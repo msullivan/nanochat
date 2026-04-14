@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # See speedrun.sh for more comments
 # Usage: ./miniseries.sh [series_name]
@@ -14,7 +15,7 @@ if [ -z "$SKIP_SETUP" ]; then
     # uv
     command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
     [ -d ".venv" ] || uv venv
-    uv sync --extra gpu
+    uv sync --extra "${UV_EXTRA:-gpu}"
     source .venv/bin/activate
 
     # Tokenizer, download 1000 shards for pretraining

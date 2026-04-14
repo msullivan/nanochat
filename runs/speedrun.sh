@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # This script is configured to train your own GPT-2 grade LLM (pretraining + finetuning)
 # It is designed to run on a blank 8XH100 GPU node and takes approximately 3 hours to complete.
@@ -23,7 +24,7 @@ command -v uv &> /dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
 # create a .venv local virtual environment (if it doesn't exist)
 [ -d ".venv" ] || uv venv
 # install the repo dependencies
-uv sync --extra gpu
+uv sync --extra "${UV_EXTRA:-gpu}"
 # activate venv so that `python` uses the project's venv instead of system python
 source .venv/bin/activate
 
@@ -70,9 +71,11 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
-torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN
+# FP8 is enabled by default (matching upstream). Set NO_FP8=1 to disable.
+if [ -z "$NO_FP8" ]; then FP8_ARG="--fp8"; else FP8_ARG=""; fi
+torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.base_train -- --depth=${DEPTH:-24} ${WINDOW_PATTERN:+--window-pattern=$WINDOW_PATTERN} --target-param-data-ratio=8 --device-batch-size=16 $FP8_ARG --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
-torchrun --standalone --nproc_per_node=8 -m scripts.base_eval -- --device-batch-size=16
+torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.base_eval -- --device-batch-size=16
 
 # -----------------------------------------------------------------------------
 # SFT (teach the model conversation special tokens, tool use, multiple choice)
