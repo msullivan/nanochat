@@ -188,6 +188,7 @@ class Engine:
         rng.manual_seed(seed)
 
         # Get the special tokens we need to coordinate the tool use state machine
+        # Special tokens can be a single int (BPE) or a list of ints (byte tokenizer)
         get_special = lambda s: self.tokenizer.encode_special(s)
         python_start = get_special("<|python_start|>")
         python_end = get_special("<|python_end|>")
@@ -195,6 +196,15 @@ class Engine:
         output_end = get_special("<|output_end|>")
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+
+        # Helpers for multi-token special tokens (byte tokenizer uses [ESCAPE, X] sequences)
+        def _as_list(tok):
+            return [tok] if isinstance(tok, int) else list(tok)
+        def _tail_matches(tokens, special):
+            s = _as_list(special)
+            return len(tokens) >= len(s) and tokens[-len(s):] == s
+        def _force_special(state, special):
+            state.forced_tokens.extend(_as_list(special))
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
@@ -251,22 +261,22 @@ class Engine:
                 # Update the state of this row to include the next token
                 state.current_tokens.append(next_token)
                 # On <|assistant_end|> or <|bos|>, mark the row as completed
-                if next_token == assistant_end or next_token == bos:
+                if _tail_matches(state.current_tokens, assistant_end) or next_token == bos:
                     state.completed = True
                 # Handle tool logic
-                if next_token == python_start:
+                if _tail_matches(state.current_tokens, python_start):
                     state.in_python_block = True
                     state.python_expr_tokens = []
-                elif next_token == python_end and state.in_python_block:
+                elif _tail_matches(state.current_tokens, python_end) and state.in_python_block:
                     state.in_python_block = False
                     if state.python_expr_tokens:
                         expr = self.tokenizer.decode(state.python_expr_tokens)
                         result = use_calculator(expr)
                         if result is not None:
                             result_tokens = self.tokenizer.encode(str(result))
-                            state.forced_tokens.append(output_start)
+                            _force_special(state, output_start)
                             state.forced_tokens.extend(result_tokens)
-                            state.forced_tokens.append(output_end)
+                            _force_special(state, output_end)
                     state.python_expr_tokens = []
                 elif state.in_python_block:
                     state.python_expr_tokens.append(next_token)
@@ -287,17 +297,22 @@ class Engine:
         """
         assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
         bos = self.tokenizer.get_bos_token_id()
+        assistant_end_list = [assistant_end] if isinstance(assistant_end, int) else list(assistant_end)
+        ae_len = len(assistant_end_list)
         results = [tokens.copy() for _ in range(num_samples)]
         masks = [[0] * len(tokens) for _ in range(num_samples)]
         completed = [False] * num_samples
         for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
                 if not completed[i]:
-                    if token == assistant_end or token == bos:
+                    results[i].append(token)
+                    masks[i].append(mask)
+                    # Check for end conditions
+                    if token == bos or results[i][-ae_len:] == assistant_end_list:
+                        # Strip the terminal tokens
+                        results[i] = results[i][:-ae_len] if results[i][-ae_len:] == assistant_end_list else results[i][:-1]
+                        masks[i] = masks[i][:-ae_len] if len(masks[i]) >= ae_len else masks[i][:-1]
                         completed[i] = True
-                    else:
-                        results[i].append(token)
-                        masks[i].append(mask)
             # Stop if all rows are completed
             if all(completed):
                 break

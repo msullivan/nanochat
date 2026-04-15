@@ -56,7 +56,7 @@ export NANOCHAT_REPORT_TAG="$MODEL_TAG"
 python -m nanochat.report reset
 
 # -----------------------------------------------------------------------------
-# Tokenizer
+# Tokenizer and dataset
 
 # Download the first ~2B characters of pretraining dataset
 # each data shard is ~250M chars
@@ -69,10 +69,13 @@ python -m nanochat.dataset -n 8
 # The maximum total number of shards available in the entire dataset is 6542.
 python -m nanochat.dataset -n 170 &
 DATASET_DOWNLOAD_PID=$!
-# train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
-python -m scripts.tok_train
-# evaluate the tokenizer (report compression ratio etc.)
-python -m scripts.tok_eval
+# Byte tokenizer mode: skip tokenizer training (set BYTE_TOKENIZER=1)
+if [ -z "$BYTE_TOKENIZER" ]; then
+    # train the tokenizer with vocab size 2**15 = 32768 on ~2B characters of data
+    python -m scripts.tok_train
+    # evaluate the tokenizer (report compression ratio etc.)
+    python -m scripts.tok_eval
+fi
 
 # -----------------------------------------------------------------------------
 # Base model (pretraining)
@@ -82,7 +85,7 @@ wait $DATASET_DOWNLOAD_PID
 # d24 model (slightly undertrained to beat GPT-2 => decrease data:params ratio from compute optimal 10.5 (default) to 8)
 # FP8 is enabled by default (matching upstream). Set NO_FP8=1 to disable.
 if [ -z "$NO_FP8" ]; then FP8_ARG="--fp8"; else FP8_ARG=""; fi
-torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.base_train -- --depth=${DEPTH:-24} ${WINDOW_PATTERN:+--window-pattern=$WINDOW_PATTERN} --target-param-data-ratio=8 --device-batch-size=16 $FP8_ARG --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.base_train -- --depth=${DEPTH:-24} ${WINDOW_PATTERN:+--window-pattern=$WINDOW_PATTERN} --target-param-data-ratio=8 --device-batch-size=16 $FP8_ARG ${BYTE_TOKENIZER:+--byte-tokenizer} --run=$WANDB_RUN
 # evaluate the model: CORE metric, BPB on train/val, and draw samples
 torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.base_eval -- --device-batch-size=16
 

@@ -33,6 +33,7 @@ import torch
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
+from nanochat.byte_tokenizer import ByteTokenizer, get_byte_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
@@ -208,7 +209,10 @@ def main():
     else:
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
-        token_bytes = get_token_bytes(device=device)
+        if isinstance(tokenizer, ByteTokenizer):
+            token_bytes = get_byte_token_bytes(device=device)
+        else:
+            token_bytes = get_token_bytes(device=device)
         model_name = f"base_model (step {meta['step']})"
         model_slug = f"base_model_{meta['step']:06d}"
 
