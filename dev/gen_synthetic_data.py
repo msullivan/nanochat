@@ -18,10 +18,24 @@ NOTE: For more details see: https://github.com/karpathy/nanochat/discussions/139
 import json
 import os
 import random
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from nanochat.common import get_base_dir
+# Ensure the repo root is on sys.path when invoked as `python dev/gen_synthetic_data.py`
+# so that `from dev.llm_client import ...` resolves. No-op when run as `-m`.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from dev.llm_client import chat_completion
+
+
+def get_base_dir():
+    """Local copy of nanochat.common.get_base_dir -- avoids torch import on
+    generator machines that don't need the ML deps."""
+    base = os.environ.get("NANOCHAT_BASE_DIR")
+    if not base:
+        base = os.path.join(os.path.expanduser("~"), ".cache", "nanochat")
+    os.makedirs(base, exist_ok=True)
+    return base
 
 # Load the knowledge base: the full PEP 827 text.
 knowledge_path = os.path.join(os.path.dirname(__file__), "..", "pep-0827.rst")

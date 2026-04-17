@@ -19,9 +19,14 @@ import os
 import subprocess
 
 import requests
-from dotenv import load_dotenv
 
-load_dotenv()
+# Optional: load .env if python-dotenv is available. Callers can also just set
+# AI_GATEWAY_API_KEY in their shell environment.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 AI_GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/chat/completions"
 
