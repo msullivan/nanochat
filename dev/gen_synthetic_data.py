@@ -1,7 +1,7 @@
 """
 Synthetic data generation for teaching nanochat about its identity and capabilities.
 
-This script uses the OpenRouter API to generate diverse multi-turn conversations
+This script uses the Vercel AI Gateway to generate diverse multi-turn conversations
 between a user and nanochat. The conversations are saved to a .jsonl file for use
 in supervised finetuning (SFT) via the CustomJSON task.
 
@@ -15,27 +15,16 @@ Key design principles for high-quality synthetic data:
    generating conversations has accurate information to draw from.
 3. Structured outputs - we use JSON schema to guarantee valid format.
 
-NOTE: You need OPENROUTER_API_KEY set in .env or as an environment variable.
+NOTE: You need AI_GATEWAY_API_KEY set in .env or as an environment variable.
 NOTE: For more details see: https://github.com/karpathy/nanochat/discussions/139
 """
-import requests
 import json
 import os
-import copy
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dotenv import load_dotenv
 
 from nanochat.common import get_base_dir
-
-load_dotenv()
-api_key = os.environ["OPENROUTER_API_KEY"]
-
-url = "https://openrouter.ai/api/v1/chat/completions"
-headers = {
-    "Authorization": f"Bearer {api_key}",
-    "Content-Type": "application/json"
-}
+from dev.llm_client import chat_completion
 
 # Load the comprehensive knowledge base
 knowledge_path = os.path.join(os.path.dirname(__file__), "..", "knowledge", "self_knowledge.md")
@@ -213,27 +202,22 @@ first_messages = {
 }
 
 # =============================================================================
-# PROMPT TEMPLATE
+# PROMPT TEMPLATES
 # =============================================================================
+# Split into system (static, cacheable across all calls) and user (per-call variables).
+# Gemini/OpenAI cache prefixes in token blocks; Anthropic caches at block boundaries.
+# Keeping the static content in its own message makes caching portable across providers.
 
-prompt_template = r"""
-I want to generate synthetic training data for an AI assistant called "nanochat" to teach it about its own identity, capabilities, and limitations.
+system_template = r"""
+You generate synthetic training data for an AI assistant called "nanochat" to teach it about its own identity, capabilities, and limitations. For each request, produce a realistic multi-turn conversation between a User and the nanochat Assistant based on the topic, persona, and dynamic provided.
 
 ## KNOWLEDGE BASE
 
-Here is comprehensive information about nanochat that you should use as the authoritative source of facts:
+Use this as the authoritative source of facts about nanochat:
 
 ---
 {knowledge}
 ---
-
-## YOUR TASK
-
-Generate a realistic multi-turn conversation between a User and the nanochat Assistant.
-
-**Topic to explore:** {topic}
-**User persona:** {persona}
-**Conversation dynamic:** {dynamic}
 
 ## STYLE GUIDELINES
 
@@ -244,11 +228,6 @@ Generate a realistic multi-turn conversation between a User and the nanochat Ass
 5. **Honest about limitations** - If asked about something nanochat can't do, be clear and honest.
 6. **Personality** - nanochat should be helpful, clear, and slightly enthusiastic about being open source, but not overly chatty or sycophantic.
 
-## FIRST MESSAGE EXAMPLES
-
-Here are some example first messages from users (for style inspiration):
-{first_message_examples}
-
 ## SPECIAL CASES
 
 - **Non-English first message:** If the user writes in another language, nanochat should briefly acknowledge it can understand but works best in English, then continue helpfully.
@@ -257,8 +236,23 @@ Here are some example first messages from users (for style inspiration):
 
 ## OUTPUT FORMAT
 
-Generate the conversation as a JSON object with a "messages" array. Each message has "role" (user/assistant) and "content". Start with a user message.
+Return a JSON object with a "messages" array. Each message has "role" (user/assistant) and "content". Start with a user message.
 """.strip()
+
+user_template = r"""
+Generate a conversation with these parameters:
+
+**Topic to explore:** {topic}
+**User persona:** {persona}
+**Conversation dynamic:** {dynamic}
+
+## FIRST MESSAGE EXAMPLES
+
+Example first messages from users (for style inspiration):
+{first_message_examples}
+""".strip()
+
+system_prompt = system_template.format(knowledge=knowledge)
 
 # =============================================================================
 # API CONFIGURATION
@@ -298,12 +292,18 @@ response_format = {
     }
 }
 
-base_payload = {
-    "model": "google/gemini-3-flash-preview",
-    "stream": False,
-    "response_format": response_format,
-    "temperature": 1.0,
-}
+GATEWAY_MODEL = "google/gemini-3-flash-preview"
+CLAUDE_MODEL = "haiku"  # cheap + fast for bulk generation
+TEMPERATURE = 1.0
+
+# Shape example for the Claude backend (which doesn't enforce json_schema).
+# Must match the response_format schema above.
+EXAMPLE_OUTPUT = json.dumps({
+    "messages": [
+        {"role": "user", "content": "hi, what are you?"},
+        {"role": "assistant", "content": "I'm nanochat, a small open-source chat model."},
+    ]
+}, indent=2)
 
 # =============================================================================
 # GENERATION LOGIC
@@ -335,9 +335,9 @@ def sample_diversity_elements(rng):
     }
 
 
-def generate_conversation(idx: int):
+def generate_conversation(idx: int, backend: str = "gateway"):
     """
-    Generate a single conversation using the OpenRouter API.
+    Generate a single conversation via the chosen backend.
     Returns a list of message dicts with 'role' and 'content' keys.
     """
     # Use idx as seed for reproducibility
@@ -346,24 +346,28 @@ def generate_conversation(idx: int):
     # Sample diversity elements
     elements = sample_diversity_elements(rng)
 
-    # Build the prompt
-    prompt = prompt_template.format(
-        knowledge=knowledge,
+    # Static system prompt (knowledge + style rules) is cacheable across calls;
+    # variable user prompt changes per call.
+    user_prompt = user_template.format(
         topic=elements["topic"],
         persona=elements["persona"],
         dynamic=elements["dynamic"],
         first_message_examples=elements["first_message_examples"],
     )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
 
-    # Make API request
-    payload = copy.deepcopy(base_payload)
-    payload['messages'] = [{"role": "user", "content": prompt}]
-
-    response = requests.post(url, headers=headers, json=payload)
-    result = response.json()
-
-    if 'error' in result:
-        raise Exception(f"API error: {result['error']}")
+    model = GATEWAY_MODEL if backend == "gateway" else CLAUDE_MODEL
+    result = chat_completion(
+        messages,
+        model=model,
+        response_format=response_format,
+        example_output=EXAMPLE_OUTPUT,
+        temperature=TEMPERATURE,
+        backend=backend,
+    )
 
     content = result['choices'][0]['message']['content']
     conversation_data = json.loads(content)
@@ -409,6 +413,8 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default=None, help="Output file path")
     parser.add_argument("--append", action="store_true", help="Append to existing file instead of overwriting")
     parser.add_argument("--save-metadata", action="store_true", help="Save metadata alongside messages")
+    parser.add_argument("--backend", choices=["gateway", "claude"], default="gateway",
+                        help="'gateway' = Vercel AI Gateway; 'claude' = local `claude -p` CLI")
     args = parser.parse_args()
 
     # Set output file
@@ -433,7 +439,7 @@ if __name__ == "__main__":
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         # Submit all tasks
-        futures = {executor.submit(generate_conversation, idx): idx
+        futures = {executor.submit(generate_conversation, idx, args.backend): idx
                    for idx in range(args.num)}
 
         # Process results as they complete
