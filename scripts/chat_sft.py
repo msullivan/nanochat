@@ -162,10 +162,22 @@ for group in optimizer.param_groups:
 
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+qamis_files = [
+    "qamis_conversations__haiku.jsonl",                           # 500 rows, cleanest grounding
+    "qamis_conversations__google_gemini-3-flash-preview.jsonl",   # 498 rows
+    "qamis_conversations__openai_gpt-5-mini.jsonl",               # 282 rows (partial run)
+]
+qamis_filepaths = [os.path.join(repo_root, f) for f in qamis_files]
+pep827_filepath = os.path.join(repo_root, "pep827_conversations.jsonl")  # 952 rows
 train_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
     CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
+    *[CustomJSON(filepath=fp) for fp in qamis_filepaths], # ~1280 rows of Qamis D&D setting (across 3 gen models)
+    *[CustomJSON(filepath=fp) for fp in qamis_filepaths], # 2 epochs
+    CustomJSON(filepath=pep827_filepath), # 952 rows of PEP 827 Q&A
+    CustomJSON(filepath=pep827_filepath), # 2 epochs
     *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
