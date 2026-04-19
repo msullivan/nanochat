@@ -22,6 +22,7 @@ from tasks.mmlu import MMLU
 from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
 from tasks.spellingbee import SpellingBee
+from tasks.arithmetic import Addition, Multiplication
 
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
@@ -51,9 +52,12 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         # Decode the completions as text
         prefix_length = len(encoded_prompt)
         completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
+
         # Evaluate success criteria
         outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
         passed = any(outcomes)
+        # if passed:
+        #     print(f"\n--- PASSED! {i} ---\n{conversation['messages'][0]['content']}\n---\n{completions[0]}\n")
 
         # Keep stats
         total += 1
@@ -165,6 +169,8 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'ARC-Challenge': partial(ARC, subset="ARC-Challenge", split="test"),
         'GSM8K': partial(GSM8K, subset="main", split="test"),
         'SpellingBee': partial(SpellingBee, size=256, split="test"),
+        'Addition': partial(Addition, size=256, split="test"),
+        'Multiplication': partial(Multiplication, size=256, split="test"),
     }[task_name]
     task_object = task_module()
     # Run the evaluation
@@ -201,7 +207,7 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
+    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee', 'Addition', 'Multiplication']
     baseline_accuracies = {
         'ARC-Easy': 0.25, # multiple choice 1 of 4 => 25%
         'ARC-Challenge': 0.25, # multiple choice 1 of 4 => 25%
@@ -209,6 +215,8 @@ if __name__ == "__main__":
         'GSM8K': 0.0, # open-ended => 0%
         'HumanEval': 0.0, # open-ended => 0%
         'SpellingBee': 0.0, # open-ended => 0%
+        'Addition': 0.0, # open-ended => 0%
+        'Multiplication': 0.0, # open-ended => 0%
     }
     task_names = all_tasks if args.task_name is None else args.task_name.split('|')
 
