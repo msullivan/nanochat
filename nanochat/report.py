@@ -398,11 +398,17 @@ class DummyReport:
         pass
 
 def get_report():
-    # just for convenience, only rank 0 logs to report
+    # just for convenience, only rank 0 logs to report.
+    # NANOCHAT_REPORT_TAG, if set, selects a per-tag subdirectory
+    # (e.g. report/d24-arith/) so re-runs with different mixtures don't
+    # overwrite each other's section files.
     from nanochat.common import get_base_dir, get_dist_info
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp_rank == 0:
         report_dir = os.path.join(get_base_dir(), "report")
+        tag = os.environ.get("NANOCHAT_REPORT_TAG", "")
+        if tag:
+            report_dir = os.path.join(report_dir, tag)
         return Report(report_dir)
     else:
         return DummyReport()

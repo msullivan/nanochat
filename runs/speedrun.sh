@@ -41,9 +41,18 @@ if [ -z "$WANDB_RUN" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# During the course of the run, we will be writing markdown reports to the report/
-# directory in the base dir. This command clears it out and writes a header section
-# with a bunch of system info and a timestamp that marks the start of the run.
+# Model tag: defaults to d${DEPTH} (matches what the Python scripts auto-compute
+# from --depth). Override by setting MODEL_TAG explicitly. Used to scope both
+# the SFT checkpoint dir and the report subdirectory so parallel/sequential
+# runs don't clobber each other.
+MODEL_TAG="${MODEL_TAG:-d${DEPTH:-24}}"
+export NANOCHAT_REPORT_TAG="$MODEL_TAG"
+
+# -----------------------------------------------------------------------------
+# During the course of the run, we will be writing markdown reports to
+# $NANOCHAT_BASE_DIR/report/$MODEL_TAG/. This command clears it out and writes
+# a header section with a bunch of system info and a timestamp that marks the
+# start of the run.
 python -m nanochat.report reset
 
 # -----------------------------------------------------------------------------
@@ -85,8 +94,8 @@ torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.base_eval
 curl -L -o $NANOCHAT_BASE_DIR/identity_conversations.jsonl https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
 
 # run SFT and eval the model
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --run=$WANDB_RUN
-torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16 --output-tag="$MODEL_TAG" --run=$WANDB_RUN
+torchrun --standalone --nproc_per_node=8 -m scripts.chat_eval -- -i sft -g "$MODEL_TAG"
 
 # chat with the model over CLI! Leave out the -p to chat interactively
 # python -m scripts.chat_cli -p "Why is the sky blue?"

@@ -44,10 +44,23 @@ if [ ! -f "$NANOCHAT_BASE_DIR/identity_conversations.jsonl" ]; then
 fi
 
 # -----------------------------------------------------------------------------
+# Optional: write SFT checkpoint under a custom dir name (so re-running with a
+# different mixture doesn't clobber an earlier run). Eval picks up the same tag.
+SFT_EXTRA_ARGS=()
+EVAL_EXTRA_ARGS=()
+if [ -n "$OUTPUT_TAG" ]; then
+    SFT_EXTRA_ARGS+=(--output-tag="$OUTPUT_TAG")
+    EVAL_EXTRA_ARGS+=(-g "$OUTPUT_TAG")
+    # Also scope the report dir so SFT + eval section files live in report/<tag>/
+    export NANOCHAT_REPORT_TAG="$OUTPUT_TAG"
+fi
+
+# -----------------------------------------------------------------------------
 # SFT + eval
 torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.chat_sft -- \
     --device-batch-size=${DEVICE_BATCH_SIZE:-16} \
     --load-optimizer=${LOAD_OPTIMIZER:-1} \
+    "${SFT_EXTRA_ARGS[@]}" \
     --run="$WANDB_RUN"
 
-torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.chat_eval -- -i sft
+torchrun --standalone --nproc_per_node=${NPROC_PER_NODE:-8} -m scripts.chat_eval -- -i sft "${EVAL_EXTRA_ARGS[@]}"
