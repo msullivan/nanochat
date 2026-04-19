@@ -53,3 +53,17 @@ class MMLU(Task):
         assert assistant_response in self.letters, f"MMLU answer {assistant_response} is expected to be one of {self.letters}"
         assistant_message = conversation['messages'][-1]['content'] # e.g. "A"
         return assistant_response == assistant_message
+
+
+if __name__ == "__main__":
+    # preview the first 5 examples from the test split
+    task = MMLU(subset="all", split="test")
+    print(f"MMLU test split: {len(task):,} examples")
+    for i in range(5):
+        ex = task.get_example(i)
+        print("=" * 100)
+        print(f"subject: {ex['subject']}")
+        print("-" * 100)
+        print(ex['messages'][0]['content'])
+        print("-" * 100)
+        print(f"correct answer: {ex['messages'][1]['content']}")

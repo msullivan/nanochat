@@ -46,3 +46,18 @@ class ARC(Task):
         assert assistant_response in conversation['letters'], f"ARC answer {assistant_response} is expected to be one of {conversation['letters']}"
         assistant_message = conversation['messages'][-1]['content'] # e.g. "A"
         return assistant_response == assistant_message
+
+
+if __name__ == "__main__":
+    # preview the first 5 examples from each ARC subset (test split)
+    for subset in ["ARC-Easy", "ARC-Challenge"]:
+        task = ARC(subset=subset, split="test")
+        print("#" * 100)
+        print(f"{subset} test split: {len(task):,} examples")
+        print("#" * 100)
+        for i in range(5):
+            ex = task.get_example(i)
+            print("=" * 100)
+            print(ex['messages'][0]['content'])
+            print("-" * 100)
+            print(f"correct answer: {ex['messages'][1]['content']}")
