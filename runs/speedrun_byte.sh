@@ -83,7 +83,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train -
 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_eval -- \
     --device-batch-size="$DEVICE_BATCH_SIZE" \
-    -g "$MODEL_TAG"
+    --model-tag="$MODEL_TAG"
 
 # -----------------------------------------------------------------------------
 # SFT (optional -- set RUN_SFT=1 to enable)
