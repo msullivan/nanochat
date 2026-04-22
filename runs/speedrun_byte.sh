@@ -46,12 +46,16 @@ TARGET_DATA_RATIO="${TARGET_DATA_RATIO:-32}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-8192}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-16}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+# WINDOW_PATTERN: "SSSL" matches upstream -- only 1 in 4 layers gets full
+# context. d12 byte experiments showed SLSL gave no BPB/CORE benefit despite
+# costing ~19% more attention FLOPs, so default to SSSL.
+WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 # SFT is skipped by default: small byte models (d12) often aren't coherent enough
 # after pretraining for SFT to land as anything but chat-format mimicry. Set
 # RUN_SFT=1 once base_eval shows BPB/CORE indicating real learning.
 RUN_SFT="${RUN_SFT:-0}"
 
-echo "=== byte run: depth=$DEPTH tag=$MODEL_TAG ratio=$TARGET_DATA_RATIO seq_len=$MAX_SEQ_LEN ==="
+echo "=== byte run: depth=$DEPTH tag=$MODEL_TAG ratio=$TARGET_DATA_RATIO seq_len=$MAX_SEQ_LEN window=$WINDOW_PATTERN ==="
 
 # -----------------------------------------------------------------------------
 # Fresh report
@@ -66,9 +70,10 @@ echo "Waiting for dataset download to complete..."
 wait $DATASET_DOWNLOAD_PID
 
 # -----------------------------------------------------------------------------
-# Base training (byte tokenizer, no FP8: the lm_head matmul is 128x smaller and
-# fp8 adds overhead without much win at this vocab; flip back on via NO_FP8=0).
-if [ -n "$NO_FP8" ] && [ "$NO_FP8" = "0" ]; then FP8_ARG="--fp8"; else FP8_ARG=""; fi
+# Base training. FP8 on by default (matches upstream speedrun.sh); set NO_FP8=1
+# to disable. The byte lm_head is tiny so fp8 mostly accelerates the trunk
+# matmuls, which are unchanged from BPE.
+if [ -z "$NO_FP8" ]; then FP8_ARG="--fp8"; else FP8_ARG=""; fi
 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train -- \
     --depth="$DEPTH" \
@@ -76,7 +81,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train -
     --max-seq-len="$MAX_SEQ_LEN" \
     --device-batch-size="$DEVICE_BATCH_SIZE" \
     --target-param-data-ratio="$TARGET_DATA_RATIO" \
-    ${WINDOW_PATTERN:+--window-pattern=$WINDOW_PATTERN} \
+    --window-pattern="$WINDOW_PATTERN" \
     --model-tag="$MODEL_TAG" \
     $FP8_ARG \
     --run="$WANDB_RUN"
