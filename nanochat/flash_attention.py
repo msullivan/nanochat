@@ -29,8 +29,12 @@ def _load_flash_attention_3():
         return None
     try:
         major, _ = torch.cuda.get_device_capability()
-        # FA3 kernels are compiled for Hopper (sm90) only
-        # Ada (sm89), Blackwell (sm100) need a different backend until FA3 is recompiled
+        # FA3 kernels are compiled for Hopper (sm90) only.
+        # Other GPUs need a different backend (FlexAttention or SDPA):
+        #   Ada sm89, Blackwell sm100 (B200/GB200), Blackwell sm120 (RTX 5090,
+        #   RTX PRO 6000 workstation). FA4 will eventually cover sm100 but not
+        #   sm120; FA2 covers Ampere/Ada but has known bf16 training convergence
+        #   issues on sm120 so we don't fall back to it.
         if major != 9:
             return None
         import os
