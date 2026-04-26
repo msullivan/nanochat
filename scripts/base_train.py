@@ -486,8 +486,12 @@ while True:
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
-    if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    # save checkpoint: at the end of the run, the last flat-phase step (the
+    # natural branch point for trapezoidal anneal-from-checkpoint extensions),
+    # or every save_every steps, except at the first step or the resume step
+    warmdown_start = num_iterations - round(args.warmdown_ratio * num_iterations)
+    is_pre_warmdown = step == warmdown_start and step > 0 and step != num_iterations
+    if last_step or is_pre_warmdown or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
