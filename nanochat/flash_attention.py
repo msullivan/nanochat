@@ -1,8 +1,11 @@
 """
-Unified Flash Attention interface with automatic FA3/SDPA switching.
+Unified Flash Attention interface with automatic backend dispatch.
 
-Exports `flash_attn` module that matches the FA3 API exactly, but falls back
-to PyTorch SDPA on non-Hopper GPUs (including Blackwell), MPS, and CPU.
+Exports `flash_attn` module that matches the FA3 API exactly. Backends, in
+preference order:
+    fa3   - Flash Attention 3, Hopper (sm_90) only, fastest path
+    flex  - PyTorch FlexAttention (Triton-generated), works on Ada/Blackwell etc.
+    sdpa  - PyTorch SDPA, universal fallback (CPU/MPS/older GPUs)
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -18,7 +21,7 @@ import torch.nn.functional as F
 
 
 # =============================================================================
-# Detection: Try to load FA3 on Hopper+ GPUs
+# Detection
 # =============================================================================
 def _load_flash_attention_3():
     """Try to load Flash Attention 3 (requires Hopper GPU, sm90)."""
@@ -27,7 +30,7 @@ def _load_flash_attention_3():
     try:
         major, _ = torch.cuda.get_device_capability()
         # FA3 kernels are compiled for Hopper (sm90) only
-        # Ada (sm89), Blackwell (sm100) need SDPA fallback until FA3 is recompiled
+        # Ada (sm89), Blackwell (sm100) need a different backend until FA3 is recompiled
         if major != 9:
             return None
         import os
@@ -38,29 +41,102 @@ def _load_flash_attention_3():
         return None
 
 
+def _flex_attention_available():
+    """FlexAttention requires PyTorch 2.5+ and CUDA with Triton."""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        from torch.nn.attention.flex_attention import flex_attention, create_block_mask  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
+HAS_FLEX = _flex_attention_available()
 
-# Override for testing: set to 'fa3', 'sdpa', or None (auto)
+# Override for testing: 'fa3', 'flex', 'sdpa', or None (auto)
 _override_impl = None
 
 
-def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
+def _resolve_backend():
+    """Decide once which backend to use, based on availability, override, dtype."""
     if _override_impl == 'fa3':
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
-        return True
+        return 'fa3'
+    if _override_impl == 'flex':
+        assert HAS_FLEX, "Cannot override to FlexAttention: not available"
+        return 'flex'
     if _override_impl == 'sdpa':
-        return False
+        return 'sdpa'
     if HAS_FA3:
-        # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use SDPA fallback
+        # FA3 Hopper kernels only support bf16 and fp8; fp16/fp32 must use a different backend
         from nanochat.common import COMPUTE_DTYPE
         if COMPUTE_DTYPE == torch.bfloat16:
-            return True
-        return False
-    return False
+            return 'fa3'
+    if HAS_FLEX:
+        return 'flex'
+    return 'sdpa'
 
-USE_FA3 = _resolve_use_fa3()
+
+BACKEND = _resolve_backend()
+USE_FA3 = BACKEND == 'fa3'  # kept for backward compat with anything that imports this
+
+
+# =============================================================================
+# FlexAttention helpers (block mask cache + lazy compile)
+# =============================================================================
+_block_mask_cache = {}
+_compiled_flex_attention = None
+
+
+def _get_compiled_flex_attention():
+    global _compiled_flex_attention
+    if _compiled_flex_attention is None:
+        from torch.nn.attention.flex_attention import flex_attention
+        _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+    return _compiled_flex_attention
+
+
+def _get_block_mask(window, q_len, k_len, device):
+    """
+    Causal block mask with optional left sliding window. window<0 means full
+    causal context. Cached per (window, q_len, k_len, device) -- training has
+    a tiny number of distinct shapes so this stays small.
+    """
+    cache_key = (int(window), int(q_len), int(k_len), str(device))
+    if cache_key in _block_mask_cache:
+        return _block_mask_cache[cache_key]
+
+    from torch.nn.attention.flex_attention import create_block_mask
+
+    # Chunked inference (q_len < k_len) needs offset between query and key positions.
+    offset = k_len - q_len
+    use_window = 0 <= window < k_len
+
+    if use_window:
+        def mask_fn(b, h, q_idx, kv_idx):
+            abs_q = q_idx + offset
+            return (abs_q >= kv_idx) & ((abs_q - kv_idx) <= window)
+    else:
+        def mask_fn(b, h, q_idx, kv_idx):
+            return (q_idx + offset) >= kv_idx
+
+    block_mask = create_block_mask(
+        mask_fn, B=None, H=None, Q_LEN=q_len, KV_LEN=k_len, device=device,
+    )
+    _block_mask_cache[cache_key] = block_mask
+    return block_mask
+
+
+def _flex_attention(q, k, v, window_size, enable_gqa):
+    """q, k, v in (B, H, T, D) layout. Returns same layout."""
+    Tq = q.size(2)
+    Tk = k.size(2)
+    block_mask = _get_block_mask(window_size[0], Tq, Tk, q.device)
+    flex = _get_compiled_flex_attention()
+    return flex(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
 
 
 # =============================================================================
@@ -116,15 +192,20 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if USE_FA3:
+    if BACKEND == 'fa3':
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
-    # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
+    # Both flex and SDPA paths use (B, H, T, D)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
-    y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+
+    if BACKEND == 'flex':
+        y = _flex_attention(q, k, v, window_size, enable_gqa)
+    else:
+        y = _sdpa_attention(q, k, v, window_size, enable_gqa)
+
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 
@@ -133,7 +214,12 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     """
     Flash Attention with KV cache for inference.
 
-    FA3 updates k_cache/v_cache in-place. Our SDPA fallback does the same.
+    FA3 updates k_cache/v_cache in-place. Our fallback does the same.
+
+    The FlexAttention backend routes inference through SDPA: block_mask depends
+    on cache_seqlens which changes every step, so the cache that makes flex fast
+    for training doesn't help here. Could be added later with per-step block_mask
+    rebuilds if inference latency becomes a bottleneck.
 
     Args:
         q: Queries, shape (B, T_new, H, D)
@@ -146,13 +232,13 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     Returns:
         Output tensor of shape (B, T_new, H, D)
     """
-    if USE_FA3:
+    if BACKEND == 'fa3':
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
         )
 
-    # SDPA fallback: manually manage KV cache
+    # SDPA fallback: manually manage KV cache (used by both BACKEND='flex' and 'sdpa')
     B, T_new, H, D = q.shape
     pos = cache_seqlens[0].item()  # assume uniform position across batch
 

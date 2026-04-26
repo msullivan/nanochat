@@ -102,20 +102,20 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
-from nanochat.flash_attention import USE_FA3
-using_fa3 = USE_FA3
-if using_fa3:
+from nanochat.flash_attention import BACKEND
+if BACKEND == 'fa3':
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
+elif BACKEND == 'flex':
+    print0("✓ Using PyTorch FlexAttention (Triton-generated, sliding-window aware).")
+    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
+        print0(f"  (FA3 was available but only supports bf16; COMPUTE_DTYPE={COMPUTE_DTYPE})")
 else:
     print0("!" * 80)
-    if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
-        print0(f"WARNING: Flash Attention 3 only supports bf16, but COMPUTE_DTYPE={COMPUTE_DTYPE}. Using PyTorch SDPA fallback")
-    else:
-        print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback")
-    print0("WARNING: Training will be less efficient without FA3")
+    print0("WARNING: Falling back to PyTorch SDPA (no FA3 or FlexAttention available)")
+    print0("WARNING: Training will be less efficient")
     if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no support for sliding window attention (window_pattern='{args.window_pattern}'). Your GPU utilization will be terrible.")
-        print0("WARNING: Recommend using --window-pattern L for full context attention without alternating sliding window patterns.")
+        print0(f"WARNING: SDPA has no fast path for sliding window (window_pattern='{args.window_pattern}'). GPU utilization will be poor.")
+        print0("WARNING: Recommend using --window-pattern L on this backend.")
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------

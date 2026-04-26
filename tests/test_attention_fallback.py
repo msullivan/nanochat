@@ -21,9 +21,10 @@ from nanochat.engine import KVCache
 
 
 def set_impl(impl):
-    """Set the implementation override ('fa3', 'sdpa', or None for auto) and re-resolve USE_FA3."""
+    """Set the implementation override ('fa3', 'flex', 'sdpa', or None) and re-resolve BACKEND."""
     fa_module._override_impl = impl
-    fa_module.USE_FA3 = fa_module._resolve_use_fa3()
+    fa_module.BACKEND = fa_module._resolve_backend()
+    fa_module.USE_FA3 = fa_module.BACKEND == 'fa3'
 
 
 def run_both_impls(fn):
@@ -354,9 +355,12 @@ class TestOverrideMechanism:
         set_impl(None)
 
     def test_override_auto(self):
-        """Test that override=None uses auto-detection."""
+        """Test that override=None uses auto-detection (FA3 if Hopper+bf16, else flex/sdpa)."""
         set_impl(None)
-        assert fa_module.USE_FA3 == HAS_FA3
+        if HAS_FA3:
+            assert fa_module.BACKEND == 'fa3'
+        else:
+            assert fa_module.BACKEND in ('flex', 'sdpa')
 
 
 if __name__ == "__main__":
