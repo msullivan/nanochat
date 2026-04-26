@@ -21,16 +21,19 @@ forget to lower `save_every`.
 
 ## Quick reference
 
-```bash
-# Anneal: pick the WARMDOWN_RATIO fraction of (FROM_STEP + anneal_len).
-# At default WARMDOWN_RATIO=0.1 and FROM_STEP=4500, this anneals 500 steps.
-SOURCE_TAG=d24-byte FROM_STEP=4500 MODE=anneal \
-    bash runs/resume_byte.sh
+Both CLI flags and env vars work; CLI takes precedence. Env-var form keeps
+parity with `runs/speedrun_byte.sh`.
 
-# Extend: continue from FROM_STEP to NEW_TOTAL with the last WARMDOWN_RATIO
-# of NEW_TOTAL spent in warmdown.
-SOURCE_TAG=d24-byte FROM_STEP=4500 MODE=extend NEW_TOTAL=10000 \
-    bash runs/resume_byte.sh
+```bash
+# Anneal (CLI):
+uv run python runs/resume.py --source-tag d24-byte --from-step 4500 --mode anneal
+
+# Anneal (env-var):
+SOURCE_TAG=d24-byte FROM_STEP=4500 MODE=anneal uv run python runs/resume.py
+
+# Extend:
+uv run python runs/resume.py --source-tag d24-byte --from-step 4500 \
+    --mode extend --new-total 10000
 ```
 
 The script inherits depth, `byte_tokenizer`, `max_seq_len`, `device_batch_size`,
@@ -38,12 +41,14 @@ The script inherits depth, `byte_tokenizer`, `max_seq_len`, `device_batch_size`,
 saved `meta_<step>.json`, so you don't repeat them.
 
 Defaults that you'll usually leave alone:
-- `WARMDOWN_RATIO=0.1` -- matches the default in `runs/speedrun_byte.sh`.
-- `SAVE_EVERY=500` -- intermediate checkpoints during the resumed run.
-- `NPROC_PER_NODE=8`.
+- `--warmdown-ratio 0.1` -- matches the default in `runs/speedrun_byte.sh`.
+- `--save-every 500` -- intermediate checkpoints during the resumed run.
+- `--nproc 8`.
 
-Override the output checkpoint dir with `OUTPUT_TAG=<name>`. The default is
-`${SOURCE_TAG}-anneal-from-${FROM_STEP}` or `${SOURCE_TAG}-ext-${NEW_TOTAL}`.
+Override the output checkpoint dir with `--output-tag <name>` (or `OUTPUT_TAG=`).
+Default is `${source}-anneal-from-${from_step}` or `${source}-ext-${new_total}`.
+
+Pass `--skip-eval` to skip the `base_eval` pass after training.
 
 ## Recipe: plan-long, stop-early, anneal-later
 
@@ -61,8 +66,7 @@ Override the output checkpoint dir with `OUTPUT_TAG=<name>`. The default is
    full-length annealed model:
 
    ```bash
-   SOURCE_TAG=d24-byte FROM_STEP=4500 MODE=anneal \
-       bash runs/resume_byte.sh
+   uv run python runs/resume.py --source-tag d24-byte --from-step 4500 --mode anneal
    ```
 
    Output lands at `~/.cache/nanochat/base_checkpoints/d24-byte-anneal-from-4500/`,
@@ -71,11 +75,11 @@ Override the output checkpoint dir with `OUTPUT_TAG=<name>`. The default is
 3. If the full run looks promising and you want to push further:
 
    ```bash
-   # FROM_STEP must be the last pre-warmdown checkpoint of the original run.
-   # If original num_iterations was N and warmdown_ratio was 0.1, that's
+   # --from-step must be the last pre-warmdown checkpoint of the original
+   # run. If original num_iterations was N and warmdown_ratio was 0.1, that's
    # step N - round(0.1 * N).
-   SOURCE_TAG=d24-byte FROM_STEP=9000 MODE=extend NEW_TOTAL=20000 \
-       bash runs/resume_byte.sh
+   uv run python runs/resume.py --source-tag d24-byte --from-step 9000 \
+       --mode extend --new-total 20000
    ```
 
    Output lands at `d24-byte-ext-20000/`. The original `d24-byte/` checkpoints
@@ -125,8 +129,8 @@ Without it, the resumed run would have to share a directory with the source.
   `nanochat.fp8.convert_to_float8_training` to apply, which the resume
   pathway handles correctly.
 - **Multiple anneals from the same source checkpoint** are fine -- each one
-  writes to a different output dir if you give them different `OUTPUT_TAG`s.
-  By default `MODE=anneal` produces a deterministic name based on
-  `FROM_STEP`, so re-running the same anneal will overwrite. Pass
-  `OUTPUT_TAG=...` to keep multiple variants (e.g. for sweeping
-  `WARMDOWN_RATIO`).
+  writes to a different output dir if you give them different
+  `--output-tag`s. By default `--mode anneal` produces a deterministic name
+  based on `--from-step`, so re-running the same anneal will overwrite. Pass
+  `--output-tag ...` to keep multiple variants (e.g. for sweeping
+  `--warmdown-ratio`).
