@@ -724,3 +724,11 @@ get_report().log(section="Base model training", data=[
 # cleanup
 wandb_run.finish() # wandb run finish
 compute_cleanup()
+
+# If we exited because of SIGINT (e.g. wandb Stop button or terminal Ctrl-C),
+# propagate that to the parent: re-raise so Python exits with the conventional
+# 130 status code. Without this, base_train returns 0 and any wrapper script
+# (runs/resume.py, runs/speedrun_byte.sh) blithely runs the next stage.
+if signal_exit_requested:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGINT)
