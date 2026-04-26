@@ -42,12 +42,12 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --window-pattern=L \
     --warmdown-ratio=0.1 \
     --save-every=100 \
-    --resume-from-step=400 \
+    --resume-from-step=2400 \
     --model-tag=d24-byte-l \
     --eval-every=100 \
     --eval-tokens=4194304 \
-    --core-metric-every=500 \
-    --sample-every=200 \
+    --core-metric-every=100 \
+    --sample-every=100 \
     --fp8 \
     $WANDB_FLAG
 
