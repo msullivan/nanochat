@@ -54,8 +54,8 @@ def main():
     )
     p.add_argument("--source-tag", **env_arg("SOURCE_TAG", required=True),
                    help="MODEL_TAG of the source run (env: SOURCE_TAG)")
-    p.add_argument("--from-step", **env_arg("FROM_STEP", type_=int, required=True),
-                   help="checkpoint step to resume from (env: FROM_STEP)")
+    p.add_argument("--from-step", **env_arg("FROM_STEP", required=True),
+                   help="checkpoint step to resume from, or 'latest' (env: FROM_STEP)")
     p.add_argument("--mode", choices=["anneal", "extend"],
                    **env_arg("MODE", required=True),
                    help="anneal: pure warmdown from FROM_STEP. extend: continue then warmdown. (env: MODE)")
@@ -77,11 +77,24 @@ def main():
 
     if args.mode == "extend" and args.new_total is None:
         p.error("--new-total (or NEW_TOTAL env) is required when --mode extend")
-    if args.mode == "extend" and args.new_total <= args.from_step:
-        p.error(f"--new-total ({args.new_total}) must be > --from-step ({args.from_step})")
 
     base_dir = Path(os.environ.get("NANOCHAT_BASE_DIR", str(Path.home() / ".cache" / "nanochat")))
     source_dir = base_dir / "base_checkpoints" / args.source_tag
+
+    # Resolve --from-step latest by scanning the source dir
+    if args.from_step == "latest":
+        ckpts = sorted(source_dir.glob("model_*.pt"))
+        if not ckpts:
+            print(f"No checkpoints found in {source_dir}", file=sys.stderr)
+            sys.exit(1)
+        args.from_step = int(ckpts[-1].name.removeprefix("model_").removesuffix(".pt"))
+        print(f"Resolved --from-step latest -> {args.from_step}", file=sys.stderr)
+    else:
+        args.from_step = int(args.from_step)
+
+    if args.mode == "extend" and args.new_total <= args.from_step:
+        p.error(f"--new-total ({args.new_total}) must be > --from-step ({args.from_step})")
+
     meta_file = source_dir / f"meta_{args.from_step:06d}.json"
     if not meta_file.exists():
         print(f"Source meta not found: {meta_file}", file=sys.stderr)
