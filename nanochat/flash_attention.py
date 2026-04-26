@@ -137,10 +137,23 @@ def _get_block_mask(window, q_len, k_len, device):
 
 
 def _flex_attention(q, k, v, window_size, enable_gqa):
-    """q, k, v in (B, H, T, D) layout. Returns same layout."""
+    """
+    q, k, v in (B, H, T, D) layout. Returns same layout.
+
+    Hybrid dispatch on the flex backend: full-causal layers (L in window_pattern)
+    go through SDPA's is_causal=True fast path -- on Blackwell that's cuDNN's
+    hand-tuned dense flash kernel, faster than flex's dense-causal kernel.
+    Only true sliding-window layers (S) get the flex/Triton sparse kernel.
+    """
     Tq = q.size(2)
     Tk = k.size(2)
-    block_mask = _get_block_mask(window_size[0], Tq, Tk, q.device)
+    window = window_size[0]
+
+    # Full causal context with aligned shapes -> SDPA fast path
+    if (window < 0 or window >= Tk) and Tq == Tk:
+        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
+
+    block_mask = _get_block_mask(window, Tq, Tk, q.device)
     flex = _get_compiled_flex_attention()
     return flex(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
 
