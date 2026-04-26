@@ -291,15 +291,21 @@ class GPT(nn.Module):
         - right: how many tokens after current position to attend to (0 for causal)
 
         Pattern string is tiled across layers. Final layer always gets L (full context).
-        Characters: L=long (full context), S=short (quarter context)
+        Characters: L=long (full context, -1 = no window), S=short (quarter of training seq len)
+
+        L uses -1 (the FA3 "unlimited" sentinel) rather than config.sequence_len so
+        that eval/inference at sequences longer than the training seq still routes
+        to the dense-causal fast path everywhere (FA3, FlexAttention's hybrid
+        dispatch, SDPA's is_causal=True). With long_window = sequence_len, longer
+        eval prompts would partially fall into the sliding-window codepath and
+        cause flex_attention recompiles per-shape during CORE eval.
         """
         pattern = config.window_pattern.upper()
         assert all(c in "SL" for c in pattern), f"Invalid window_pattern: {pattern}. Use only S and L."
         # Map characters to window sizes
-        long_window = config.sequence_len
-        short_window = -(-long_window // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
+        short_window = -(-config.sequence_len // 4 // 128) * 128  # ceil to FA3 tile size (2048 -> 768)
         char_to_window = {
-            "L": (long_window, 0),
+            "L": (-1, 0),
             "S": (short_window, 0),
         }
         # Tile pattern across layers
@@ -308,7 +314,7 @@ class GPT(nn.Module):
             char = pattern[layer_idx % len(pattern)]
             window_sizes.append(char_to_window[char])
         # Final layer always gets full context
-        window_sizes[-1] = (long_window, 0)
+        window_sizes[-1] = (-1, 0)
         return window_sizes
 
     def get_device(self):
