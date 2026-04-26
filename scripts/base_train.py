@@ -557,11 +557,19 @@ while True:
             "If 5*x + 3 = 13, then x is",
         ]
         engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        print0("Conditioned samples:")
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
                 sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
             print0(tokenizer.decode(sample[0]))
+        print0("Unconditioned samples:")
+        tokens = tokenizer("", prepend="<|bos|>")
+        with disable_fp8(orig_model):
+            uncond, _ = engine.generate_batch(tokens, num_samples=3, max_tokens=128, temperature=1.0)
+        for sample in uncond:
+            print0("-" * 40)
+            print0(tokenizer.decode(sample))
         model.train()
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
