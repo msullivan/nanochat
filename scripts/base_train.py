@@ -420,6 +420,7 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+last_wandb_log_time = 0.0 # wall-clock of last train-stats wandb push; 0 forces an immediate first log
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -588,7 +589,8 @@ while True:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
-    if step % 100 == 0:
+    now = time.time()
+    if last_step or (now - last_wandb_log_time) >= 10:
         log_data = {
             "step": step,
             "total_training_flops": flops_so_far,
@@ -601,6 +603,7 @@ while True:
             "train/epoch": epoch,
         }
         wandb_run.log(log_data)
+        last_wandb_log_time = now
 
     # state update
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
