@@ -69,6 +69,7 @@ parser.add_argument("--warmup-steps", type=int, default=40, help="number of step
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
 parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
+parser.add_argument("--resume-from-tag", type=str, default=None, help="model tag to resume from (default: same as --model-tag); use this to resume one run into a fresh output dir")
 # Evaluation
 parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
@@ -156,14 +157,18 @@ print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 
-# If we are resuming, overwrite the model parameters with those of the checkpoint
+# If we are resuming, overwrite the model parameters with those of the checkpoint.
+# Output (write) and resume-source (read) dirs can differ via --resume-from-tag,
+# so anneal/extension runs can land in their own dirs without clobbering the source.
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
-    print0(f"Resuming optimization from step {args.resume_from_step}")
-    model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    resume_dirname = args.resume_from_tag if args.resume_from_tag else output_dirname
+    resume_dir = os.path.join(base_dir, "base_checkpoints", resume_dirname)
+    print0(f"Resuming optimization from step {args.resume_from_step} (source: {resume_dir})")
+    model_data, optimizer_data, meta_data = load_checkpoint(resume_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
     del model_data # free up this memory after the copy
 
