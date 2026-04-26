@@ -95,13 +95,10 @@ def _get_compiled_flex_attention():
     global _compiled_flex_attention
     if _compiled_flex_attention is None:
         from torch.nn.attention.flex_attention import flex_attention
-        # max-autotune-no-cudagraphs: pick best Triton kernel per shape; skip
-        # cudagraphs since they don't compose well with DDP / grad accumulation.
-        # First call pays significant compile/autotune cost (tens of seconds);
-        # subsequent calls reuse the cached kernel.
-        _compiled_flex_attention = torch.compile(
-            flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs"
-        )
+        # Default mode. max-autotune-no-cudagraphs OOMs at d24 on Blackwell
+        # (autotune keeps multiple kernel candidates resident) and didn't help
+        # throughput when it did fit, so not worth it.
+        _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
     return _compiled_flex_attention
 
 
