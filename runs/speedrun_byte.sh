@@ -55,6 +55,10 @@ WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
 # so a checkpoint anywhere in the flat phase sits in a steady-state regime --
 # good for anneal-from-checkpoint extensions and flexible stop times.
 WARMDOWN_RATIO="${WARMDOWN_RATIO:-0.1}"
+# SAVE_EVERY: write a checkpoint every N steps (-1 = only end + the
+# automatic pre-warmdown checkpoint). Default 500 so anneal-from-checkpoint
+# extensions have a few mid-flat branch points to choose from.
+SAVE_EVERY="${SAVE_EVERY:-500}"
 # SFT is skipped by default: small byte models (d12) often aren't coherent enough
 # after pretraining for SFT to land as anything but chat-format mimicry. Set
 # RUN_SFT=1 once base_eval shows BPB/CORE indicating real learning.
@@ -88,6 +92,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train -
     --target-param-data-ratio="$TARGET_DATA_RATIO" \
     --window-pattern="$WINDOW_PATTERN" \
     --warmdown-ratio="$WARMDOWN_RATIO" \
+    --save-every="$SAVE_EVERY" \
     --model-tag="$MODEL_TAG" \
     $FP8_ARG \
     --run="$WANDB_RUN"
