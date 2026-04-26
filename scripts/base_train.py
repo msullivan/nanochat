@@ -438,16 +438,31 @@ last_wandb_log_time = 0.0 # wall-clock of last train-stats wandb push; 0 forces 
 # Graceful save/exit signaling. Two triggers, both checked at the top of the
 # main loop:
 #   - SIGUSR1 (kill -USR1 <pid>) -> save checkpoint and continue training.
-#   - wandb dashboard "Stop Run" button -> save checkpoint and exit cleanly.
-# Multi-rank caveat: SIGUSR1 must be sent to every rank (signals don't broadcast
-# through DDP); the wandb-stop check broadcasts via dist so all ranks agree.
+#   - SIGINT (Ctrl-C, OR wandb dashboard "Stop Run" button which sends SIGINT
+#     in wandb >=0.26) -> save checkpoint and exit cleanly.
+# Multi-rank caveat: SIGUSR1 must be sent to every rank manually. SIGINT is
+# usually forwarded by torchrun to all workers, but if not, send to all.
+# A second SIGINT after the first restores default behavior (immediate exit)
+# in case the save itself is hanging.
 signal_save_requested = False
 signal_exit_requested = False
-def _request_save_handler(signum, frame):
+def _save_handler(signum, frame):
     global signal_save_requested
     signal_save_requested = True
     print(f"[rank {ddp_rank}] received SIGUSR1, will save checkpoint at next loop iteration", flush=True)
-signal.signal(signal.SIGUSR1, _request_save_handler)
+def _save_and_exit_handler(signum, frame):
+    global signal_save_requested, signal_exit_requested
+    if signal_exit_requested:
+        # Second SIGINT -- restore default and re-raise so user can force-quit
+        # if the graceful save is taking too long or hung.
+        print(f"[rank {ddp_rank}] second SIGINT received, exiting immediately", flush=True)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        raise KeyboardInterrupt
+    signal_save_requested = True
+    signal_exit_requested = True
+    print(f"[rank {ddp_rank}] received SIGINT (Ctrl-C / wandb Stop), will save and exit at next loop iteration", flush=True)
+signal.signal(signal.SIGUSR1, _save_handler)
+signal.signal(signal.SIGINT, _save_and_exit_handler)
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -463,14 +478,11 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # Check wandb's "Stop Run" button (cooperative -- only fires if we look).
-    # Only master has a real wandb client; broadcast to all ranks so they save together.
-    if master_process and getattr(wandb_run, "should_stop", False):
-        signal_save_requested = True
-        signal_exit_requested = True
+    # Multi-rank consensus on exit: if any rank received SIGINT and didn't have
+    # it forwarded, broadcast the flag so all ranks save+exit together.
     if is_ddp_initialized():
         flag = torch.tensor([1 if signal_exit_requested else 0], device=device)
-        torch.distributed.broadcast(flag, src=0)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
         if flag.item():
             signal_save_requested = True
             signal_exit_requested = True
