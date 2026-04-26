@@ -17,6 +17,7 @@ import gc
 import json
 import time
 import math
+import signal
 import argparse
 from dataclasses import asdict
 from contextlib import contextmanager
@@ -101,6 +102,11 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+# Use the training step we log as the canonical x-axis for all metrics, instead
+# of wandb's internal call counter. Lets us log on a non-uniform cadence (e.g.
+# time-based) without misaligning train vs val vs core curves.
+wandb_run.define_metric("step")
+wandb_run.define_metric("*", step_metric="step")
 
 # Flash Attention status
 from nanochat.flash_attention import BACKEND
@@ -422,6 +428,20 @@ else:
     total_training_time = loop_state["total_training_time"]
 last_wandb_log_time = 0.0 # wall-clock of last train-stats wandb push; 0 forces an immediate first log
 
+# Graceful save/exit signaling. Two triggers, both checked at the top of the
+# main loop:
+#   - SIGUSR1 (kill -USR1 <pid>) -> save checkpoint and continue training.
+#   - wandb dashboard "Stop Run" button -> save checkpoint and exit cleanly.
+# Multi-rank caveat: SIGUSR1 must be sent to every rank (signals don't broadcast
+# through DDP); the wandb-stop check broadcasts via dist so all ranks agree.
+signal_save_requested = False
+signal_exit_requested = False
+def _request_save_handler(signum, frame):
+    global signal_save_requested
+    signal_save_requested = True
+    print(f"[rank {ddp_rank}] received SIGUSR1, will save checkpoint at next loop iteration", flush=True)
+signal.signal(signal.SIGUSR1, _request_save_handler)
+
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -435,6 +455,18 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * total_batch_size * step
+
+    # Check wandb's "Stop Run" button (cooperative -- only fires if we look).
+    # Only master has a real wandb client; broadcast to all ranks so they save together.
+    if master_process and getattr(wandb_run, "should_stop", False):
+        signal_save_requested = True
+        signal_exit_requested = True
+    if is_ddp_initialized():
+        flag = torch.tensor([1 if signal_exit_requested else 0], device=device)
+        torch.distributed.broadcast(flag, src=0)
+        if flag.item():
+            signal_save_requested = True
+            signal_exit_requested = True
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
@@ -494,10 +526,11 @@ while True:
 
     # save checkpoint: at the end of the run, the last flat-phase step (the
     # natural branch point for trapezoidal anneal-from-checkpoint extensions),
-    # or every save_every steps, except at the first step or the resume step
+    # every save_every steps (except at the first/resume step), or whenever
+    # SIGUSR1 was received since the last save.
     warmdown_start = num_iterations - round(args.warmdown_ratio * num_iterations)
     is_pre_warmdown = step == warmdown_start and step > 0 and step != num_iterations
-    if last_step or is_pre_warmdown or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    if last_step or is_pre_warmdown or signal_save_requested or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
@@ -521,9 +554,13 @@ while True:
             },
             rank=ddp_rank,
         )
+        signal_save_requested = False
 
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
+        break
+    if signal_exit_requested:
+        print0(f"Exiting after save at step {step} (wandb Stop Run requested)")
         break
 
     # -------------------------------------------------------------------------
