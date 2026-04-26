@@ -50,12 +50,17 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 # context. d12 byte experiments showed SLSL gave no BPB/CORE benefit despite
 # costing ~19% more attention FLOPs, so default to SSSL.
 WINDOW_PATTERN="${WINDOW_PATTERN:-SSSL}"
+# WARMDOWN_RATIO: fraction of iterations spent in linear LR warmdown (to
+# final_lr_frac). Upstream default is 0.65; we use 0.1 (trapezoidal/WSD shape)
+# so a checkpoint anywhere in the flat phase sits in a steady-state regime --
+# good for anneal-from-checkpoint extensions and flexible stop times.
+WARMDOWN_RATIO="${WARMDOWN_RATIO:-0.1}"
 # SFT is skipped by default: small byte models (d12) often aren't coherent enough
 # after pretraining for SFT to land as anything but chat-format mimicry. Set
 # RUN_SFT=1 once base_eval shows BPB/CORE indicating real learning.
 RUN_SFT="${RUN_SFT:-0}"
 
-echo "=== byte run: depth=$DEPTH tag=$MODEL_TAG ratio=$TARGET_DATA_RATIO seq_len=$MAX_SEQ_LEN window=$WINDOW_PATTERN ==="
+echo "=== byte run: depth=$DEPTH tag=$MODEL_TAG ratio=$TARGET_DATA_RATIO seq_len=$MAX_SEQ_LEN window=$WINDOW_PATTERN warmdown=$WARMDOWN_RATIO ==="
 
 # -----------------------------------------------------------------------------
 # Fresh report
@@ -82,6 +87,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.base_train -
     --device-batch-size="$DEVICE_BATCH_SIZE" \
     --target-param-data-ratio="$TARGET_DATA_RATIO" \
     --window-pattern="$WINDOW_PATTERN" \
+    --warmdown-ratio="$WARMDOWN_RATIO" \
     --model-tag="$MODEL_TAG" \
     $FP8_ARG \
     --run="$WANDB_RUN"

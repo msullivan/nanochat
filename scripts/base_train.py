@@ -387,9 +387,16 @@ def get_muon_momentum(it):
     else:
         return 0.97
 
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
+# Weight decay scheduler: constant during flat-LR phase, linear decay to 0 over the warmdown window.
+# Matches the LR/momentum schedule shape so mid-training checkpoints sit in a steady-state regime
+# (enables trapezoidal/WSD anneal-from-checkpoint experiments and flexible stop times).
 def get_weight_decay(it):
-    return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
+    warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    warmdown_start = num_iterations - warmdown_iters
+    if it < warmdown_start:
+        return weight_decay_scaled
+    progress = (it - warmdown_start) / warmdown_iters
+    return weight_decay_scaled * (1 - progress)
 
 # -----------------------------------------------------------------------------
 # Training loop
