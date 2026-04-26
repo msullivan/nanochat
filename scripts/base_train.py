@@ -468,6 +468,46 @@ while True:
             signal_save_requested = True
             signal_exit_requested = True
 
+    # save checkpoint: at the end of the run, the last flat-phase step (the
+    # natural branch point for trapezoidal anneal-from-checkpoint extensions),
+    # every save_every steps (except at the first/resume step), or whenever
+    # SIGUSR1 / wandb-stop was requested since the last save.
+    # Save runs *before* the eval blocks so a SIGUSR1 / Stop click takes effect
+    # immediately, even if a long CORE eval is scheduled at this same step.
+    warmdown_start = num_iterations - round(args.warmdown_ratio * num_iterations)
+    is_pre_warmdown = step == warmdown_start and step > 0 and step != num_iterations
+    if last_step or is_pre_warmdown or signal_save_requested or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(), # model parameters
+            optimizer.state_dict(), # optimizer state
+            { # metadata saved as json
+                "step": step,
+                "val_bpb": val_bpb, # loss at most recent eval (may be from a previous step)
+                "model_config": model_config_kwargs,
+                "user_config": user_config, # inputs to the training script
+                "byte_tokenizer": args.byte_tokenizer,
+                "device_batch_size": args.device_batch_size,
+                "max_seq_len": args.max_seq_len,
+                "total_batch_size": total_batch_size,
+                "dataloader_state_dict": dataloader_state_dict,
+                "loop_state": { # all loop state (other than step) so that we can resume training
+                    "min_val_bpb": min_val_bpb,
+                    "smooth_train_loss": smooth_train_loss,
+                    "total_training_time": total_training_time,
+                },
+            },
+            rank=ddp_rank,
+        )
+        signal_save_requested = False
+
+    # If we were asked to exit, do so now that the checkpoint is on disk;
+    # skip the (potentially long) eval/sample blocks at this step.
+    if signal_exit_requested:
+        print0(f"Exiting after save at step {step} (wandb Stop Run requested)")
+        break
+
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
         model.eval()
@@ -524,43 +564,8 @@ while True:
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint: at the end of the run, the last flat-phase step (the
-    # natural branch point for trapezoidal anneal-from-checkpoint extensions),
-    # every save_every steps (except at the first/resume step), or whenever
-    # SIGUSR1 was received since the last save.
-    warmdown_start = num_iterations - round(args.warmdown_ratio * num_iterations)
-    is_pre_warmdown = step == warmdown_start and step > 0 and step != num_iterations
-    if last_step or is_pre_warmdown or signal_save_requested or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "byte_tokenizer": args.byte_tokenizer,
-                "device_batch_size": args.device_batch_size,
-                "max_seq_len": args.max_seq_len,
-                "total_batch_size": total_batch_size,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
-                    "smooth_train_loss": smooth_train_loss,
-                    "total_training_time": total_training_time,
-                },
-            },
-            rank=ddp_rank,
-        )
-        signal_save_requested = False
-
     # termination conditions (TODO: possibly also add loss explosions etc.)
     if last_step:
-        break
-    if signal_exit_requested:
-        print0(f"Exiting after save at step {step} (wandb Stop Run requested)")
         break
 
     # -------------------------------------------------------------------------
