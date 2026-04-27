@@ -7,7 +7,13 @@ set -e
 # Example launches:
 #   bash runs/finetune.sh
 #   WANDB_RUN=sft-d24 bash runs/finetune.sh
+#   MODEL_TAG=d24-byte OUTPUT_TAG=d24-byte-cute bash runs/finetune.sh
 #   screen -L -Logfile runs/finetune.log -S finetune bash runs/finetune.sh
+#
+# Env knobs:
+#   MODEL_TAG    base checkpoint to load from (default: chat_sft.py picks d{depth})
+#   OUTPUT_TAG   SFT checkpoint dir to write to (default: same as MODEL_TAG)
+#   WANDB_RUN    wandb run name; "dummy" disables logging (default: dummy)
 
 export OMP_NUM_THREADS=1
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
@@ -48,6 +54,9 @@ fi
 # different mixture doesn't clobber an earlier run). Eval picks up the same tag.
 SFT_EXTRA_ARGS=()
 EVAL_EXTRA_ARGS=()
+if [ -n "$MODEL_TAG" ]; then
+    SFT_EXTRA_ARGS+=(--model-tag="$MODEL_TAG")
+fi
 if [ -n "$OUTPUT_TAG" ]; then
     SFT_EXTRA_ARGS+=(--output-tag="$OUTPUT_TAG")
     EVAL_EXTRA_ARGS+=(-g "$OUTPUT_TAG")
