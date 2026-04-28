@@ -17,6 +17,7 @@ Structured output:
 import json
 import os
 import subprocess
+import tempfile
 
 import requests
 
@@ -29,6 +30,14 @@ except ImportError:
     pass
 
 AI_GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/chat/completions"
+
+# Spawn `claude` from a directory with no CLAUDE.md / project memory so the
+# caller's system prompt is evaluated in isolation. Without this, project memory
+# (~/.claude/projects/<encoded-cwd>/memory/) auto-loads and Claude Code may
+# evaluate generation prompts against the surrounding project context -- which
+# in the nanochat repo causes Haiku to refuse stylistic-rewrite tasks as
+# suspected prompt injections.
+_CLAUDE_CLEAN_CWD = tempfile.mkdtemp(prefix="claude-clean-")
 
 
 def chat_completion(
@@ -114,10 +123,15 @@ def _claude_completion(messages, *, model=None, example_output=None, timeout=600
     if model:
         args.extend(["--model", model])
     if system:
-        args.extend(["--append-system-prompt", system])
+        # Use --system-prompt (replace) rather than --append-system-prompt (add)
+        # so Claude Code's coding-assistant base prompt doesn't leak through and
+        # cause the model to evaluate our caller's prompt as an "instruction"
+        # rather than a task. Combined with running from a clean cwd (no
+        # CLAUDE.md / project memory), this gives a generic LLM-API behavior.
+        args.extend(["--system-prompt", system])
     args.append(user)
 
-    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=_CLAUDE_CLEAN_CWD)
     if proc.returncode != 0:
         raise RuntimeError(
             f"claude -p failed (exit {proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
