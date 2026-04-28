@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+set -ex
 
 # Run SFT + eval starting from a pretrained base model.
 # Assumes base_checkpoints/ already exists in $NANOCHAT_BASE_DIR (i.e. base_train.py has been run).
