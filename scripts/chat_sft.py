@@ -189,10 +189,16 @@ train_tasks = [
     CustomJSON(filepath=pep827_filepath), # 2 epochs
     *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
-    SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
-    SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
-    Addition(size=150000, split="train"), # 150K rows of Addition (mostly 2-term, some 3/4/5-term)
-    Multiplication(size=50000, split="train"), # 50K rows of Multiplication (small direct, larger by partial products)
+
+    SimpleSpelling(size=1000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
+    SpellingBee(size=1000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    Addition(size=1000, split="train"), # 150K rows of Addition (mostly 2-term, some 3/4/5-term)
+    Multiplication(size=1000, split="train"), # 50K rows of Multiplication (small direct, larger by partial products)
+
+    # SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
+    # SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    # Addition(size=150000, split="train"), # 150K rows of Addition (mostly 2-term, some 3/4/5-term)
+    # Multiplication(size=50000, split="train"), # 50K rows of Multiplication (small direct, larger by partial products)
 ]
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
