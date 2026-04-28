@@ -58,18 +58,18 @@ def _atomic_json_dump(obj, path):
     os.replace(tmp_path, path)
 
 class _block_signals:
-    """Block SIGINT/SIGTERM for the duration of the with-block. Pending signals
-    are queued by the kernel and delivered when we unblock, so a wandb 'Stop
-    Run' or repeated Ctrl-C can't interrupt torch.save mid-write — the save
+    """Block SIGINT for the duration of the with-block. A pending SIGINT is
+    queued by the kernel and delivered when we unblock, so a wandb 'Stop Run'
+    or repeated Ctrl-C can't interrupt torch.save mid-write — the save
     completes and then the queued signal fires.
 
-    SIGQUIT (Ctrl-\\ or `kill -QUIT`) is intentionally NOT blocked, so it remains
-    a true nuclear escape hatch if the save itself hangs. SIGKILL is unmaskable
-    by definition.
+    SIGTERM is intentionally NOT blocked: a real `kill <pid>` should still
+    abort cleanly. SIGQUIT (Ctrl-\\) and SIGKILL are also unblocked/unblockable
+    as deeper escape hatches if the save hangs.
     """
     def __enter__(self):
         self._old = signal.pthread_sigmask(signal.SIG_BLOCK,
-                                            {signal.SIGINT, signal.SIGTERM})
+                                            {signal.SIGINT})
         return self
     def __exit__(self, *exc):
         signal.pthread_sigmask(signal.SIG_SETMASK, self._old)
@@ -78,11 +78,11 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
     """Save a checkpoint atomically, robust against mid-save interruption.
 
     Three protections combine:
-      1. SIGINT/SIGTERM are blocked during the save (see _block_signals). A
-         wandb 'Stop Run' SIGINT or a double-Ctrl-C is queued by the kernel
-         and delivered after the save completes, so the checkpoint always
-         lands intact. SIGQUIT (Ctrl-\\) remains unmasked for true emergency
-         exit if the save itself hangs.
+      1. SIGINT is blocked during the save (see _block_signals). A wandb 'Stop
+         Run' SIGINT or a double-Ctrl-C is queued by the kernel and delivered
+         after the save completes, so the checkpoint always lands intact.
+         SIGTERM, SIGQUIT, and SIGKILL all remain unblocked as escape hatches
+         if the save itself hangs.
       2. Each file is written via .tmp + os.replace, so even an unmaskable
          death (SIGQUIT, SIGKILL, OOM-killer, host shutdown) leaves an
          orphaned .tmp rather than a corrupt named file. The previous good
