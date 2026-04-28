@@ -89,10 +89,7 @@ else:
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
-    project="nanochat-sft", name=args.run, config=user_config,
-    settings=wandb.Settings(console_multipart=True),
-)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
 
 # Flash Attention status
 if not HAS_FA3:

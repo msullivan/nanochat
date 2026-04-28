@@ -102,12 +102,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
-    project="nanochat", name=args.run, config=user_config,
-    # console_multipart=True names each session's console log with a timestamp
-    # so resumed runs don't clobber prior sessions' output.log on the server.
-    settings=wandb.Settings(console_multipart=True),
-)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 # Use the training step we log as the canonical x-axis for all metrics, instead
 # of wandb's internal call counter. Lets us log on a non-uniform cadence (e.g.
 # time-based) without misaligning train vs val vs core curves.
