@@ -63,6 +63,9 @@ def main():
                    help="(extend only) new total iteration count (env: NEW_TOTAL)")
     p.add_argument("--warmdown-ratio", **env_arg("WARMDOWN_RATIO", type_=float, default=0.1),
                    help="warmdown fraction of total iterations (env: WARMDOWN_RATIO)")
+    p.add_argument("--lr-breakpoints", **env_arg("LR_BREAKPOINTS", default=""),
+                   help="piecewise-linear LR breakpoints during the stable phase, "
+                        "e.g. '4000:1.0,4200:0.8' (env: LR_BREAKPOINTS). Forwarded to base_train.")
     p.add_argument("--save-every", **env_arg("SAVE_EVERY", type_=int, default=500),
                    help="checkpoint cadence (env: SAVE_EVERY)")
     p.add_argument("--nproc", **env_arg("NPROC_PER_NODE", type_=int, default=8),
@@ -148,6 +151,8 @@ def main():
         train_cmd.append("--byte-tokenizer")
     if src["fp8"]:
         train_cmd.append("--fp8")
+    if args.lr_breakpoints:
+        train_cmd.append(f"--lr-breakpoints={args.lr_breakpoints}")
 
     env = os.environ.copy()
     env["NANOCHAT_REPORT_TAG"] = output_tag

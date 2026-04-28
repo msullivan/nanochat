@@ -69,6 +69,7 @@ parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate 
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
+parser.add_argument("--lr-breakpoints", type=str, default="", help="comma-separated 'step:lrm' breakpoints for piecewise-linear LR during the stable phase, e.g. '4000:1.0,4200:0.8' holds 1.0 until 4000, ramps to 0.8 by 4200, then holds 0.8 until warmdown. Affects LR only; momentum/WD still follow the warmdown window.")
 parser.add_argument("--resume-from-step", type=str, default="-1", help="resume training from this step (-1 = disable, 'latest' = highest step in resume dir)")
 parser.add_argument("--resume-from-tag", type=str, default=None, help="model tag to resume from (default: same as --model-tag); use this to resume one run into a fresh output dir")
 # Evaluation
@@ -385,17 +386,65 @@ print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
+# Learning rate schedule. Three phases:
+#   1. Linear warmup from 0 to 1.0 over `warmup_steps`.
+#   2. Stable phase: 1.0, optionally with piecewise-linear breakpoints.
+#      `--lr-breakpoints "s1:m1,s2:m2,..."` defines anchors interpolated linearly;
+#      points before the first breakpoint sit at 1.0, points after the last sit at
+#      its multiplier. Breakpoints are validated to lie inside the stable phase.
+#   3. Linear warmdown from the stable-phase-end multiplier to `final_lr_frac`.
+def _parse_lr_breakpoints(spec):
+    """Parse 'step1:lrm1,step2:lrm2,...' into a sorted list of (step, lrm)."""
+    if not spec.strip():
+        return []
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        step_s, lrm_s = part.split(":")
+        out.append((int(step_s), float(lrm_s)))
+    out.sort()
+    for i in range(1, len(out)):
+        if out[i][0] <= out[i-1][0]:
+            raise ValueError(f"--lr-breakpoints steps must be strictly increasing; got {out}")
+    return out
+
+LR_BREAKPOINTS = _parse_lr_breakpoints(args.lr_breakpoints)
+_warmdown_iters_static = round(args.warmdown_ratio * num_iterations)
+_warmdown_start_static = num_iterations - _warmdown_iters_static
+for _bp_step, _bp_lrm in LR_BREAKPOINTS:
+    if _bp_step < args.warmup_steps or _bp_step > _warmdown_start_static:
+        raise ValueError(
+            f"--lr-breakpoints step {_bp_step} must lie in [warmup_steps={args.warmup_steps}, "
+            f"warmdown_start={_warmdown_start_static}]"
+        )
+print0(f"LR breakpoints: {LR_BREAKPOINTS or '(none — flat 1.0 stable phase)'}")
+# Stable-phase-end LR multiplier (warmdown starts from here, not from 1.0).
+_stable_end_lrm = LR_BREAKPOINTS[-1][1] if LR_BREAKPOINTS else 1.0
+
 def get_lr_multiplier(it):
     warmup_iters = args.warmup_steps
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
+    warmdown_start = num_iterations - warmdown_iters
     if it < warmup_iters:
         return (it + 1) / warmup_iters
-    elif it <= num_iterations - warmdown_iters:
-        return 1.0
-    else:
+    if it >= warmdown_start:
         progress = (num_iterations - it) / warmdown_iters
-        return progress * 1.0 + (1 - progress) * args.final_lr_frac
+        return progress * _stable_end_lrm + (1 - progress) * args.final_lr_frac
+    # Stable phase, optionally with piecewise-linear breakpoints.
+    if not LR_BREAKPOINTS:
+        return 1.0
+    prev_step, prev_lrm = warmup_iters, 1.0
+    for bp_step, bp_lrm in LR_BREAKPOINTS:
+        if it <= bp_step:
+            span = bp_step - prev_step
+            if span <= 0:
+                return bp_lrm
+            t = (it - prev_step) / span
+            return (1 - t) * prev_lrm + t * bp_lrm
+        prev_step, prev_lrm = bp_step, bp_lrm
+    return prev_lrm
 
 # Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
 def get_muon_momentum(it):
