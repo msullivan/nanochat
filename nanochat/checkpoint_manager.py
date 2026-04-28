@@ -7,6 +7,7 @@ import glob
 import json
 import logging
 import torch
+import torch.distributed as dist
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
@@ -56,22 +57,45 @@ def _atomic_json_dump(obj, path):
     os.replace(tmp_path, path)
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
-    if rank == 0:
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
-        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
-        _atomic_torch_save(model_data, model_path)
-        logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
-        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
-        _atomic_json_dump(meta_data, meta_path)
-        logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
+    """Save a checkpoint atomically, robust against mid-save interruption.
+
+    Two protections combine:
+      1. Each file is written via .tmp + os.replace, so an interrupted write
+         (KeyboardInterrupt, OOM-killer, host shutdown) leaves an orphaned .tmp
+         rather than a corrupt named file. The previous good checkpoint stays
+         intact and 'latest' keeps resolving to it.
+      2. model_<step>.pt is written LAST, after meta and all optimizer shards.
+         Existence of model_<step>.pt thus proves the full checkpoint set is on
+         disk and loadable; 'latest'-resolution code that scans for model_*.pt
+         only sees complete checkpoints.
+
+    Note: signals are intentionally NOT blocked during the save so that a
+    double-SIGINT escape hatch still works (e.g., if the save itself hangs).
+    The atomic-write + reorder makes that escape safe — worst case is a few
+    leftover .tmp files, never a checkpoint that load_checkpoint will choke on.
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    # 1. Optimizer (per-rank, sharded).
     if optimizer_data is not None:
-        os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         _atomic_torch_save(optimizer_data, optimizer_path)
         logger.info(f"Saved optimizer state to: {optimizer_path}")
+    # 2. Wait for all ranks to finish their optim shards before rank 0 writes
+    # meta + model. Otherwise a slow non-zero rank could still be writing optim
+    # while model_<step>.pt already advertises the checkpoint as complete.
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+    # 3. Meta (rank 0 only).
+    if rank == 0:
+        meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
+        _atomic_json_dump(meta_data, meta_path)
+        logger.info(f"Saved metadata to: {meta_path}")
+    # 4. Model (rank 0, LAST). Existence of this file is the
+    # checkpoint-complete marker for 'latest'-resolution.
+    if rank == 0:
+        model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
+        _atomic_torch_save(model_data, model_path)
+        logger.info(f"Saved model parameters to: {model_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
     # Load the model state
