@@ -18,12 +18,12 @@ set -e
 # WANDB_RUN_ID to the original run's id (last path component of the wandb URL):
 #   WANDB_RUN_ID=abc12345 bash runs/resume_d24_byte_l.sh
 #
-# LR schedule: piecewise — hold 1.0 until step 3800, ramp linearly to 0.8 by
+# LR schedule: piecewise — hold 1.0 until step 3750, ramp linearly to 0.8 by
 # step 4000, then hold 0.8 until the existing wd_ratio=0.1 warmdown window
 # opens (~step 18,720 at ratio=16). WSD-style iterative cooldown to escape the
 # diminishing-returns plateau the run hit at flat LR=1.0. Old checkpoints are
 # preserved, so reverting to the LR=1.0 trajectory just means resuming from a
-# pre-3800 checkpoint without --lr-breakpoints.
+# pre-3750 checkpoint without --lr-breakpoints.
 
 cd "$(dirname "$0")/.."
 
@@ -48,7 +48,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --target-param-data-ratio=16 \
     --window-pattern=L \
     --warmdown-ratio=0.1 \
-    --lr-breakpoints="3800:1.0,4000:0.8" \
+    --lr-breakpoints="3750:1.0,4000:0.8" \
     --save-every=100 \
     --resume-from-step=latest \
     --model-tag=d24-byte-l \
