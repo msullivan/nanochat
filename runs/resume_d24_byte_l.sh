@@ -69,6 +69,11 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- \
 # pod is 1×GPU. Uses a separate output tag so SFT checkpoints don't clobber
 # the base under d24-byte-l/.
 if [ "${SKIP_SFT:-0}" != "1" ]; then
+    # SFT is a fresh wandb run in the nanochat-sft project. If the caller set
+    # WANDB_RUN_ID / WANDB_RESUME for the base-train resume above, those values
+    # are stale for SFT and would cause "invalid resume='must' for run that has
+    # not been initialized" against the SFT project. Strip them.
+    unset WANDB_RUN_ID WANDB_RESUME
     NPROC_PER_NODE=1 \
     DEVICE_BATCH_SIZE=8 \
     MODEL_TAG=d24-byte-l \
