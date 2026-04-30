@@ -1,19 +1,10 @@
-"""Back up all checkpoints in a nanochat checkpoint dir to a target directory,
-then delete all but the most recent N from the source.
+"""Move all but the most recent N checkpoints from a nanochat checkpoint dir
+to a target directory.
 
 A "checkpoint" is the set of files for a given training step:
     model_{step:06d}.pt
     meta_{step:06d}.json
     optim_{step:06d}_rank{rank:d}.pt   (one per rank)
-
-Default behaviour (no flags): copy *every* checkpoint to target if not
-already present there with matching size, then delete all but the last N
-checkpoints from source. So target accumulates the full history; source
-keeps only the recent tail.
-
-Flags:
-    --copy-only   copy everything to target; never delete from source.
-    --prune-only  delete old checkpoints from source; never copy.
 
 Default is dry-run; pass --execute to actually copy/delete.
 """
@@ -72,47 +63,28 @@ def main():
 
     steps_sorted = sorted(by_step.keys())
     keep_steps = set(steps_sorted[-args.keep:]) if args.keep > 0 else set()
-    delete_steps = [s for s in steps_sorted if s not in keep_steps]
+    move_steps = [s for s in steps_sorted if s not in keep_steps]
 
     do_copy = not args.prune_only
     do_delete = not args.copy_only
+    verb = "MOVE" if (do_copy and do_delete) else ("COPY" if do_copy else "PRUNE")
     prefix = "[dry-run] " if not args.execute else ""
-
-    # Process every step that needs touching: all of them when copying, just
-    # the delete set when prune-only.
-    process_steps = steps_sorted if do_copy else delete_steps
 
     print(f"{prefix}source: {args.source}")
     print(f"{prefix}target: {args.target}")
     print(f"{prefix}found {len(steps_sorted)} checkpoints: {steps_sorted}")
-    print(f"{prefix}keeping in source: {sorted(keep_steps)}")
-    if do_copy:
-        print(f"{prefix}copying to target: {steps_sorted}")
-    if do_delete and delete_steps:
-        print(f"{prefix}pruning from source: {delete_steps}")
+    print(f"{prefix}keeping {sorted(keep_steps)}; will {verb.lower()} {move_steps}")
 
-    if not process_steps:
+    if not move_steps:
         print(f"{prefix}nothing to do")
         return
 
     if args.execute and do_copy:
         os.makedirs(args.target, exist_ok=True)
 
-    total_copied = 0
-    total_deleted = 0
-    for step in process_steps:
+    total_bytes = 0
+    for step in move_steps:
         files = sorted(by_step[step])
-        will_delete = do_delete and step in set(delete_steps)
-        will_copy = do_copy
-        # Per-step verb purely for the log line.
-        if will_copy and will_delete:
-            verb = "MOVE"
-        elif will_copy:
-            verb = "COPY"
-        elif will_delete:
-            verb = "PRUNE"
-        else:
-            continue
         step_bytes = 0
         for name in files:
             src = os.path.join(args.source, name)
@@ -122,7 +94,7 @@ def main():
             print(f"{prefix}  {verb} {name} ({human_size(size)})")
             if not args.execute:
                 continue
-            if will_copy:
+            if do_copy:
                 if os.path.exists(dst):
                     if os.path.getsize(dst) != size:
                         sys.exit(f"error: {dst} exists with different size; aborting")
@@ -131,16 +103,12 @@ def main():
                     tmp = dst + ".part"
                     shutil.copy2(src, tmp)
                     os.replace(tmp, dst)
-                    total_copied += size
-            if will_delete:
+            if do_delete:
                 os.remove(src)
-                total_deleted += size
+        total_bytes += step_bytes
         print(f"{prefix}  step {step}: {human_size(step_bytes)}")
 
-    if do_copy:
-        print(f"{prefix}copied {human_size(total_copied)} new bytes to target")
-    if do_delete:
-        print(f"{prefix}deleted {human_size(total_deleted)} from source ({len(delete_steps)} checkpoints pruned)")
+    print(f"{prefix}total: {human_size(total_bytes)} across {len(move_steps)} checkpoints")
     if not args.execute:
         print("(dry-run; pass --execute to apply)")
 
