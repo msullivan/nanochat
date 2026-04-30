@@ -62,3 +62,17 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
 torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- \
     --device-batch-size=8 \
     --model-tag=d24-byte-l
+
+# -----------------------------------------------------------------------------
+# Chain SFT + eval onto the freshly trained base. Skip with SKIP_SFT=1.
+# Inherits the single-GPU config (NPROC=1, device_batch_size=8) since this
+# pod is 1×GPU. Uses a separate output tag so SFT checkpoints don't clobber
+# the base under d24-byte-l/.
+if [ "${SKIP_SFT:-0}" != "1" ]; then
+    NPROC_PER_NODE=1 \
+    DEVICE_BATCH_SIZE=8 \
+    MODEL_TAG=d24-byte-l \
+    OUTPUT_TAG=d24-byte-l-sft \
+    WANDB_RUN="${SFT_WANDB_RUN:-d24-byte-l-sft}" \
+    bash runs/finetune.sh
+fi
