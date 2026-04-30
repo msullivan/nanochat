@@ -633,18 +633,17 @@ while True:
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
     print0(f"step {step:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.2f} | epoch: {current_epoch} | total time: {total_training_time/60:.2f}m")
-    if step % 10 == 0:
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "train/loss": debiased_smooth_loss,
-            "train/lrm": lrm,
-            "train/dt": dt,
-            "train/tok_per_sec": tok_per_sec,
-            "train/mfu": mfu,
-            "train/epoch": current_epoch,
-        })
+    wandb_run.log({
+        "step": step,
+        "total_training_flops": flops_so_far,
+        "total_training_time": total_training_time,
+        "train/loss": debiased_smooth_loss,
+        "train/lrm": lrm,
+        "train/dt": dt,
+        "train/tok_per_sec": tok_per_sec,
+        "train/mfu": mfu,
+        "train/epoch": current_epoch,
+    })
 
     # The garbage collector spends ~500ms scanning for cycles quite frequently.
     # We manually manage it to avoid these pauses during training.
