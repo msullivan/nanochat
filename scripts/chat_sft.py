@@ -90,6 +90,12 @@ else:
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sft", name=args.run, config=user_config)
+# Use the training step we log as the canonical x-axis for all metrics, instead
+# of wandb's internal call counter. Lets us log on a non-uniform cadence (e.g.
+# eval every 200 steps + train every 10) without misaligning train vs val vs
+# chatcore curves.
+wandb_run.define_metric("step")
+wandb_run.define_metric("*", step_metric="step")
 
 # Flash Attention status
 if not HAS_FA3:
