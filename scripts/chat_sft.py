@@ -13,13 +13,14 @@ import gc
 import argparse
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import signal
 import time
 import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
 from nanochat.byte_tokenizer import ByteTokenizer, get_byte_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -69,6 +70,10 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+# Save / resume (mirrors base_train.py's pattern)
+parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--resume-from-step", type=str, default="-1", help="resume SFT from this step (-1 = disable, 'latest' = highest step in resume dir)")
+parser.add_argument("--resume-from-tag", type=str, default=None, help="SFT tag to resume from (default: same as --output-tag); use this to resume one run into a fresh output dir")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -101,7 +106,12 @@ wandb_run.define_metric("*", step_metric="step")
 if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
-# Load the model and tokenizer
+# Resume-detection. We always need to load the base first to get the model
+# architecture and tokenizer; if resuming, we then overwrite the model weights
+# (and optimizer + loop state below) with the in-progress SFT checkpoint.
+resuming = args.resume_from_step != "-1"
+
+# Load the model and tokenizer (from base; SFT weights applied later if resuming)
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
@@ -149,8 +159,10 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # Note: load_state_dict overwrites param_group metadata (LRs, betas, etc.) with the
 # pretrained values. Since pretraining warmdown brings LRs to ~0, we must save and
 # restore our fresh SFT LRs after loading.
+# Skip when resuming from an in-progress SFT checkpoint -- we'll load that
+# optimizer state below and don't want to also load the base's optim first.
 base_dir = get_base_dir()
-if args.load_optimizer:
+if args.load_optimizer and not resuming:
     optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
@@ -161,6 +173,37 @@ if args.load_optimizer:
         print0("Loaded optimizer state from pretrained checkpoint (momentum buffers only, LRs reset)")
     else:
         print0("WARNING: optimizer checkpoint not found, starting with fresh optimizer (slightly worse)")
+
+# If resuming an in-progress SFT run: overwrite the model weights and optimizer
+# state with the SFT checkpoint. Loop state and dataloader state are pulled out
+# below from the same meta_data.
+output_dirname = args.output_tag or args.model_tag or f"d{depth}"
+checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
+sft_meta_data = None
+if resuming:
+    resume_dirname = args.resume_from_tag if args.resume_from_tag else output_dirname
+    resume_dir = os.path.join(base_dir, "chatsft_checkpoints", resume_dirname)
+    if args.resume_from_step == "latest":
+        args.resume_from_step = find_last_step(resume_dir)
+    else:
+        args.resume_from_step = int(args.resume_from_step)
+    print0(f"Resuming SFT from step {args.resume_from_step} (source: {resume_dir})")
+    sft_model_data, sft_optim_data, sft_meta_data = load_checkpoint(resume_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
+    orig_model.load_state_dict(sft_model_data, strict=True, assign=True)
+    del sft_model_data
+    if sft_optim_data is not None:
+        # Save initial_lr from the freshly-built optimizer (set above by setup_optimizer)
+        # since load_state_dict will overwrite param_group metadata.
+        fresh_lrs = [group["lr"] for group in optimizer.param_groups]
+        optimizer.load_state_dict(sft_optim_data)
+        del sft_optim_data
+        # Restore the schedule-anchor LR; the schedule will then re-apply lrm
+        # against the saved-step's progress on the first iteration.
+        for group, lr in zip(optimizer.param_groups, fresh_lrs):
+            group["lr"] = lr
+        print0("Loaded SFT optimizer state from resume checkpoint")
+else:
+    args.resume_from_step = -1  # normalize for downstream comparisons
 
 # GradScaler for fp16 training (bf16/fp32 don't need it)
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
@@ -216,6 +259,10 @@ val_dataset = TaskMixture([
 last_step = False # we will toggle this to True when we reach the end of the training dataset
 approx_progress = 0.0 # will go from 0 to 1 over the course of the epoch
 current_epoch = 1 # track epoch for logging
+# Shared mutable state-dict for the train dataloader, updated after each yield.
+# Captured into save_checkpoint's meta and restored on resume so we don't replay
+# already-consumed conversations.
+dataloader_state = {"cursor": ddp_rank, "consumed": ddp_rank, "epoch": 1}
 def sft_data_generator_bos_bestfit(split, buffer_size=100):
     """
     BOS-aligned dataloader for SFT with bestfit-pad packing.
@@ -235,9 +282,14 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
     # Conversation buffer: list of (token_ids, loss_mask) tuples
     conv_buffer = []
-    cursor = ddp_rank  # Each rank processes different conversations (for fetching)
-    consumed = ddp_rank  # Track actual consumption separately from buffering
-    epoch = 1
+    if split == "train":
+        cursor = dataloader_state["cursor"]
+        consumed = dataloader_state["consumed"]
+        epoch = dataloader_state["epoch"]
+    else:
+        cursor = ddp_rank
+        consumed = ddp_rank
+        epoch = 1
     it = 0  # iteration counter
 
     def refill_buffer():
@@ -334,7 +386,22 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             if content_len < row_capacity:
                 targets[i, content_len-1:] = -1
 
+        # Publish the current state for the train loader so save_checkpoint can
+        # snapshot it. Val loader doesn't need to (it's rebuilt fresh per eval).
+        if split == "train":
+            dataloader_state["cursor"] = cursor
+            dataloader_state["consumed"] = consumed
+            dataloader_state["epoch"] = epoch
+
         yield inputs, targets
+
+# Restore dataloader state if resuming. Captured snapshot from the saved meta;
+# the generator reads these on its first iteration.
+if resuming and sft_meta_data is not None:
+    saved_dl = sft_meta_data.get("dataloader_state", None)
+    if saved_dl is not None:
+        dataloader_state.update(saved_dl)
+        print0(f"Restored dataloader state: {saved_dl}")
 
 train_loader = sft_data_generator_bos_bestfit("train")
 build_val_loader = lambda: sft_data_generator_bos_bestfit("val")
@@ -361,11 +428,48 @@ def get_muon_momentum(it):
 # -----------------------------------------------------------------------------
 # Training loop
 x, y = next(train_loader) # prefetch the very first batch of data
-min_val_bpb = float("inf")
-smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
-total_training_time = 0 # total wall-clock time of training
-step = 0
+val_bpb = None
+if resuming and sft_meta_data is not None:
+    step = sft_meta_data["step"]
+    val_bpb = sft_meta_data.get("val_bpb")
+    loop_state = sft_meta_data.get("loop_state", {})
+    min_val_bpb = loop_state.get("min_val_bpb", float("inf"))
+    smooth_train_loss = loop_state.get("smooth_train_loss", 0)
+    total_training_time = loop_state.get("total_training_time", 0)
+    progress = loop_state.get("progress", 0)
+    print0(f"Restored loop state: step={step}, min_val_bpb={min_val_bpb:.4f}, total_time={total_training_time/60:.2f}m")
+else:
+    step = 0
+    min_val_bpb = float("inf")
+    smooth_train_loss = 0
+    total_training_time = 0
+
+# Graceful save/exit signaling. Two triggers, both checked at the top of the
+# main loop:
+#   - SIGUSR1 (kill -USR1 <pid>) -> save checkpoint and continue training.
+#   - SIGINT (Ctrl-C, OR wandb dashboard "Stop Run") -> save and exit cleanly.
+# Multi-rank: SIGUSR1 must be sent to every rank manually; SIGINT is usually
+# forwarded by torchrun. A second SIGINT restores default handling (force-quit
+# escape hatch if the save itself hangs).
+signal_save_requested = False
+signal_exit_requested = False
+def _save_handler(signum, frame):
+    global signal_save_requested
+    signal_save_requested = True
+    print(f"[rank {ddp_rank}] received SIGUSR1, will save checkpoint at next loop iteration", flush=True)
+def _save_and_exit_handler(signum, frame):
+    global signal_save_requested, signal_exit_requested
+    if signal_exit_requested:
+        print(f"[rank {ddp_rank}] second SIGINT received, exiting immediately", flush=True)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        raise KeyboardInterrupt
+    signal_save_requested = True
+    signal_exit_requested = True
+    print(f"[rank {ddp_rank}] received SIGINT (Ctrl-C / wandb Stop), will save and exit at next loop iteration", flush=True)
+signal.signal(signal.SIGUSR1, _save_handler)
+signal.signal(signal.SIGINT, _save_and_exit_handler)
+
 while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
@@ -375,8 +479,57 @@ while True:
         dist.all_reduce(last_step_tensor, op=dist.ReduceOp.MAX)
         last_step = bool(last_step_tensor.item())
 
+    # Multi-rank consensus on exit: if any rank received SIGINT and didn't have
+    # it forwarded, broadcast the flag so all ranks save+exit together.
+    if is_ddp_initialized():
+        flag = torch.tensor([1 if signal_exit_requested else 0], device=device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        if flag.item():
+            signal_save_requested = True
+            signal_exit_requested = True
+
+    # Save checkpoint: at the end of the run, every save_every steps (excluding
+    # the resume step), or whenever SIGUSR1 / SIGINT was requested.
+    if last_step or signal_save_requested or (args.save_every > 0 and step > 0 and step != args.resume_from_step and step % args.save_every == 0):
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            orig_model.state_dict(),
+            optimizer.state_dict(),
+            {
+                "step": step,
+                "val_bpb": val_bpb,
+                "model_config": {
+                    "sequence_len": args.max_seq_len,
+                    "vocab_size": tokenizer.get_vocab_size(),
+                    "n_layer": depth,
+                    "n_head": model.config.n_head,
+                    "n_kv_head": model.config.n_kv_head,
+                    "n_embd": model.config.n_embd,
+                    "window_pattern": model.config.window_pattern,
+                },
+                "user_config": user_config,
+                "byte_tokenizer": isinstance(tokenizer, ByteTokenizer),
+                "dataloader_state": dict(dataloader_state),
+                "loop_state": {
+                    "min_val_bpb": min_val_bpb,
+                    "smooth_train_loss": smooth_train_loss,
+                    "total_training_time": total_training_time,
+                    "progress": progress,
+                },
+            },
+            rank=ddp_rank,
+        )
+        signal_save_requested = False
+
+    # If we were asked to exit, do so now that the checkpoint is on disk;
+    # skip the (potentially long) eval/sample blocks at this step.
+    if signal_exit_requested:
+        print0(f"Exiting after save at step {step} (SIGINT / wandb Stop requested)")
+        break
+
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
+    if step != args.resume_from_step and (last_step or (args.eval_every > 0 and step % args.eval_every == 0)):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
@@ -395,7 +548,7 @@ while True:
     # once in a while: estimate the ChatCORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     chatcore_results = {}
-    if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
+    if args.chatcore_every > 0 and step != args.resume_from_step and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
         engine = Engine(orig_model, tokenizer)
         all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
@@ -426,33 +579,6 @@ while True:
             **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
         })
         model.train()
-
-    # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
-    if last_step:
-        output_dirname = args.output_tag or args.model_tag or f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            optimizer.state_dict(),
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": args.max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                    "window_pattern": model.config.window_pattern,
-                },
-                "user_config": user_config, # inputs to the training script
-                "byte_tokenizer": isinstance(tokenizer, ByteTokenizer),
-            },
-            rank=ddp_rank,
-        )
 
     if last_step:
         break
