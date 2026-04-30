@@ -75,8 +75,7 @@ if [ "${SKIP_SFT:-0}" != "1" ]; then
     # not been initialized" against the SFT project. Strip them.
     unset WANDB_RUN_ID WANDB_RESUME
     NPROC_PER_NODE=1 \
-    DEVICE_BATCH_SIZE=8 \
-    MAX_SEQ_LEN=2048 \
+    DEVICE_BATCH_SIZE=4 \
     MODEL_TAG=d24-byte-l \
     OUTPUT_TAG=d24-byte-l-sft \
     WANDB_RUN="${SFT_WANDB_RUN:-d24-byte-l-sft}" \
