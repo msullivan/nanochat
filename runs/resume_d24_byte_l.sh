@@ -74,5 +74,8 @@ if [ "${SKIP_SFT:-0}" != "1" ]; then
     MODEL_TAG=d24-byte-l \
     OUTPUT_TAG=d24-byte-l-sft \
     WANDB_RUN="${SFT_WANDB_RUN:-d24-byte-l-sft}" \
+    EVAL_EVERY=100 \
+    EVAL_TOKENS=4194304 \
+    CHATCORE_EVERY=100 \
     bash runs/finetune.sh
 fi

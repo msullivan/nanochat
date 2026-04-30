@@ -63,6 +63,19 @@ if [ -n "$OUTPUT_TAG" ]; then
     # Also scope the report dir so SFT + eval section files live in report/<tag>/
     export NANOCHAT_REPORT_TAG="$OUTPUT_TAG"
 fi
+# Optional eval-cadence overrides (forwarded to chat_sft if set):
+#   EVAL_EVERY        steps between val-bpb evals (default 200)
+#   EVAL_TOKENS       val tokens per eval (default 40*524288 = 20.9M)
+#   CHATCORE_EVERY    steps between ChatCORE evals (default 200)
+if [ -n "$EVAL_EVERY" ]; then
+    SFT_EXTRA_ARGS+=(--eval-every="$EVAL_EVERY")
+fi
+if [ -n "$EVAL_TOKENS" ]; then
+    SFT_EXTRA_ARGS+=(--eval-tokens="$EVAL_TOKENS")
+fi
+if [ -n "$CHATCORE_EVERY" ]; then
+    SFT_EXTRA_ARGS+=(--chatcore-every="$CHATCORE_EVERY")
+fi
 
 # -----------------------------------------------------------------------------
 # SFT + eval
