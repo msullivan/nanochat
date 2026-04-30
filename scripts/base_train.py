@@ -131,9 +131,11 @@ else:
 if args.byte_tokenizer:
     tokenizer = ByteTokenizer()
     token_bytes = get_byte_token_bytes(device=device)
+    token_scale = 4
 else:
     tokenizer = get_tokenizer()
     token_bytes = get_token_bytes(device=device)
+    token_scale = 1
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -630,12 +632,12 @@ while True:
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16 * token_scale, temperature=0)
             print0(tokenizer.decode(sample[0]))
         print0("Unconditioned samples:")
         tokens = tokenizer("", prepend="<|bos|>")
         with disable_fp8(orig_model):
-            uncond, _ = engine.generate_batch(tokens, num_samples=3, max_tokens=128, temperature=1.0)
+            uncond, _ = engine.generate_batch(tokens, num_samples=3, max_tokens=128 * token_scale, temperature=1.0)
         for sample in uncond:
             print0("-" * 40)
             print0(tokenizer.decode(sample))
