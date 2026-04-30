@@ -69,6 +69,11 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-rl", name=args.run, config=user_config)
+# Use the training step we log as the canonical x-axis for all metrics, instead
+# of wandb's internal call counter. Keeps overlapping curves aligned when
+# different metrics are logged at different cadences.
+wandb_run.define_metric("step")
+wandb_run.define_metric("*", step_metric="step")
 
 # Init model and tokenizer
 model, tokenizer, meta = load_model("sft", device, phase="eval", model_tag=args.model_tag, step=args.model_step)
