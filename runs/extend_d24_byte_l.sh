@@ -6,8 +6,11 @@ set -ex
 # stay intact and we can compare the two trajectories cleanly.
 #
 # Schedule (per WSD discussion):
-#   - Resume from step 9300 of d24-byte-l, where LR=0.55 plateau began.
-#   - Hold flat at 0.55 from step 9300 to 11500 (~2.2k steps to confirm
+#   - Resume from step 9337 of d24-byte-l, just past where the LR=0.55
+#     plateau began. The 9300:0.55 breakpoint anchor stays in place so
+#     the schedule reads lrm=0.55 from step 9337 onward (linear interp
+#     between two same-value anchors = flat).
+#   - Hold flat at 0.55 from step 9337 to 11500 (~2.2k steps to confirm
 #     plateau is real before further cooldown).
 #   - Linear decay 0.55 -> 0.2 from step 11500 to 21500 (10k step ramp).
 #   - Standard 10% warmdown 0.2 -> final_lr_frac=0.05 over the last 2390
@@ -43,7 +46,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --warmdown-ratio=0.1 \
     --lr-breakpoints="9300:0.55,11500:0.55,21500:0.2" \
     --save-every=100 \
-    --resume-from-step=9300 \
+    --resume-from-step=9337 \
     --resume-from-tag=d24-byte-l \
     --model-tag=d24-byte-l-ext \
     --eval-every=100 \
