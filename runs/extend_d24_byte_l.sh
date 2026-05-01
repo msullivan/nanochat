@@ -5,11 +5,19 @@ set -ex
 # under a NEW model tag (d24-byte-l-ext) so the original run's checkpoints
 # stay intact and we can compare the two trajectories cleanly.
 #
+# PREREQUISITE: copy the seed checkpoint into the new tag's dir first, e.g.:
+#   D=$NANOCHAT_BASE_DIR/base_checkpoints
+#   mkdir -p $D/d24-byte-l-ext
+#   cp $D/d24-byte-l/{model,meta}_009337.* \
+#      $D/d24-byte-l/optim_009337_rank0.pt \
+#      $D/d24-byte-l-ext/
+# After copying, --resume-from-step=latest under d24-byte-l-ext picks it up.
+#
 # Schedule (per WSD discussion):
-#   - Resume from step 9337 of d24-byte-l, just past where the LR=0.55
-#     plateau began. The 9300:0.55 breakpoint anchor stays in place so
-#     the schedule reads lrm=0.55 from step 9337 onward (linear interp
-#     between two same-value anchors = flat).
+#   - Resume from step 9337 of d24-byte-l (copied into d24-byte-l-ext above),
+#     just past where the LR=0.55 plateau began. The 9300:0.55 breakpoint
+#     anchor stays in place so the schedule reads lrm=0.55 from step 9337
+#     onward (linear interp between two same-value anchors = flat).
 #   - Hold flat at 0.55 from step 9337 to 11500 (~2.2k steps to confirm
 #     plateau is real before further cooldown).
 #   - Linear decay 0.55 -> 0.2 from step 11500 to 21500 (10k step ramp).
@@ -46,8 +54,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --warmdown-ratio=0.1 \
     --lr-breakpoints="9300:0.55,11500:0.55,21500:0.2" \
     --save-every=100 \
-    --resume-from-step=9337 \
-    --resume-from-tag=d24-byte-l \
+    --resume-from-step=latest \
     --model-tag=d24-byte-l-ext \
     --eval-every=100 \
     --eval-tokens=4194304 \
