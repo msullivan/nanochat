@@ -72,7 +72,6 @@ while True:
     conversation_tokens.extend(user_start)
     conversation_tokens.extend(tokenizer.encode(user_input))
     conversation_tokens.extend(user_end)
-    print(conversation_tokens)
 
     # Kick off the assistant
     conversation_tokens.extend(assistant_start)
