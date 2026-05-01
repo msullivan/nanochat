@@ -291,6 +291,8 @@ class Engine:
         assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
         bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
 
+        # Helpers for special tokens. Both tokenizers now return single ints,
+        # but tail-match logic is kept to remain compatible with any list form.
         def _as_list(tok):
             return [tok] if isinstance(tok, int) else list(tok)
         def _tail_matches(tokens, special):

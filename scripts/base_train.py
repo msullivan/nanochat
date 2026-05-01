@@ -96,7 +96,7 @@ parser.add_argument("--save-at-evals", action="store_true", help="also save a ch
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
-parser.add_argument("--byte-tokenizer", action="store_true", help="use byte-level tokenizer (vocab_size=256, no BPE)")
+parser.add_argument("--byte-tokenizer", action="store_true", help="use byte-level tokenizer (vocab_size=265, no BPE)")
 parser.add_argument("--bigram-value-embeds", action="store_true", help="index value embeddings by (prev_byte, curr_byte_low7) -- 15-bit, 32k entries. UTF-8-aware. Only meaningful with --byte-tokenizer.")
 parser.add_argument("--disable-value-embeds", action="store_true", help="ablate the value-embedding contribution: zero-init the value_embeds + ve_gate weights and skip them in forward and the optimizer (params remain allocated for checkpoint compat)")
 parser.add_argument("--mask-before", type=str, default="", help='loss-mask every training token that comes before (and including) this substring in each sub-document. e.g. --mask-before="Answer: " makes cute_pt train only on the answer text in each Q/A doc. Empty (default) = no masking, every token contributes loss.')

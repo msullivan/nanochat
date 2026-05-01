@@ -1,36 +1,37 @@
 """
-Byte-level tokenizer: vocab size 256, no merges.
+Byte-level tokenizer: vocab size 265 (= 256 raw bytes + 9 specials).
 
-\x00 = BOS. \x01 = escape prefix for literal \x00/\x01 and special tokens:
-  \x01\x00 = literal \x00, \x01\x01 = literal \x01,
-  \x01\x02..\x01\x09 = user_start..output_end
+Bytes 0x00..0xff occupy IDs 0..255 untouched. Specials get dedicated IDs
+above the byte range, so no escaping is needed on encode/decode.
 """
 
 import copy
 import torch
 
-BOS = 0x00
-ESCAPE = 0x01
-
-# Special token name -> escape second byte (None = BOS itself)
+# Special token IDs sit above the byte range. Order is fixed; do NOT renumber
+# without writing a checkpoint conversion -- these IDs are baked into the
+# embedding rows of every saved model.
 SPECIAL_TOKENS = {
-    "<|bos|>": None,
-    "<|user_start|>": 0x02,
-    "<|user_end|>": 0x03,
-    "<|assistant_start|>": 0x04,
-    "<|assistant_end|>": 0x05,
-    "<|python_start|>": 0x06,
-    "<|python_end|>": 0x07,
-    "<|output_start|>": 0x08,
-    "<|output_end|>": 0x09,
+    "<|bos|>":              256,
+    "<|user_start|>":       257,
+    "<|user_end|>":         258,
+    "<|assistant_start|>":  259,
+    "<|assistant_end|>":    260,
+    "<|python_start|>":     261,
+    "<|python_end|>":       262,
+    "<|output_start|>":     263,
+    "<|output_end|>":       264,
 }
-ESCAPE_TO_NAME = {v: k for k, v in SPECIAL_TOKENS.items() if v is not None}
+ID_TO_SPECIAL = {v: k for k, v in SPECIAL_TOKENS.items()}
+
+VOCAB_SIZE = 256 + len(SPECIAL_TOKENS)  # 265
+BOS = SPECIAL_TOKENS["<|bos|>"]
 
 
 class ByteTokenizer:
 
     def get_vocab_size(self):
-        return 256
+        return VOCAB_SIZE
 
     def get_bos_token_id(self):
         return BOS
@@ -39,44 +40,18 @@ class ByteTokenizer:
         return set(SPECIAL_TOKENS.keys())
 
     def encode_special(self, text):
-        if text == "<|bos|>":
-            return BOS
-        return [ESCAPE, SPECIAL_TOKENS[text]]
-
-    def encode_special_list(self, text):
-        if text == "<|bos|>":
-            return [BOS]
-        return [ESCAPE, SPECIAL_TOKENS[text]]
+        return SPECIAL_TOKENS[text]
 
     def encode(self, text, prepend=None, append=None, num_threads=None):
         if isinstance(text, list):
             return [self.encode(t, prepend=prepend, append=append) for t in text]
 
         ids = []
-
-        # prepend
         if prepend is not None:
-            tok = prepend if isinstance(prepend, (int, list)) else self.encode_special(prepend)
-            if isinstance(tok, int):
-                ids.append(tok)
-            else:
-                ids.extend(tok)
-
-        # text as UTF-8 bytes, escaping \x00 and \x01
-        for b in text.encode("utf-8"):
-            if b <= ESCAPE:
-                ids.extend([ESCAPE, b])
-            else:
-                ids.append(b)
-
-        # append
+            ids.append(prepend if isinstance(prepend, int) else self.encode_special(prepend))
+        ids.extend(text.encode("utf-8"))
         if append is not None:
-            tok = append if isinstance(append, (int, list)) else self.encode_special(append)
-            if isinstance(tok, int):
-                ids.append(tok)
-            else:
-                ids.extend(tok)
-
+            ids.append(append if isinstance(append, int) else self.encode_special(append))
         return ids
 
     def __call__(self, *args, **kwargs):
@@ -84,29 +59,20 @@ class ByteTokenizer:
 
     def decode(self, ids):
         out = bytearray()
-        i = 0
-        while i < len(ids):
-            if ids[i] == ESCAPE and i + 1 < len(ids):
-                n = ids[i + 1]
-                if n in ESCAPE_TO_NAME:
-                    out.extend(ESCAPE_TO_NAME[n].encode())
-                else:
-                    out.append(n)
-                i += 2
-            elif ids[i] == BOS:
-                out.extend(b"<|bos|>")
-                i += 1
-            else:
-                out.append(ids[i])
-                i += 1
+        for i in ids:
+            if i < 256:
+                out.append(i)
+            elif i in ID_TO_SPECIAL:
+                out.extend(ID_TO_SPECIAL[i].encode())
+            # ids beyond the vocab (e.g. padding rows) are silently dropped
         return out.decode("utf-8", errors="replace")
 
     def id_to_token(self, id):
-        if id == BOS:
-            return "<|bos|>"
-        if id == ESCAPE:
-            return "<ESC>"
-        return chr(id) if 32 <= id < 127 else f"<0x{id:02X}>"
+        if id in ID_TO_SPECIAL:
+            return ID_TO_SPECIAL[id]
+        if id < 256:
+            return chr(id) if 32 <= id < 127 else f"<0x{id:02X}>"
+        return f"<id_{id}>"
 
     def render_conversation(self, conversation, max_tokens=2048):
         ids, mask = [], []
@@ -116,9 +82,6 @@ class ByteTokenizer:
                 toks = [toks]
             ids.extend(toks)
             mask.extend([m] * len(toks))
-
-        def special(name):
-            return [ESCAPE, SPECIAL_TOKENS[name]]
 
         # Merge system message into first user message
         if conversation["messages"][0]["role"] == "system":
@@ -135,11 +98,11 @@ class ByteTokenizer:
             content = msg["content"]
 
             if msg["role"] == "user":
-                add(special("<|user_start|>"), 0)
+                add(SPECIAL_TOKENS["<|user_start|>"], 0)
                 add(self.encode(content), 0)
-                add(special("<|user_end|>"), 0)
+                add(SPECIAL_TOKENS["<|user_end|>"], 0)
             else:
-                add(special("<|assistant_start|>"), 0)
+                add(SPECIAL_TOKENS["<|assistant_start|>"], 0)
                 if isinstance(content, str):
                     add(self.encode(content), 1)
                 elif isinstance(content, list):
@@ -148,14 +111,14 @@ class ByteTokenizer:
                         if part["type"] == "text":
                             add(v, 1)
                         elif part["type"] == "python":
-                            add(special("<|python_start|>"), 1)
+                            add(SPECIAL_TOKENS["<|python_start|>"], 1)
                             add(v, 1)
-                            add(special("<|python_end|>"), 1)
+                            add(SPECIAL_TOKENS["<|python_end|>"], 1)
                         elif part["type"] == "python_output":
-                            add(special("<|output_start|>"), 0)
+                            add(SPECIAL_TOKENS["<|output_start|>"], 0)
                             add(v, 0)
-                            add(special("<|output_end|>"), 0)
-                add(special("<|assistant_end|>"), 1)
+                            add(SPECIAL_TOKENS["<|output_end|>"], 0)
+                add(SPECIAL_TOKENS["<|assistant_end|>"], 1)
 
         return ids[:max_tokens], mask[:max_tokens]
 
@@ -163,7 +126,7 @@ class ByteTokenizer:
         conversation = copy.deepcopy(conversation)
         conversation["messages"].pop()
         ids, _ = self.render_conversation(conversation)
-        ids.extend([ESCAPE, SPECIAL_TOKENS["<|assistant_start|>"]])
+        ids.append(SPECIAL_TOKENS["<|assistant_start|>"])
         return ids
 
     def save(self, tokenizer_dir):
@@ -181,8 +144,8 @@ class ByteTokenizer:
 
 
 def get_byte_token_bytes(device="cpu"):
-    """Token byte counts for BPB calculation. 1 for all bytes except BOS and ESCAPE."""
-    tb = torch.ones(256, dtype=torch.int32, device=device)
-    tb[BOS] = 0
-    tb[ESCAPE] = 0
+    """Token byte counts for BPB calculation. 1 for raw-byte IDs (0..255),
+    0 for the special-token IDs above. Length matches vocab_size."""
+    tb = torch.zeros(VOCAB_SIZE, dtype=torch.int32, device=device)
+    tb[:256] = 1
     return tb
