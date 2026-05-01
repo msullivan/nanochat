@@ -122,6 +122,9 @@ class HuggingFaceTokenizer:
         # encode a single special token via exact match
         return self.tokenizer.token_to_id(text)
 
+    def encode_special_list(self, text):
+        return [self.encode_special(text)]
+
     def get_bos_token_id(self):
         # Different HuggingFace models use different BOS tokens and there is little consistency
         # 1) attempt to find a <|bos|> token
@@ -218,6 +221,9 @@ class RustBPETokenizer:
     @lru_cache(maxsize=32)
     def encode_special(self, text):
         return self.enc.encode_single_token(text)
+
+    def encode_special_list(self, text):
+        return [self.encode_special(text)]
 
     def get_bos_token_id(self):
         return self.bos_token_id

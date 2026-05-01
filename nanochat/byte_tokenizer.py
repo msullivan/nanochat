@@ -43,6 +43,11 @@ class ByteTokenizer:
             return BOS
         return [ESCAPE, SPECIAL_TOKENS[text]]
 
+    def encode_special_list(self, text):
+        if text == "<|bos|>":
+            return [BOS]
+        return [ESCAPE, SPECIAL_TOKENS[text]]
+
     def encode(self, text, prepend=None, append=None, num_threads=None):
         if isinstance(text, list):
             return [self.encode(t, prepend=prepend, append=append) for t in text]

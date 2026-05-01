@@ -168,7 +168,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'ARC-Easy': partial(ARC, subset="ARC-Easy", split="test"),
         'ARC-Challenge': partial(ARC, subset="ARC-Challenge", split="test"),
         'GSM8K': partial(GSM8K, subset="main", split="test"),
-        'SpellingBee': partial(SpellingBee, size=256, split="test"),
+        'SpellingBee': partial(SpellingBee, size=256 * 4, split="test"),
         'Addition': partial(Addition, size=256, split="test"),
         'Multiplication': partial(Multiplication, size=256, split="test"),
     }[task_name]
