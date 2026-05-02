@@ -21,7 +21,7 @@ from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
 from tasks.arc import ARC
 from tasks.gsm8k import GSM8K
-from tasks.spellingbee import SpellingBee
+from tasks.spellingbee import SpellingBee, SimpleSpelling
 from tasks.arithmetic import Addition, Multiplication
 
 # -----------------------------------------------------------------------------
@@ -169,6 +169,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         'ARC-Challenge': partial(ARC, subset="ARC-Challenge", split="test"),
         'GSM8K': partial(GSM8K, subset="main", split="test"),
         'SpellingBee': partial(SpellingBee, size=256 * 4, split="test"),
+        'SimpleSpelling': partial(SimpleSpelling, size=1000, split="test"),
         'Addition': partial(Addition, size=256, split="test"),
         'Multiplication': partial(Multiplication, size=256, split="test"),
     }[task_name]
@@ -207,7 +208,7 @@ if __name__ == "__main__":
     engine = Engine(model, tokenizer)
 
     # Get the tasks to evaluate on
-    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee', 'Addition', 'Multiplication']
+    all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee', 'SimpleSpelling', 'Addition', 'Multiplication']
     baseline_accuracies = {
         'ARC-Easy': 0.25, # multiple choice 1 of 4 => 25%
         'ARC-Challenge': 0.25, # multiple choice 1 of 4 => 25%
@@ -215,6 +216,7 @@ if __name__ == "__main__":
         'GSM8K': 0.0, # open-ended => 0%
         'HumanEval': 0.0, # open-ended => 0%
         'SpellingBee': 0.0, # open-ended => 0%
+        'SimpleSpelling': 0.0, # open-ended => 0%
         'Addition': 0.0, # open-ended => 0%
         'Multiplication': 0.0, # open-ended => 0%
     }

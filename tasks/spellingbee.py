@@ -266,8 +266,23 @@ class SimpleSpelling(Task):
         ]
         conversation = {
             "messages": messages,
+            "word": word,
         }
         return conversation
+
+    def evaluate(self, conversation, assistant_response):
+        """Score a generated spelling. Required format: comma-or-whitespace-
+        separated single letters after the first ':'. Loose on the separator
+        (',', ' ', '-' all accepted) but strict that every emitted run be a
+        single letter -- otherwise the model is just echoing the word, not
+        spelling it. Concatenated letters must equal the target word."""
+        assert isinstance(assistant_response, str), "Assuming string response"
+        word = conversation["word"]
+        rhs = assistant_response.split(":", 1)[1] if ":" in assistant_response else assistant_response
+        runs = re.findall(r"[a-zA-Z]+", rhs)
+        if not runs or any(len(r) != 1 for r in runs):
+            return 0
+        return int("".join(runs).lower() == word.lower())
 
 
 if __name__ == "__main__":
