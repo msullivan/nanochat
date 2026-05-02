@@ -24,7 +24,15 @@ BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resol
 MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
 index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
 base_dir = get_base_dir()
-DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
+# NANOCHAT_DATA_DIR overrides the default climbmix shard location -- useful for
+# continued pretraining on a synthetic corpus (e.g. CUTE-format finetune data)
+# without disturbing the rest of the pipeline. Absolute paths only; if relative,
+# treated as relative to base_dir.
+_data_dir_override = os.environ.get("NANOCHAT_DATA_DIR")
+if _data_dir_override:
+    DATA_DIR = _data_dir_override if os.path.isabs(_data_dir_override) else os.path.join(base_dir, _data_dir_override)
+else:
+    DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
