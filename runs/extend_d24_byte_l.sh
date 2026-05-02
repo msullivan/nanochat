@@ -38,8 +38,10 @@ cd "$(dirname "$0")/.."
 export OMP_NUM_THREADS=1
 export NANOCHAT_REPORT_TAG=d24-byte-l-ext
 
-# Strip any inherited wandb-resume env vars from a prior session in this shell.
-unset WANDB_RUN_ID WANDB_RESUME
+if [ -n "$WANDB_RUN_ID" ]; then
+    export WANDB_RESUME=must
+    WANDB_FLAG="--run=d24-byte-l-ext"   # name is ignored when resuming by id
+fi
 
 source .venv/bin/activate
 
