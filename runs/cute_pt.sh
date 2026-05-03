@@ -96,8 +96,3 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --sample-every=50 \
     --fp8 \
     --run="$MODEL_TAG"
-
-torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- \
-    --device-batch-size=8 \
-    --source=cute \
-    --model-tag="$MODEL_TAG"

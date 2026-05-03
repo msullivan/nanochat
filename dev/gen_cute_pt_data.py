@@ -273,10 +273,63 @@ ANSWER_HAS_SPACES = {
 }
 
 
-def format_document(subtask, question, answer):
-    """Build the full document text: prefix + question + Answer line."""
+def format_document(subtask, question, answer, prefix=None):
+    """Build the full document text: prefix + question + Answer line.
+    Uses the published 4-shot prefix unless a varied prefix is supplied."""
+    if prefix is None:
+        prefix = PREFIXES[subtask]
     quoted = f'" {answer} "' if ANSWER_HAS_SPACES[subtask] else f'"{answer}"'
-    return f'{PREFIXES[subtask]}{question}\n\nAnswer: {quoted}'
+    return f'{prefix}{question}\n\nAnswer: {quoted}'
+
+
+# Task header (the description line above the demos). Same for fixed and varied
+# prefix modes; only the demo lines below it get re-rolled.
+TASK_HEADERS = {s: PREFIXES[s].split("\n", 1)[0] for s in PREFIXES}
+
+# Indentation that matches the published CUTE prompts byte-for-byte (12 spaces
+# before each demo line and on the blank lines around them).
+DEMO_INDENT = " " * 12
+
+
+def _build_demo_line(num, subtask, word, rng, *, far_pool):
+    """Format a single 4-shot demo line: 'N. <task statement>. Answer: "<answer>"'.
+    Reuses make_X to generate the (question, answer) pair so the demo wording
+    matches what we already produce for the Question line. Returns None if the
+    pair couldn't be generated (only orth can fail this way)."""
+    if subtask == "orth":
+        result = make_orth(word, rng, near_pool=None, far_pool=far_pool)
+        if result is None:
+            return None
+        question, answer = result
+    else:
+        question, answer = SUBTASKS[subtask](word, rng)
+    text = question.removeprefix("Question: ")
+    quoted = f'" {answer} "' if ANSWER_HAS_SPACES[subtask] else f'"{answer}"'
+    return f"{num}. {text} Answer: {quoted}"
+
+
+def build_varied_prefix(subtask, rng, pool, *, far_pool, num_demos=4):
+    """Construct a {num_demos}-shot prefix where the demo target words are
+    drawn at random from `pool`. The task-description header and surrounding
+    whitespace match the published format byte-for-byte; only the demo body
+    varies. Returns None if the demos couldn't be filled (rare; only orth)."""
+    demos = []
+    seen = set()
+    attempts = 0
+    while len(demos) < num_demos and attempts < num_demos * 20:
+        attempts += 1
+        w = rng.choice(pool)
+        if w in seen:
+            continue
+        line = _build_demo_line(len(demos) + 1, subtask, w, rng, far_pool=far_pool)
+        if line is None:
+            continue
+        demos.append(line)
+        seen.add(w)
+    if len(demos) < num_demos:
+        return None
+    body = "\n".join(f"{DEMO_INDENT}{d}" for d in demos)
+    return f"{TASK_HEADERS[subtask]}\n{DEMO_INDENT}\n{body}\n{DEMO_INDENT}\n{DEMO_INDENT}"
 
 
 # -----------------------------------------------------------------------------
@@ -313,6 +366,9 @@ def main():
                         help="number of source words to use; total examples = num_words * 8 subtasks (minus orth fails)")
     parser.add_argument("--val-frac", type=float, default=0.01, help="fraction of generated docs put in shard_00001.parquet")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--vary-demos", action=argparse.BooleanOptionalAction, default=True,
+                        help="re-roll the 4-shot demo target words per training example "
+                        "(default; --no-vary-demos to fall back to the published fixed prefix)")
     parser.add_argument("--preview", type=int, default=0,
                         help="if >0, print this many rendered examples per subtask and exit (no parquet written)")
     args = parser.parse_args()
@@ -341,6 +397,13 @@ def main():
     docs = []
     counts = Counter()
 
+    def get_prefix(subtask):
+        """Returns the 4-shot demo prefix to use for one training document.
+        Re-rolls demo target words on every call when --vary-demos is set."""
+        if not args.vary_demos:
+            return PREFIXES[subtask]
+        return build_varied_prefix(subtask, rng, pool, far_pool=far_pool)
+
     if args.preview:
         for subtask in list(SUBTASKS.keys()) + ["orth"]:
             print("=" * 80)
@@ -353,14 +416,20 @@ def main():
                     q, a = res
                 else:
                     q, a = SUBTASKS[subtask](w, rng)
-                print(format_document(subtask, q, a))
+                prefix = get_prefix(subtask)
+                if prefix is None:
+                    continue
+                print(format_document(subtask, q, a, prefix=prefix))
                 print("---")
         return
 
     for subtask, fn in SUBTASKS.items():
         for w in pool:
             q, a = fn(w, rng)
-            docs.append(format_document(subtask, q, a))
+            prefix = get_prefix(subtask)
+            if prefix is None:
+                continue
+            docs.append(format_document(subtask, q, a, prefix=prefix))
             counts[subtask] += 1
 
     for w in pool:
@@ -368,7 +437,10 @@ def main():
         if res is None:
             continue
         q, a = res
-        docs.append(format_document("orth", q, a))
+        prefix = get_prefix("orth")
+        if prefix is None:
+            continue
+        docs.append(format_document("orth", q, a, prefix=prefix))
         counts["orth"] += 1
 
     rng.shuffle(docs)
