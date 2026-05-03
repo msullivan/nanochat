@@ -64,24 +64,11 @@ if [ -z "$LATEST_META" ]; then
     exit 1
 fi
 
-# Discover seed step + architecture from the seed checkpoint's meta.
-# base_train builds the model from CLI args (not meta), so DEPTH /
-# MAX_SEQ_LEN / WINDOW_PATTERN / BYTE_TOKENIZER must match the saved model.
-read SEED_STEP DEPTH MAX_SEQ_LEN WINDOW_PATTERN BYTE_TOK <<< $(.venv/bin/python -c "
-import json
-m = json.load(open('$LATEST_META'))
-u = m.get('user_config', {})
-mc = m.get('model_config', {})
-step = m.get('step', '?')
-depth = u.get('depth', mc.get('n_layer', 24))
-msl = u.get('max_seq_len', mc.get('sequence_len', 8192))
-wp = u.get('window_pattern', mc.get('window_pattern', 'L'))
-bt = 'true' if (u.get('byte_tokenizer') or m.get('byte_tokenizer') or mc.get('vocab_size', 32768) <= 320) else 'false'
-print(step, depth, msl, wp, bt)
-")
-echo "discovered: seed_step=$SEED_STEP depth=$DEPTH max_seq_len=$MAX_SEQ_LEN window_pattern=$WINDOW_PATTERN byte=$BYTE_TOK"
+# We only need the seed step here for the LR-schedule math; base_train
+# itself recovers the model architecture (depth, max_seq_len, window_pattern,
+# byte_tokenizer, ...) from the seed meta on resume.
+SEED_STEP=$(.venv/bin/python -c "import json; print(json.load(open('$LATEST_META'))['step'])")
 
-# Schedule math: warmdown over last 10% of FT_STEPS, flat at FT_LRM before that
 NUM_ITERATIONS=$(( SEED_STEP + FT_STEPS ))
 WARMDOWN_TAIL_STEPS=$(( FT_STEPS / 10 ))
 [ "$WARMDOWN_TAIL_STEPS" -lt 1 ] && WARMDOWN_TAIL_STEPS=1
@@ -93,16 +80,9 @@ echo "=== cute_pt: tag=$MODEL_TAG seed_step=$SEED_STEP +ft_steps=$FT_STEPS"
 echo "=== num_iterations=$NUM_ITERATIONS warmdown_ratio=$WARMDOWN_RATIO breakpoints=$LR_BREAKPOINTS"
 echo "=== checkpoint_subdir=$CKPT_SUBDIR wandb_project=$WANDB_PROJECT"
 
-BYTE_FLAG=""
-[ "$BYTE_TOK" = "true" ] && BYTE_FLAG="--byte-tokenizer"
-
 torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
-    --depth="$DEPTH" \
-    $BYTE_FLAG \
-    --max-seq-len="$MAX_SEQ_LEN" \
     --device-batch-size=8 \
     --num-iterations="$NUM_ITERATIONS" \
-    --window-pattern="$WINDOW_PATTERN" \
     --warmdown-ratio="$WARMDOWN_RATIO" \
     --lr-breakpoints="$LR_BREAKPOINTS" \
     --save-every=50 \

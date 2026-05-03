@@ -85,6 +85,34 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 parser.add_argument("--byte-tokenizer", action="store_true", help="use byte-level tokenizer (vocab_size=256, no BPE)")
 args = parser.parse_args()
+
+# If resuming, peek at the seed checkpoint's meta to recover the model
+# architecture (depth, max_seq_len, window_pattern, byte_tokenizer,
+# aspect_ratio, head_dim) so launchers don't have to thread the right
+# arch flags through every resume invocation. CLI args for these fields
+# are silently overwritten by the saved values -- the checkpoint already
+# determined the model shape, so the CLI versions can't change it
+# anyway (would just trigger a load_state_dict shape mismatch later).
+if args.resume_from_step != "-1":
+    _output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"
+    _resume_dirname = args.resume_from_tag if args.resume_from_tag else _output_dirname
+    _resume_dir = os.path.join(get_base_dir(), args.checkpoint_subdir, _resume_dirname)
+    if args.resume_from_step == "latest":
+        from nanochat.checkpoint_manager import find_last_step
+        _seed_step = find_last_step(_resume_dir)
+    else:
+        _seed_step = int(args.resume_from_step)
+    with open(os.path.join(_resume_dir, f"meta_{_seed_step:06d}.json")) as _f:
+        _seed_meta = json.load(_f)
+    _seed_user_config = _seed_meta.get("user_config", {})
+    for _arch_key in ("depth", "aspect_ratio", "head_dim", "max_seq_len", "window_pattern", "byte_tokenizer"):
+        if _arch_key in _seed_user_config:
+            _new = _seed_user_config[_arch_key]
+            if getattr(args, _arch_key, None) != _new:
+                # only print on rank 0 once we've gotten that far; for now use bare print
+                print(f"resume: --{_arch_key.replace('_','-')} overridden to {_new!r} from seed meta")
+                setattr(args, _arch_key, _new)
+
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
