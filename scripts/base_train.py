@@ -43,6 +43,8 @@ print_banner()
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project name")
+parser.add_argument("--checkpoint-subdir", type=str, default="base_checkpoints", help="subdirectory under NANOCHAT_BASE_DIR where checkpoints are read (resume) and written (save). Use e.g. 'cute_checkpoints' for midtraining runs that should not clobber base_checkpoints/")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
@@ -102,7 +104,7 @@ print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, config=user_config)
 # Use the training step we log as the canonical x-axis for all metrics, instead
 # of wandb's internal call counter. Lets us log on a non-uniform cadence (e.g.
 # time-based) without misaligning train vs val vs core curves.
@@ -171,11 +173,11 @@ model.init_weights() # 3) All tensors get initialized
 # so anneal/extension runs can land in their own dirs without clobbering the source.
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
-checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+checkpoint_dir = os.path.join(base_dir, args.checkpoint_subdir, output_dirname)
 resuming = args.resume_from_step != "-1"
 if resuming:
     resume_dirname = args.resume_from_tag if args.resume_from_tag else output_dirname
-    resume_dir = os.path.join(base_dir, "base_checkpoints", resume_dirname)
+    resume_dir = os.path.join(base_dir, args.checkpoint_subdir, resume_dirname)
     if args.resume_from_step == "latest":
         from nanochat.checkpoint_manager import find_last_step
         args.resume_from_step = find_last_step(resume_dir)
