@@ -85,6 +85,7 @@ parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 parser.add_argument("--byte-tokenizer", action="store_true", help="use byte-level tokenizer (vocab_size=256, no BPE)")
 parser.add_argument("--bigram-value-embeds", action="store_true", help="index value embeddings by (prev_byte, curr_byte_low7) -- 15-bit, 32k entries. UTF-8-aware. Only meaningful with --byte-tokenizer.")
+parser.add_argument("--disable-value-embeds", action="store_true", help="ablate the value-embedding contribution: zero-init the value_embeds + ve_gate weights and skip them in forward and the optimizer (params remain allocated for checkpoint compat)")
 args = parser.parse_args()
 
 # If resuming, peek at the seed checkpoint's meta to recover the model
@@ -107,7 +108,7 @@ if args.resume_from_step != "-1":
     with open(os.path.join(_resume_dir, f"meta_{_seed_step:06d}.json")) as _f:
         _seed_meta = json.load(_f)
     _seed_user_config = _seed_meta.get("user_config", {})
-    for _arch_key in ("depth", "aspect_ratio", "head_dim", "max_seq_len", "window_pattern", "byte_tokenizer", "bigram_value_embeds"):
+    for _arch_key in ("depth", "aspect_ratio", "head_dim", "max_seq_len", "window_pattern", "byte_tokenizer", "bigram_value_embeds", "disable_value_embeds"):
         if _arch_key in _seed_user_config:
             _new = _seed_user_config[_arch_key]
             if getattr(args, _arch_key, None) != _new:
@@ -208,6 +209,7 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
         bigram_value_embeds=args.bigram_value_embeds,
+        disable_value_embeds=args.disable_value_embeds,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -238,7 +240,14 @@ if resuming:
         args.resume_from_step = int(args.resume_from_step)
     print0(f"Resuming optimization from step {args.resume_from_step} (source: {resume_dir})")
     model_data, optimizer_data, meta_data = load_checkpoint(resume_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    model.load_state_dict(model_data, strict=True, assign=True)
+    # strict=False so we tolerate VE-allocation differences between this
+    # run and the seed checkpoint (--disable-value-embeds toggles whether
+    # value_embeds + ve_gate exist at all). Other shape mismatches still
+    # error from PyTorch's own checks.
+    missing, unexpected = model.load_state_dict(model_data, strict=False, assign=True)
+    if missing or unexpected:
+        print0(f"resume: load_state_dict missing keys: {missing}")
+        print0(f"resume: load_state_dict unexpected keys: {unexpected}")
     del model_data # free up this memory after the copy
 else:
     args.resume_from_step = -1  # normalize to int sentinel for downstream comparisons

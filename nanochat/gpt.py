@@ -42,6 +42,10 @@ class GPTConfig:
     # since the dropped high bit of curr is recoverable when curr is a UTF-8 cont byte
     # (forced to 1 by validity). Only meaningful for byte-level tokenizers (vocab_size <= 256).
     bigram_value_embeds: bool = False
+    # Skip value-embedding contribution in attention entirely: the
+    # value_embeds tables and per-block ve_gate weights are not allocated.
+    # Cross-loading from non-disabled checkpoints uses strict=False at load.
+    disable_value_embeds: bool = False
 
 
 # 15-bit bigram VE table size. 8 bits of prev (full byte) × 7 bits of curr (low 7).
@@ -122,7 +126,8 @@ class CausalSelfAttention(nn.Module):
         self.c_v = Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 12
-        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        ve_layer = has_ve(layer_idx, config.n_layer) and not config.disable_value_embeds
+        self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if ve_layer else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
@@ -235,7 +240,10 @@ class GPT(nn.Module):
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
         ve_vocab_size = BIGRAM_VE_VOCAB_SIZE if config.bigram_value_embeds else padded_vocab_size
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(ve_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        if config.disable_value_embeds:
+            self.value_embeds = nn.ModuleDict({})
+        else:
+            self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(ve_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -291,11 +299,13 @@ class GPT(nn.Module):
         torch.nn.init.constant_(self.backout_lambda, 0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
-        # Value embeddings (init like c_v: uniform with same std)
+        # Value embeddings (init like c_v: uniform with same std).
+        # Empty dict when disable_value_embeds is set, so this loop is a no-op.
         for ve in self.value_embeds.values():
             torch.nn.init.uniform_(ve.weight, -s, s)
 
-        # Gate weights init with small positive values so gates start slightly above neutral
+        # Gate weights init with small positive values so gates start slightly above neutral.
+        # ve_gate is None on every block when disable_value_embeds is set.
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.uniform_(block.attn.ve_gate.weight, 0.0, 0.02)
@@ -448,11 +458,14 @@ class GPT(nn.Module):
             # AdamW groups (embeddings, lm_head, scalars)
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=(0.8, 0.96), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.001),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.05),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
+        if value_embeds_params:
+            param_groups.append(
+                dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale * 0.5, betas=(0.8, 0.995), eps=1e-10, weight_decay=0.01),
+            )
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
