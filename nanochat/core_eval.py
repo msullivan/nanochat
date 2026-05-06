@@ -110,6 +110,32 @@ def stack_sequences(tokens, pad_token_id):
     return input_ids
 
 
+# Bucket sizes for shape-stable forwards. With torch.compile (FlexAttention
+# specifically), every distinct (B, T) tuple triggers a recompile. To keep
+# the compile cache small, we round B and T up to fixed multiples and pad
+# rows + tokens accordingly. Dummy padding rows go through the model but
+# their outputs are never read.
+T_BUCKET = 128
+B_BUCKET = 8
+
+
+def _round_up(n, m):
+    return ((n + m - 1) // m) * m
+
+
+def stack_sequences_bucketed(tokens, pad_token_id):
+    """Like stack_sequences but pads B up to a multiple of B_BUCKET and T up
+    to a multiple of T_BUCKET. Dummy rows are appended; callers must avoid
+    indexing into them."""
+    n_real_rows = len(tokens)
+    T_max = max(len(t) for t in tokens)
+    T_pad = _round_up(T_max, T_BUCKET)
+    B_pad = _round_up(n_real_rows, B_BUCKET)
+    padded = [t + [pad_token_id] * (T_pad - len(t)) for t in tokens]
+    padded.extend([[pad_token_id] * T_pad] * (B_pad - n_real_rows))
+    return torch.tensor(padded, dtype=torch.long)
+
+
 def batch_sequences_mc(tokenizer, prompts):
     # In multiple choice, contexts are the same but the continuation is different (common prefix)
     tokens = tokenizer(prompts, prepend=tokenizer.get_bos_token_id())
@@ -212,9 +238,10 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
                 new_end_idxs.append(e)
         tokens, start_idxs, end_idxs = new_tokens, new_start_idxs, new_end_idxs
 
-    # Stack up all the sequences into a batch
+    # Stack up all the sequences into a batch, padded to bucketed (B, T) so
+    # torch.compile sees only a small set of shapes across repeated calls.
     pad_token_id = tokenizer.get_bos_token_id() # use BOS as pad token is ok
-    input_ids = stack_sequences(tokens, pad_token_id)
+    input_ids = stack_sequences_bucketed(tokens, pad_token_id)
     input_ids = input_ids.to(device)
 
     # Forward the model, get the autoregressive loss and argmax prediction at each token

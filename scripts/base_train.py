@@ -24,7 +24,15 @@ from contextlib import contextmanager
 
 import wandb
 import torch
+import torch._dynamo
 import torch.distributed as dist
+
+# Each distinct (B, T) shape triggers a flex_attention recompile, and dynamo
+# silently aborts past its default limit (8), falling back to a naive eager
+# path that materialises the full B×H×T×T scores matrix and OOMs at modest
+# eval batch sizes. core_eval.evaluate_example buckets shapes to keep this
+# small, but we lift the cap as a safety margin for the periodic CORE eval.
+torch._dynamo.config.recompile_limit = max(getattr(torch._dynamo.config, "recompile_limit", 8), 64)
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit

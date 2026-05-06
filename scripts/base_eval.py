@@ -30,6 +30,14 @@ import zipfile
 import tempfile
 import argparse
 import torch
+import torch._dynamo
+
+# Each distinct (B, T) shape triggers a flex_attention recompile, and dynamo
+# silently aborts compilation past its default limit, falling back to a
+# naive eager path that materialises the full B×H×T×T scores matrix and
+# OOMs at modest batch sizes. core_eval.evaluate_example buckets shapes to
+# keep this small, but we lift the cap further as a safety margin.
+torch._dynamo.config.recompile_limit = max(getattr(torch._dynamo.config, "recompile_limit", 8), 64)
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
