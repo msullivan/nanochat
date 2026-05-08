@@ -105,10 +105,15 @@ def place_eval_bundle(file_path):
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1):
+def evaluate_core(model, tokenizer, device, max_per_task=-1, task_names=None):
     """
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
+
+    task_names: optional list of task labels to restrict evaluation to. If
+    None, all tasks in core.yaml are evaluated. Note that core_metric is
+    averaged only over the tasks that ran, so partial runs aren't
+    comparable to the full CORE number.
     """
     base_dir = get_base_dir()
     eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
@@ -123,6 +128,12 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     tasks = config['icl_tasks']
+    if task_names is not None:
+        wanted = set(task_names)
+        tasks = [t for t in tasks if t['label'] in wanted]
+        missing = wanted - {t['label'] for t in tasks}
+        if missing:
+            raise ValueError(f"Unknown CORE task labels: {sorted(missing)}")
 
     # Load random baseline values
     random_baselines = {}
@@ -184,6 +195,7 @@ def main():
     parser.add_argument('--source', type=str, default='base', choices=['base', 'cute', 'sft', 'rl'], help='Checkpoint source dir (base_checkpoints/cute_checkpoints/etc)')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
+    parser.add_argument('-a', '--task-name', type=str, action='append', default=None, help="CORE task label to run (repeat for multiple). Default = all tasks. Note: core_metric will be averaged only over the tasks that ran.")
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
@@ -285,7 +297,7 @@ def main():
         print0("\n" + "="*80)
         print0("CORE Evaluation")
         print0("="*80)
-        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task)
+        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, task_names=args.task_name)
 
         # Write CSV output
         if ddp_rank == 0:

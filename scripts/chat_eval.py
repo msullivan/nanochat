@@ -200,7 +200,7 @@ if __name__ == "__main__":
     # Parse command-line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument('-i', '--source', type=str, required=True, help="Source of the model: sft|rl")
-    parser.add_argument('-a', '--task-name', type=str, default=None, help="Task name. Default = all tasks. Use | to split multiple tasks.")
+    parser.add_argument('-a', '--task-name', type=str, action='append', default=None, help="Task name (repeat for multiple). Default = all tasks.")
     parser.add_argument('-t', '--temperature', type=float, default=0.0)
     parser.add_argument('-m', '--max-new-tokens', type=int, default=512)
     parser.add_argument('-n', '--num-samples', type=int, default=1)
@@ -232,7 +232,7 @@ if __name__ == "__main__":
         'Addition': 0.0, # open-ended => 0%
         'Multiplication': 0.0, # open-ended => 0%
     }
-    task_names = all_tasks if args.task_name is None else args.task_name.split('|')
+    task_names = all_tasks if args.task_name is None else args.task_name
 
     # Run all the task evaluations sequentially
     results = {}

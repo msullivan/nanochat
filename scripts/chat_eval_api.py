@@ -154,8 +154,8 @@ def run_eval(task_object, client, *, num_samples, max_tokens, temperature,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-a', '--task-name', type=str, default=None,
-                        help=f"Task name, or pipe-separated list. Known: {'|'.join(TASK_NAMES)}. Default = all.")
+    parser.add_argument('-a', '--task-name', type=str, action='append', default=None,
+                        help=f"Task name (repeat for multiple). Known: {', '.join(TASK_NAMES)}. Default = all.")
     parser.add_argument('--base-url', type=str, default='https://api.openai.com/v1',
                         help='OpenAI-compatible endpoint base URL (default: OpenAI)')
     parser.add_argument('--model', type=str, required=True, help='Model id to send in the request')
@@ -178,7 +178,7 @@ def main():
         print("warning: --num-samples > 1 with temperature=0 produces identical completions", file=sys.stderr)
 
     client = OpenAIClient(args.base_url, api_key, args.model)
-    task_names = TASK_NAMES if args.task_name is None else args.task_name.split('|')
+    task_names = TASK_NAMES if args.task_name is None else args.task_name
 
     results = {}
     for task_name in task_names:
