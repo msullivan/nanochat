@@ -102,11 +102,15 @@ class KVCache:
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
         # Previous token's normalized embedding for smear (set by model forward pass)
         self.prev_embedding = None
+        # Previous token id for bigram value embeddings (set by model forward pass).
+        # None means "use BOS for the bigram of the next call's first position".
+        self.prev_token_id = None
 
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
         self.prev_embedding = None
+        self.prev_token_id = None
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -135,6 +139,9 @@ class KVCache:
         # Copy smear state: expand batch=1 prev_embedding to num_samples
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
+        # Copy bigram-VE state: expand batch=1 prev_token_id to num_samples
+        if other.prev_token_id is not None:
+            self.prev_token_id = other.prev_token_id.expand(self.batch_size).clone()
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()

@@ -37,6 +37,18 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Bigram value embeddings: index VE by (prev_byte, curr_byte) instead of curr_byte alone.
+    # Uses 8 bits of prev + low 7 bits of curr (= 15 bits = 32768 entries) — UTF-8-aware
+    # since the dropped high bit of curr is recoverable when curr is a UTF-8 cont byte
+    # (forced to 1 by validity). Only meaningful for byte-level tokenizers (vocab_size <= 256).
+    bigram_value_embeds: bool = False
+
+
+# 15-bit bigram VE table size. 8 bits of prev (full byte) × 7 bits of curr (low 7).
+# Token IDs above 255 collapse modulo 256 -- byte tokenizer only uses 0-255 so this is fine.
+BIGRAM_VE_VOCAB_SIZE = 32768
+BIGRAM_VE_CURR_BITS = 7
+BIGRAM_VE_CURR_MASK = (1 << BIGRAM_VE_CURR_BITS) - 1  # 0x7F
 
 
 def norm(x):
@@ -53,6 +65,39 @@ class Linear(nn.Linear):
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def compute_bigram_idx(idx, prev_token_id=None):
+    """Compute bigram value-embedding indices.
+
+    For each position t, output[t] = (prev_byte * 128) | (curr_byte & 0x7F)
+    where prev_byte at t=0 is BOS (0x00) for training/prefill and prev_token_id for decode.
+
+    8 bits of prev byte + low 7 bits of curr byte = 15 bits = 32768 entries. Lossless on
+    UTF-8 multi-byte intra-char bigrams under validity (curr's redundant high bit when it
+    is a continuation byte is recoverable from curr's full bits, so we drop it). Token IDs
+    are masked to byte range modulo 256, which is exact for the byte tokenizer (vocab=256).
+
+    Args:
+        idx: (B, T) input token ids.
+        prev_token_id: optional (B,) tensor giving the byte BEFORE idx[:, 0]. Used during
+                       KV-cache decode where we have the previous step's emitted token.
+                       If None, BOS=0x00 is used (training/prefill default).
+    Returns:
+        (B, T) int64 tensor of bigram indices in [0, 32768).
+    """
+    B, T = idx.size()
+    curr_byte = (idx & 0xFF).long()
+    if prev_token_id is None:
+        # Training / prefill: shift idx right by 1, prepend BOS (0x00) at position 0.
+        bos_col = torch.zeros((B, 1), dtype=torch.long, device=idx.device)
+        prev_byte = torch.cat([bos_col, curr_byte[:, :-1]], dim=1)
+    else:
+        # Decode: prev_token_id provides the byte just before idx[:, 0].
+        # idx is typically (B, 1) here; for T>1 prefill-with-cache, shift internally too.
+        prev_first = (prev_token_id & 0xFF).long().view(B, 1)
+        prev_byte = torch.cat([prev_first, curr_byte[:, :-1]], dim=1) if T > 1 else prev_first
+    return (prev_byte << BIGRAM_VE_CURR_BITS) | (curr_byte & BIGRAM_VE_CURR_MASK)
 
 def apply_rotary_emb(x, cos, sin):
     assert x.ndim == 4  # multihead attention
@@ -184,10 +229,13 @@ class GPT(nn.Module):
         self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
-        # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        # Value embeddings (ResFormer-style): alternating layers, last layer always included.
+        # When bigram_value_embeds=True, the embedding table is indexed by a 15-bit
+        # (prev_byte, curr_byte_low7) pair instead of curr_byte alone.
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        ve_vocab_size = BIGRAM_VE_VOCAB_SIZE if config.bigram_value_embeds else padded_vocab_size
+        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(ve_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -454,6 +502,17 @@ class GPT(nn.Module):
                 gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
                 x = x + gate * x_pre_smear
 
+        # Compute the index used for value-embedding lookups. Default = curr token.
+        # When bigram_value_embeds is on, fold (prev_byte, curr_byte) into a 15-bit index.
+        if self.config.bigram_value_embeds:
+            prev_token_id = kv_cache.prev_token_id if (kv_cache is not None and getattr(kv_cache, 'prev_token_id', None) is not None) else None
+            ve_idx = compute_bigram_idx(idx, prev_token_id=prev_token_id)
+            if kv_cache is not None:
+                # Remember the last emitted token so the next decode step has its prev byte.
+                kv_cache.prev_token_id = idx[:, -1]
+        else:
+            ve_idx = idx
+
         # Forward the trunk of the Transformer
         x0 = x  # save initial normalized embedding for x0 residual
         n_layer = self.config.n_layer
@@ -461,7 +520,7 @@ class GPT(nn.Module):
         x_backout = None
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = self.value_embeds[str(i)](ve_idx).to(x.dtype) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
