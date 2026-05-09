@@ -94,6 +94,7 @@ args = parser.parse_args()
 # are silently overwritten by the saved values -- the checkpoint already
 # determined the model shape, so the CLI versions can't change it
 # anyway (would just trigger a load_state_dict shape mismatch later).
+resume_wandb_run_id = None  # filled in below if resuming and the seed meta has it
 if args.resume_from_step != "-1":
     _output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"
     _resume_dirname = args.resume_from_tag if args.resume_from_tag else _output_dirname
@@ -113,6 +114,18 @@ if args.resume_from_step != "-1":
                 # only print on rank 0 once we've gotten that far; for now use bare print
                 print(f"resume: --{_arch_key.replace('_','-')} overridden to {_new!r} from seed meta")
                 setattr(args, _arch_key, _new)
+    # If the seed checkpoint recorded its wandb run id AND the saved run name
+    # matches the current --run, reattach to that run instead of starting a
+    # new one. A name mismatch is treated as the user explicitly wanting a
+    # fresh wandb run (e.g., starting an "ext" run from a baseline
+    # checkpoint), so we don't reattach in that case. Old checkpoints
+    # without wandb_run_id fall through to a fresh wandb run.
+    _seed_run_name = _seed_user_config.get("run")
+    _seed_run_id = _seed_meta.get("wandb_run_id")
+    if _seed_run_id is not None and _seed_run_name is not None and _seed_run_name != args.run:
+        print(f"resume: seed wandb run name {_seed_run_name!r} != --run {args.run!r}; starting a fresh wandb run")
+    elif _seed_run_id is not None:
+        resume_wandb_run_id = _seed_run_id
 
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -131,9 +144,19 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-# wandb logging init
+# wandb logging init. If we're resuming a checkpoint that recorded its wandb
+# run id, reattach to that run (resume="allow" so a deleted/missing run
+# falls back to a fresh init rather than erroring). The previous run's
+# history is preserved and new metrics append to the same chart.
 use_dummy_wandb = args.run == "dummy" or not master_process
-wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project=args.wandb_project, name=args.run, config=user_config)
+if use_dummy_wandb:
+    wandb_run = DummyWandb()
+else:
+    _init_kwargs = dict(project=args.wandb_project, name=args.run, config=user_config)
+    if resume_wandb_run_id is not None:
+        _init_kwargs.update(id=resume_wandb_run_id, resume="allow")
+        print0(f"resume: reattaching to wandb run id={resume_wandb_run_id}")
+    wandb_run = wandb.init(**_init_kwargs)
 # Use the training step we log as the canonical x-axis for all metrics, instead
 # of wandb's internal call counter. Lets us log on a non-uniform cadence (e.g.
 # time-based) without misaligning train vs val vs core curves.
@@ -593,6 +616,7 @@ while True:
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
+                "wandb_run_id": getattr(wandb_run, "id", None),  # for resume reattach
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
