@@ -42,7 +42,8 @@ print_banner()
 # CLI arguments
 parser = argparse.ArgumentParser(description="Pretrain base model")
 # Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
+parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
+parser.add_argument("--run", type=str, default=None, help="DEPRECATED: ignored except that --run=dummy is treated as --no-wandb. Wandb run name is always derived from --model-tag (or f'd{depth}' if unset).")
 parser.add_argument("--wandb-project", type=str, default="nanochat", help="wandb project name")
 parser.add_argument("--checkpoint-subdir", type=str, default="base_checkpoints", help="subdirectory under NANOCHAT_BASE_DIR where checkpoints are read (resume) and written (save). Use e.g. 'cute_checkpoints' for midtraining runs that should not clobber base_checkpoints/")
 # Runtime
@@ -115,16 +116,17 @@ if args.resume_from_step != "-1":
                 # only print on rank 0 once we've gotten that far; for now use bare print
                 print(f"resume: --{_arch_key.replace('_','-')} overridden to {_new!r} from seed meta")
                 setattr(args, _arch_key, _new)
-    # If the seed checkpoint recorded its wandb run id AND the saved run name
-    # matches the current --run, reattach to that run instead of starting a
-    # new one. A name mismatch is treated as the user explicitly wanting a
-    # fresh wandb run (e.g., starting an "ext" run from a baseline
-    # checkpoint), so we don't reattach in that case. Old checkpoints
+    # If the seed checkpoint recorded its wandb run id AND the seed's
+    # output_dirname (model_tag, or f'd{depth}') matches the current
+    # output_dirname, reattach to that run instead of starting a new one.
+    # A mismatch (e.g. starting an "ext" run from a baseline checkpoint via
+    # a different --model-tag) starts a fresh wandb run. Old checkpoints
     # without wandb_run_id fall through to a fresh wandb run.
-    _seed_run_name = _seed_user_config.get("run")
+    _seed_output_dirname = _seed_user_config.get("model_tag") or f"d{_seed_user_config.get('depth')}"
+    _current_output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"
     _seed_run_id = _seed_meta.get("wandb_run_id")
-    if _seed_run_id is not None and _seed_run_name is not None and _seed_run_name != args.run:
-        print(f"resume: seed wandb run name {_seed_run_name!r} != --run {args.run!r}; starting a fresh wandb run")
+    if _seed_run_id is not None and _seed_output_dirname != _current_output_dirname:
+        print(f"resume: seed model_tag/depth {_seed_output_dirname!r} != current {_current_output_dirname!r}; starting a fresh wandb run")
     elif _seed_run_id is not None:
         resume_wandb_run_id = _seed_run_id
 
@@ -145,15 +147,21 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-# wandb logging init. If we're resuming a checkpoint that recorded its wandb
-# run id, reattach to that run (resume="allow" so a deleted/missing run
-# falls back to a fresh init rather than erroring). The previous run's
-# history is preserved and new metrics append to the same chart.
-use_dummy_wandb = args.run == "dummy" or not master_process
+# wandb logging init. The run name is always derived from the model tag
+# (--model-tag, or f'd{depth}' if unset) so it matches the checkpoint
+# subdirectory. If we're resuming a checkpoint that recorded its wandb run
+# id, reattach to that run (resume="allow" so a deleted/missing run falls
+# back to a fresh init rather than erroring). The previous run's history
+# is preserved and new metrics append to the same chart.
+output_dirname = args.model_tag if args.model_tag else f"d{args.depth}"
+if args.run is not None and args.run != "dummy":
+    print0(f"warning: --run={args.run!r} is deprecated and ignored; wandb run name is {output_dirname!r} (derived from --model-tag/--depth)")
+no_wandb = args.no_wandb or args.run == "dummy"  # back-compat for --run=dummy
+use_dummy_wandb = no_wandb or not master_process
 if use_dummy_wandb:
     wandb_run = DummyWandb()
 else:
-    _init_kwargs = dict(project=args.wandb_project, name=args.run, config=user_config)
+    _init_kwargs = dict(project=args.wandb_project, name=output_dirname, config=user_config)
     if resume_wandb_run_id is not None:
         _init_kwargs.update(id=resume_wandb_run_id, resume="allow")
         print0(f"resume: reattaching to wandb run id={resume_wandb_run_id}")
@@ -227,7 +235,7 @@ model.init_weights() # 3) All tensors get initialized
 # Output (write) and resume-source (read) dirs can differ via --resume-from-tag,
 # so anneal/extension runs can land in their own dirs without clobbering the source.
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+# output_dirname computed earlier alongside the wandb run name so they stay in sync.
 checkpoint_dir = os.path.join(base_dir, args.checkpoint_subdir, output_dirname)
 resuming = args.resume_from_step != "-1"
 if resuming:
