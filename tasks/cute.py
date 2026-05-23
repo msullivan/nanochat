@@ -72,13 +72,15 @@ def extract_cute_answer(completion, prefilled=True):
 
 class CUTE(Task):
 
-    def __init__(self, subtask, mode="completion", prefill=True, **kwargs):
+    def __init__(self, subtask, mode="completion", prefill=True, prompt_style="fewshot", **kwargs):
         super().__init__(**kwargs)
         assert subtask in CUTE_SUBTASKS, f"Unknown CUTE subtask: {subtask}"
         assert mode in ("completion", "chat"), f"mode must be completion|chat, got {mode}"
+        assert prompt_style in ("fewshot", "zero"), f"prompt_style must be fewshot|zero, got {prompt_style}"
         self.subtask = subtask
         self.mode = mode
         self.prefill = prefill
+        self.prompt_style = prompt_style
         self.ds = load_dataset("leukas/cute", split=subtask)
 
     @property
@@ -90,7 +92,15 @@ class CUTE(Task):
 
     def get_example(self, index):
         row = self.ds[index]
-        prompt = row["prompt"] + (ANSWER_PREFILL if self.prefill else "")
+        prompt = row["prompt"]
+        if self.prompt_style == "zero":
+            # The 4-shot demo block is fixed per subtask. Strip it: keep only
+            # `Question: ...` onward. Pair with gen_cute_pt_data --no-demos
+            # so the training surface form matches.
+            idx = prompt.find("Question:")
+            if idx >= 0:
+                prompt = prompt[idx:]
+        prompt = prompt + (ANSWER_PREFILL if self.prefill else "")
         answer = row["answer"]
 
         if self.mode == "chat":

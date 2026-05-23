@@ -275,7 +275,9 @@ ANSWER_HAS_SPACES = {
 
 def format_document(subtask, question, answer, prefix=None):
     """Build the full document text: prefix + question + Answer line.
-    Uses the published 4-shot prefix unless a varied prefix is supplied."""
+    Uses the published 4-shot prefix unless `prefix` is supplied. Pass
+    prefix="" for the no-demos variant (bare `Question: ... Answer: "..."`
+    with no task header or examples)."""
     if prefix is None:
         prefix = PREFIXES[subtask]
     quoted = f'" {answer} "' if ANSWER_HAS_SPACES[subtask] else f'"{answer}"'
@@ -369,6 +371,9 @@ def main():
     parser.add_argument("--vary-demos", action=argparse.BooleanOptionalAction, default=True,
                         help="re-roll the 4-shot demo target words per training example "
                         "(default; --no-vary-demos to fall back to the published fixed prefix)")
+    parser.add_argument("--no-demos", action="store_true",
+                        help="emit bare Question/Answer training docs with no task header and no 4-shot examples. "
+                        "Use with cute_eval --prompt-style zero so train and eval surface forms match.")
     parser.add_argument("--preview", type=int, default=0,
                         help="if >0, print this many rendered examples per subtask and exit (no parquet written)")
     args = parser.parse_args()
@@ -399,7 +404,10 @@ def main():
 
     def get_prefix(subtask):
         """Returns the 4-shot demo prefix to use for one training document.
-        Re-rolls demo target words on every call when --vary-demos is set."""
+        Re-rolls demo target words on every call when --vary-demos is set.
+        Returns "" when --no-demos is set (bare Q/A with no header/demos)."""
+        if args.no_demos:
+            return ""
         if not args.vary_demos:
             return PREFIXES[subtask]
         return build_varied_prefix(subtask, rng, pool, far_pool=far_pool)

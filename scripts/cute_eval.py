@@ -90,6 +90,7 @@ def main():
     parser.add_argument("-x", "--max-problems", type=int, default=None, help="Max problems per subtask")
     parser.add_argument("--debug-n", type=int, default=0, help="Print raw completion + parse for the first N examples per subtask")
     parser.add_argument("--no-prefill", action="store_true", help='Do not append \\n\\nAnswer: " to the prompt; let the model emit the answer turn itself')
+    parser.add_argument("--prompt-style", type=str, default="fewshot", choices=["fewshot", "zero"], help="fewshot: use the published 4-shot CUTE prompt (default). zero: strip the demo block, keep only Question: onward. Pair with gen_cute_pt_data --no-demos so train and eval surface forms match.")
     parser.add_argument("--device-type", type=str, default="", choices=["", "cuda", "cpu", "mps"])
     args = parser.parse_args()
 
@@ -117,7 +118,7 @@ def main():
 
     results = {}
     for subtask in subtasks:
-        task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill)
+        task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill, prompt_style=args.prompt_style)
         num_passed, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens, max_problems=args.max_problems, debug_n=args.debug_n)
         acc = num_passed / total if total > 0 else 0.0
         results[subtask] = acc
