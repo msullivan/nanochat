@@ -15,7 +15,12 @@
 #   N_EPOCHS     epochs over each dataset (default: 2)
 #   FT_LRM       LR multiplier during finetune (default: 0.05)
 #   BATCH        device-batch-size for cute_pt (default: 8)
-#   MIN_STEPS    floor on FT_STEPS so tiny datasets still get some training (default: 50)
+#   MIN_STEPS    floor on FT_STEPS (default: 1). The default-batch (1MB) is larger
+#                than the entire dataset for sizes ≲ a few thousand words, so a
+#                meaningful "N_EPOCHS=2" can be 1 step at the small end. A higher
+#                floor like 50 would silently override the epoch scaling and turn
+#                the sweep into a constant-compute one. Raise this if you want
+#                that framing instead.
 #   FORCE_REGEN  set to 1 to regenerate data shards even if present
 #   SKIP_DONE    set to 1 to skip (size, model) pairs that already have a results CSV row
 #   RESULT_CSV   results path (default: $NANOCHAT_BASE_DIR/cute_sweep/results.csv)
@@ -34,7 +39,7 @@ MODELS="${MODELS:-d24-byte-l-early d24-byte-l d24-byte-l-ext d24-stock}"
 N_EPOCHS="${N_EPOCHS:-2}"
 FT_LRM="${FT_LRM:-0.05}"
 BATCH="${BATCH:-8}"
-MIN_STEPS="${MIN_STEPS:-50}"
+MIN_STEPS="${MIN_STEPS:-1}"
 PROMPT_STYLE="${PROMPT_STYLE:-zero}"
 EVAL_MAX="${EVAL_MAX:-200}"
 BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
