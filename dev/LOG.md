@@ -4,6 +4,98 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-05-23: Byte vs BPE on CUTE char-level tasks (sweep + recipe ablation)
+
+Setting up an experiment to measure whether byte-tokenizer models have a structural advantage over BPE on character-level tasks (the CUTE benchmark — Edman et al. EMNLP 2024). Approach: train a cheap "midtraining" (cute_pt) on synthetic CUTE-format examples, then eval zero-shot on the real CUTE benchmark. Sweep across (base model × dataset size × training recipe).
+
+### Setup
+
+- 4 base models, all d24 (1.38B total / 730M scaling params), single-GPU pretrained on friend's RTX 6000 PRO Blackwell:
+  - `d24-byte-l-early` — byte, shortest pretrain (~5.5B byte tokens, ratio ≈ 8)
+  - `d24-byte-l` — byte, full speedrun (~10.9B tokens)
+  - `d24-byte-l-ext` — byte, extended (~22-25B tokens)
+  - `d24` — BPE stock (5.84B BPE tokens, ratio 8)
+- CUTE training data: `dev/gen_cute_pt_data.py --no-demos` generates bare `Question: ... \n\nAnswer: " w o r d "` documents (no 4-shot demo prefix). 8 char-level subtasks per word.
+- Eval: `scripts/cute_eval --prompt-style zero` strips the published 4-shot demo prefix so eval surface form matches training.
+- Sweep driver: `dev/sweep_cute_pt.sh` with SKIP_DONE=1 default, per-cell ETA from rolling-dt window (fix for inherited cumulative `total_training_time` from 8×H100 base pretrain).
+
+### Headline results (no-demos recipe, BUDGET_MODE=epochs)
+
+Mean accuracy across 8 char-level subtasks, eval at 100 problems/subtask:
+
+| model            | 10k   | 30k   | 100k  |
+|------------------|------:|------:|------:|
+| d24-byte-l-ext   |  —    | 0.529 |  —    |
+| d24-byte-l       |  —    | 0.365 |  —    |
+| d24-byte-l-early | 0.120 | 0.244 | 0.840 |
+| d24 (BPE stock)  |  —    | 0.065 | 0.171 |
+
+The d24-byte-l-early jump 30k → 100k (mean 0.24 → 0.84) is the dramatic result. Manipulation subtasks (ins/del/sub/swap_char) go from ~0% to 70-93% — they don't just need pretraining strength (ext at 30k gets only 14-39% on those), they need CUTE training data volume. At 100k, the LEAST-pretrained byte model crushes BPE.
+
+### Per-subtask gap at 100k (early-byte vs BPE-stock)
+
+| subtask        | early (byte) | d24 (BPE) | gap   |
+|----------------|-------------:|----------:|------:|
+| spell          | 1.00         | 0.05      | 20×   |
+| spell_inverse  | 1.00         | 0.00      | ∞     |
+| contains_char  | 0.57         | 0.65      | BPE wins! |
+| orth           | 0.71         | 0.54      | 1.31× |
+| ins_char       | 0.93         | 0.10      | 9.3×  |
+| del_char       | 0.91         | 0.00      | ∞     |
+| sub_char       | 0.91         | 0.02      | 45×   |
+| swap_char      | 0.69         | 0.00      | ∞     |
+| **mean**       | **0.84**     | **0.17**  | ~5×   |
+
+BPE saw *more* underlying text in pretraining (~24 GB vs early-byte's ~5.5 GB) and the same cute_pt budget, yet on edit tasks it's at ≤10% while byte's at 70-93%.
+
+### But — BPE *can* do this under proper SFT
+
+Caveat that reshapes the framing: user's earlier full SFT pass (200K rows of SimpleSpelling + SpellingBee mixed with smoltalk/mmlu/gsm8k) hit ~100% on SimpleSpelling for d24-stock. With 1K SimpleSpelling rows it dropped to 60-70% — still way above what no-demos cute_pt achieves on CUTE spell. So BPE isn't structurally incapable; the no-demos cute_pt recipe is specifically BPE-unfriendly.
+
+### Why cute_pt is BPE-unfriendly (analysis of SFT vs cute_pt code)
+
+1. **Loss masking** — SFT computes loss only on assistant tokens (`mask=1` for assistant content in `tokenizer.render_conversation`, `target=-1` elsewhere). cute_pt is bare text continuation, loss on every token. For BPE specifically, half the gradient signal is wasted on predicting the `Question:` prompt text the model never needs to *produce*.
+2. **Format diversity** — SFT trains on a TaskMixture (SmolTalk 460K + MMLU 100K×3 + GSM8K 8K×4 + SimpleSpelling 1K rendered to 200K + others). The model learns generic instruction-following with spelling as one small instance. cute_pt has only CUTE.
+3. **Chat format tokens** — SFT uses `<|user_start|>`/`<|assistant_start|>` clean structural separators. cute_pt has no boundaries.
+4. **Spelling output format** — SFT SimpleSpelling: `nadorite:n,a,d,o,r,i,t,e` (bare ASCII-range tokens 97-116, comma separators). CUTE spell: `" n a d o r i t e "` (space-prefix tokens like ` n`, ` a` — common individually but the *sequence* of space-letter-space-letter is essentially never seen in pretraining text).
+5. **LR schedule** — SFT uses `init_lr_frac=0.8` with `warmdown_ratio=0.5`. cute_pt anchors at `FT_LRM=0.05` with 10% warmdown.
+
+### Recipe ablation plan
+
+Added two flag-gated interventions (defaults off, sweep-aware):
+
+- **`--mask-before STRING`** (base_train.py + dataloader): per-document loss masking. Sets targets to -1 for positions predicting the prompt region of each sub-doc, defined as everything up to (and including) the tokenized form of STRING. Pair with `MASK_BEFORE="Answer: "`.
+- **`SFT_STYLE=1`** (cute_pt.sh env var): swap the LR schedule from "barely nudge" (FT_LRM=0.05, 10% warmdown) to SFT-style "actively finetune" (FT_LRM=0.8, 50% warmdown).
+
+`dev/sweep_cute_pt.sh` extended to auto-derive a `RECIPE` tag from the flag combination (`nodemos` / `mask` / `sft` / `sft-mask`), include it in DST_TAG (`${model}-cute-${recipe}-${size}w`), and write to a per-recipe CSV (`results.csv` for nodemos to preserve back-compat; `results_${recipe}.csv` otherwise).
+
+4-cell ablation matrix to run:
+
+| Recipe   | SFT_STYLE | MASK_BEFORE | Hypothesis |
+|----------|-----------|-------------|------------|
+| nodemos  | 0         | (empty)     | Baseline (already have data) |
+| mask     | 0         | "Answer: "  | Loss masking alone (probably the biggest single-knob win) |
+| sft      | 1         | (empty)     | Aggressive LR alone |
+| sft-mask | 1         | "Answer: "  | Both — closest analogue to SFT, expected best |
+
+Invocation reference: `dev/cute_sweep_recipes.md`.
+
+### Likely blog post framing
+
+Not "byte structurally beats BPE on char tasks" (false — SFT proves BPE can do char tasks). Instead:
+
+> "Byte tokenizers are more data-efficient than BPE under *minimal* midtraining recipes — bare-completion training, no loss masking, no format diversity, no chat scaffolding. Under proper SFT, BPE almost entirely catches up. The byte advantage is real but specifically valuable when full instruction-tuning isn't an option."
+
+Pending: run the ablation, confirm sft-mask closes the BPE gap, write up.
+
+### Open questions for future runs (not blocking the blog)
+
+- 300k cells for the two anchor models (early-byte, d24-BPE) — does byte saturate? Does BPE keep climbing or plateau?
+- General-eval impact: cute_pt with these recipes might degrade CORE; the original "(4) mix in general text" idea (deferred) would test that.
+- Apply same recipe-improvement approach to chat_sft? Probably orthogonal — chat_sft already has all 5 of these features built in.
+
+---
+
 ## 2026-03-24: Parameter-Golf Ideas Sweep (Negative)
 
 Reviewed `openai/parameter-golf` for small/simple ideas that might transfer to nanochat pretraining without bloating the codebase. Cached notes are in `knowledge/parameter_golf.md`.
