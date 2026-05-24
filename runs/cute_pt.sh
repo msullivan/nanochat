@@ -54,6 +54,12 @@ MODEL_TAG="${MODEL_TAG:?MODEL_TAG is required (e.g. d24-byte-l-ext-cute)}"
 FT_STEPS="${FT_STEPS:-50}"
 FT_LRM="${FT_LRM:-0.05}"
 WANDB_PROJECT="${WANDB_PROJECT:-nanochat-cute}"
+# In-training eval cadences. Sweep driver disables these (sets to -1) since
+# the only eval we care about per cute_pt run is the post-finetune CUTE
+# benchmark, and the in-training CORE eval costs minutes per call.
+EVAL_EVERY="${EVAL_EVERY:-25}"
+CORE_METRIC_EVERY="${CORE_METRIC_EVERY:-50}"
+SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
 CKPT_SUBDIR=cute_checkpoints
 export NANOCHAT_REPORT_TAG="$MODEL_TAG"
 
@@ -97,9 +103,9 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --model-tag="$MODEL_TAG" \
     --checkpoint-subdir="$CKPT_SUBDIR" \
     --wandb-project="$WANDB_PROJECT" \
-    --eval-every=25 \
+    --eval-every="$EVAL_EVERY" \
     --eval-tokens=1048576 \
-    --core-metric-every=50 \
-    --sample-every=50 \
+    --core-metric-every="$CORE_METRIC_EVERY" \
+    --sample-every="$SAMPLE_EVERY" \
     --fp8 \
     --run="$MODEL_TAG"

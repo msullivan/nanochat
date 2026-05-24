@@ -130,10 +130,15 @@ for SIZE in $SIZES; do
         [ "$FT_STEPS" -lt "$MIN_STEPS" ] && FT_STEPS=$MIN_STEPS
 
         echo "--- TRAIN: model=$MODEL size=$SIZE ft_steps=$FT_STEPS lrm=$FT_LRM ---"
+        # Disable in-training evals; the only eval we care about per iteration
+        # is the post-finetune CUTE benchmark run a few lines below.
         NANOCHAT_DATA_DIR="$(basename "$DATA_DIR")" \
             MODEL_TAG="$DST_TAG" \
             FT_STEPS="$FT_STEPS" \
             FT_LRM="$FT_LRM" \
+            EVAL_EVERY=-1 \
+            CORE_METRIC_EVERY=-1 \
+            SAMPLE_EVERY=-1 \
             bash runs/cute_pt.sh
 
         echo "--- EVAL: model=$MODEL size=$SIZE prompt=$PROMPT_STYLE ---"
