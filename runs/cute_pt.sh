@@ -52,16 +52,21 @@ export NANOCHAT_DATA_DIR="${NANOCHAT_DATA_DIR:-cute_pt_data}"
 
 MODEL_TAG="${MODEL_TAG:?MODEL_TAG is required (e.g. d24-byte-l-ext-cute)}"
 FT_STEPS="${FT_STEPS:-50}"
-# SFT_STYLE=1 swaps in an SFT-like LR schedule: 80% of the pretrain peak LR
-# held flat then warmed down over the last 50% of FT_STEPS, instead of the
-# default cute_pt "barely nudge" 5% LR with 10% warmdown.
+# SFT_STYLE=1 swaps in an SFT-like recipe: 80% of the pretrain peak LR held
+# flat then warmed down over the last 50% of FT_STEPS, AND weight decay=0
+# (mirrors chat_sft.py, which explicitly sets weight_decay=0.0 on the theory
+# that pretraining warmdown already brought WD to zero). The default cute_pt
+# recipe instead uses a "barely nudge" 5% LR with 10% warmdown and inherits
+# base_train's WD default.
 SFT_STYLE="${SFT_STYLE:-0}"
 if [ "$SFT_STYLE" = "1" ]; then
     FT_LRM="${FT_LRM:-0.8}"
     WARMDOWN_FRAC="${WARMDOWN_FRAC:-0.5}"
+    WEIGHT_DECAY="${WEIGHT_DECAY:-0}"
 else
     FT_LRM="${FT_LRM:-0.05}"
     WARMDOWN_FRAC="${WARMDOWN_FRAC:-0.1}"
+    WEIGHT_DECAY="${WEIGHT_DECAY:-0.28}"  # base_train default
 fi
 # MASK_BEFORE: when set, loss-mask all training tokens before (and including)
 # this substring in each sub-document. e.g. MASK_BEFORE="Answer: " makes the
@@ -105,7 +110,7 @@ fi
 
 echo "=== cute_pt: tag=$MODEL_TAG seed_step=$SEED_STEP +ft_steps=$FT_STEPS sft_style=$SFT_STYLE"
 echo "=== num_iterations=$NUM_ITERATIONS lr_mult=$FT_LRM warmdown_ratio=$WARMDOWN_RATIO breakpoints=$LR_BREAKPOINTS"
-echo "=== mask_before=${MASK_BEFORE:-<none>}"
+echo "=== weight_decay=$WEIGHT_DECAY mask_before=${MASK_BEFORE:-<none>}"
 echo "=== checkpoint_subdir=$CKPT_SUBDIR wandb_project=$WANDB_PROJECT"
 
 torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
@@ -113,6 +118,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --num-iterations="$NUM_ITERATIONS" \
     --warmdown-ratio="$WARMDOWN_RATIO" \
     --lr-breakpoints="$LR_BREAKPOINTS" \
+    --weight-decay="$WEIGHT_DECAY" \
     --save-every=50 \
     --resume-from-step=latest \
     --model-tag="$MODEL_TAG" \

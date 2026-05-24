@@ -27,15 +27,21 @@ collide and `SKIP_DONE=1` works correctly per recipe.
 
 ## What each recipe means
 
-| RECIPE   | SFT_STYLE | MASK_BEFORE | FT_LRM | WARMDOWN | Loss mask           |
-|----------|-----------|-------------|--------|----------|---------------------|
-| nodemos  | 0         | (empty)     | 0.05   | 10%      | none (loss on all)  |
-| mask     | 0         | "Answer: "  | 0.05   | 10%      | answer-only         |
-| sft      | 1         | (empty)     | 0.8    | 50%      | none                |
-| sft-mask | 1         | "Answer: "  | 0.8    | 50%      | answer-only         |
+| RECIPE   | SFT_STYLE | MASK_BEFORE | FT_LRM | WARMDOWN | WD   | Loss mask           |
+|----------|-----------|-------------|--------|----------|------|---------------------|
+| nodemos  | 0         | (empty)     | 0.05   | 10%      | 0.28 | none (loss on all)  |
+| mask     | 0         | "Answer: "  | 0.05   | 10%      | 0.28 | answer-only         |
+| sft      | 1         | (empty)     | 0.8    | 50%      | 0    | none                |
+| sft-mask | 1         | "Answer: "  | 0.8    | 50%      | 0    | answer-only         |
 
-- **SFT_STYLE=1** flips FT_LRM 0.05 → 0.8 and WARMDOWN_FRAC 0.1 → 0.5
-  (mirrors `chat_sft.py`'s `init_lr_frac=0.8`, `warmdown_ratio=0.5`).
+- **SFT_STYLE=1** flips FT_LRM 0.05 → 0.8, WARMDOWN_FRAC 0.1 → 0.5, and
+  weight-decay 0.28 → 0 (mirrors `chat_sft.py`'s `init_lr_frac=0.8`,
+  `warmdown_ratio=0.5`, `weight_decay=0.0`).
+- Override WD independently with `WEIGHT_DECAY=<value>` if you want to mix
+  SFT-style LR with non-zero WD (or vice versa).
+- Note: with the nodemos default `FT_LRM=0.05` and `final_lr_frac=0.05`,
+  the "warmdown" is effectively a no-op (0.05 → 0.05). Real LR decay only
+  happens under `SFT_STYLE=1`.
 - **MASK_BEFORE="Answer: "** tells the dataloader to set targets to -1
   for all positions up to (and including) the tokenized form of
   `"Answer: "` within each sub-document. Mirrors SFT's
@@ -110,9 +116,24 @@ PYTHONPATH=. .venv/bin/python -m scripts.cute_eval \
 
 ## Plotting
 
-`/tmp/plot_cute_sweep.py` reads `results.csv` and produces two plots
-(per-subtask grid + mean curve). For multi-recipe comparison, modify it
-to load multiple `results_*.csv` files and label them by recipe.
+`dev/plot_cute_sweep.py` reads a results CSV and produces two PNGs
+(per-subtask grid + mean curve). Defaults read from
+`/tmp/cute_sweep_results.csv` and write to `/tmp/`.
+
+```bash
+# Plot the nodemos (legacy) recipe
+.venv/bin/python dev/plot_cute_sweep.py \
+    --input ~/.cache/nanochat/cute_sweep/results.csv \
+    --outdir /tmp --tag cute_nodemos
+
+# Plot a specific recipe
+.venv/bin/python dev/plot_cute_sweep.py \
+    --input ~/.cache/nanochat/cute_sweep/results_sft-mask.csv \
+    --outdir /tmp --tag cute_sft-mask
+```
+
+For multi-recipe comparison overlays, load multiple `results_*.csv`
+files and label series by recipe (not yet wired in).
 
 ## Pulling results from the remote training machine
 

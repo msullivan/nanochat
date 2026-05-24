@@ -56,11 +56,16 @@
 #   TPW_BYTE     tokens-per-word for byte models (default: 800)
 #   TPW_BPE      tokens-per-word for BPE/non-byte models (default: 200; only
 #                used when BUDGET_MODE=epochs)
-#   SFT_STYLE    forwarded to cute_pt.sh. 1 = SFT-like LR schedule (high LR
-#                + 50% warmdown), 0 = default cute_pt schedule. Default: 0.
+#   SFT_STYLE    forwarded to cute_pt.sh. 1 = SFT-like recipe (high LR +
+#                50% warmdown + WD=0), 0 = default cute_pt schedule. Default: 0.
 #   MASK_BEFORE  forwarded to cute_pt.sh. e.g. "Answer: " enables per-doc
 #                loss masking (train only on the answer text).
 #   WARMDOWN_FRAC forwarded to cute_pt.sh. Overrides SFT_STYLE's default.
+#   WEIGHT_DECAY forwarded to cute_pt.sh. Overrides SFT_STYLE's default (0
+#                under SFT_STYLE=1, 0.28 otherwise). Useful for isolating
+#                "LR schedule alone" vs "LR + WD" ablations — set
+#                WEIGHT_DECAY=0.28 with SFT_STYLE=1 to keep WD on, or
+#                WEIGHT_DECAY=0 with SFT_STYLE=0 to test WD effect alone.
 #   RECIPE       tag for the training recipe; appears in DST_TAG (so different
 #                recipes don't share checkpoint dirs) and in the results CSV
 #                (so plots can distinguish them). Default: "nodemos" — matches
@@ -95,6 +100,7 @@ SKIP_DONE="${SKIP_DONE:-1}"
 SFT_STYLE="${SFT_STYLE:-0}"
 MASK_BEFORE="${MASK_BEFORE:-}"
 WARMDOWN_FRAC="${WARMDOWN_FRAC:-}"  # empty = cute_pt picks default per SFT_STYLE
+WEIGHT_DECAY="${WEIGHT_DECAY:-}"    # empty = cute_pt picks default per SFT_STYLE
 
 # Auto-derive RECIPE from interventions if user didn't set it explicitly.
 # Keeps "nodemos" as the default-recipe name (matches existing checkpoint
@@ -240,6 +246,7 @@ for SIZE in $SIZES; do
             SFT_STYLE="$SFT_STYLE" \
             MASK_BEFORE="$MASK_BEFORE" \
             WARMDOWN_FRAC="$WARMDOWN_FRAC" \
+            WEIGHT_DECAY="$WEIGHT_DECAY" \
             EVAL_EVERY=-1 \
             CORE_METRIC_EVERY=-1 \
             SAMPLE_EVERY=-1 \
