@@ -34,6 +34,20 @@
 #                is single-prompt sequential on one GPU so each eval costs
 #                ~1ms × max_problems × n_subtasks of wall clock; 100 is the
 #                sweet spot for sweep curves where shape > precision.
+#   BUDGET_MODE  how FT_STEPS scales per cell (default: epochs)
+#                  epochs:  N_EPOCHS over each model's own dataset-in-tokens.
+#                           Byte models train ~4× more steps than BPE at the
+#                           same word count because byte tokens are ~4× denser.
+#                  compute: every cell gets the same FT_STEPS as a hypothetical
+#                           byte model at that word count (uses TPW_BYTE for
+#                           all models). For BPE this is ~4× more epochs over
+#                           the data than `epochs` mode, but the total training
+#                           compute per cell is matched across models — making
+#                           a "did model A learn more than model B at this
+#                           dataset size" comparison apples-to-apples.
+#   TPW_BYTE     tokens-per-word for byte models (default: 800)
+#   TPW_BPE      tokens-per-word for BPE/non-byte models (default: 200; only
+#                used when BUDGET_MODE=epochs)
 
 set -e
 
@@ -62,13 +76,30 @@ fi
 # generates). Override via SUBTASKS env var if you want full 14.
 EVAL_SUBTASKS="${SUBTASKS:-char}"
 
-# Auto-detect: bytes per example for no-demos varies a bit by subtask;
-# eyeball ~100 tokens per example for byte tokenizer, ~25 for BPE. 8
-# examples per word in the generator. Used only to scale FT_STEPS.
+# Tokens-per-word estimates for FT_STEPS scaling. ~100 byte tokens per
+# example × 8 examples per word = ~800 for byte; ~25 BPE tokens per
+# example × 8 = ~200 for BPE.
+TPW_BYTE="${TPW_BYTE:-800}"
+TPW_BPE="${TPW_BPE:-200}"
+BUDGET_MODE="${BUDGET_MODE:-epochs}"
+case "$BUDGET_MODE" in
+    epochs|compute) ;;
+    *) echo "ERROR: BUDGET_MODE must be 'epochs' or 'compute' (got: $BUDGET_MODE)" >&2; exit 1 ;;
+esac
+
 tokens_per_word_for() {
+    # In `compute` mode, use the byte tokens-per-word for ALL models — so
+    # every cell trains for the same number of total tokens at fixed word
+    # count, matching compute across model types. In `epochs` mode, use
+    # each model's actual density so N_EPOCHS truly means N passes over
+    # the data.
+    if [ "$BUDGET_MODE" = "compute" ]; then
+        echo "$TPW_BYTE"
+        return
+    fi
     case "$1" in
-        *byte*) echo $((8 * 100)) ;;
-        *)      echo $((8 * 25)) ;;
+        *byte*) echo "$TPW_BYTE" ;;
+        *)      echo "$TPW_BPE"  ;;
     esac
 }
 
@@ -137,7 +168,7 @@ for SIZE in $SIZES; do
         FT_STEPS=$(( N_EPOCHS * STEPS_PER_EPOCH ))
         [ "$FT_STEPS" -lt "$MIN_STEPS" ] && FT_STEPS=$MIN_STEPS
 
-        echo "--- TRAIN: model=$MODEL size=$SIZE ft_steps=$FT_STEPS lrm=$FT_LRM ---"
+        echo "--- TRAIN: model=$MODEL size=$SIZE ft_steps=$FT_STEPS lrm=$FT_LRM budget=$BUDGET_MODE ---"
         # Disable in-training evals; the only eval we care about per iteration
         # is the post-finetune CUTE benchmark run a few lines below.
         NANOCHAT_DATA_DIR="$(basename "$DATA_DIR")" \
