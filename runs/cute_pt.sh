@@ -69,9 +69,16 @@ else
     WEIGHT_DECAY="${WEIGHT_DECAY:-0.28}"  # base_train default
 fi
 # MASK_BEFORE: when set, loss-mask all training tokens before (and including)
-# this substring in each sub-document. e.g. MASK_BEFORE="Answer: " makes the
-# model train only on the answer portion of each Q/A doc, mirroring SFT's
-# assistant-only loss mask.
+# this substring in each sub-document. For cute_pt --no-demos docs, the
+# correct marker is `Answer: "` (including the opening quote). NOT `Answer: `
+# alone -- BPE tokenizes a trailing bare space differently in isolation vs in
+# context (the in-context space merges with the following quote into ` "`),
+# so the standalone tokenization wouldn't match in any real doc and every
+# sub-doc would get fully masked. With the quote, the marker tokenizes to the
+# same boundary token sequence in both contexts and lines up with eval's
+# prompt-end. Byte tokenizer is unaffected (no merges; bytes always match).
+# The dataloader prints a one-shot warning on the first batch if marker
+# not-found rate is high, which is your tripwire if this rule changes.
 MASK_BEFORE="${MASK_BEFORE:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-nanochat-cute}"
 # In-training eval cadences. Sweep driver disables these (sets to -1) since

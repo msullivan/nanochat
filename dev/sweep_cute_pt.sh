@@ -58,8 +58,14 @@
 #                used when BUDGET_MODE=epochs)
 #   SFT_STYLE    forwarded to cute_pt.sh. 1 = SFT-like recipe (high LR +
 #                50% warmdown + WD=0), 0 = default cute_pt schedule. Default: 0.
-#   MASK_BEFORE  forwarded to cute_pt.sh. e.g. "Answer: " enables per-doc
-#                loss masking (train only on the answer text).
+#   MASK_BEFORE  forwarded to cute_pt.sh. For cute_pt --no-demos docs use
+#                `Answer: "` (including the opening quote). NOT `Answer: `
+#                alone -- BPE merges the trailing space with the following
+#                quote in context, so the standalone tokenization wouldn't
+#                match and every sub-doc would get fully masked (zero
+#                training signal). Watch for the dataloader's one-shot
+#                "marker found in N/M sub-docs" log line on the first batch
+#                of each cell to confirm the marker is actually matching.
 #   WARMDOWN_FRAC forwarded to cute_pt.sh. Overrides SFT_STYLE's default.
 #   WEIGHT_DECAY forwarded to cute_pt.sh. Overrides SFT_STYLE's default (0
 #                under SFT_STYLE=1, 0.28 otherwise). Useful for isolating
@@ -81,7 +87,7 @@ export PYTHONPATH=.
 export OMP_NUM_THREADS=1
 
 # SIZES="${SIZES:-100000 70000 50000 30000 10000 3000}"
-SIZES="${SIZES:-3000 30000 10000 100000 50000 70000}"
+SIZES="${SIZES:-30000 3000 10000 100000 50000 70000}"
 MODELS="${MODELS:-d24-byte-l-early d24 d24-byte-l d24-byte-l-ext}"
 N_EPOCHS="${N_EPOCHS:-2}"
 FT_LRM="${FT_LRM:-0.05}"

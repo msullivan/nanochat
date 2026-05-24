@@ -12,10 +12,10 @@ SKIP_DONE=1 bash dev/sweep_cute_pt.sh
 
 # Both interventions: SFT-like LR schedule + loss masking on answer tokens
 # Fills results_sft-mask.csv, uses cute_checkpoints/d24-cute-sft-mask-30000w/ etc.
-SFT_STYLE=1 MASK_BEFORE="Answer: " bash dev/sweep_cute_pt.sh
+SFT_STYLE=1 MASK_BEFORE='Answer: "' bash dev/sweep_cute_pt.sh
 
 # Mask only
-MASK_BEFORE="Answer: " bash dev/sweep_cute_pt.sh   # → results_mask.csv
+MASK_BEFORE='Answer: "' bash dev/sweep_cute_pt.sh   # → results_mask.csv
 
 # SFT-style LR only
 SFT_STYLE=1 bash dev/sweep_cute_pt.sh              # → results_sft.csv
@@ -27,12 +27,12 @@ collide and `SKIP_DONE=1` works correctly per recipe.
 
 ## What each recipe means
 
-| RECIPE   | SFT_STYLE | MASK_BEFORE | FT_LRM | WARMDOWN | WD   | Loss mask           |
-|----------|-----------|-------------|--------|----------|------|---------------------|
-| nodemos  | 0         | (empty)     | 0.05   | 10%      | 0.28 | none (loss on all)  |
-| mask     | 0         | "Answer: "  | 0.05   | 10%      | 0.28 | answer-only         |
-| sft      | 1         | (empty)     | 0.8    | 50%      | 0    | none                |
-| sft-mask | 1         | "Answer: "  | 0.8    | 50%      | 0    | answer-only         |
+| RECIPE   | SFT_STYLE | MASK_BEFORE  | FT_LRM | WARMDOWN | WD   | Loss mask           |
+|----------|-----------|--------------|--------|----------|------|---------------------|
+| nodemos  | 0         | (empty)      | 0.05   | 10%      | 0.28 | none (loss on all)  |
+| mask     | 0         | `Answer: "`  | 0.05   | 10%      | 0.28 | answer-only         |
+| sft      | 1         | (empty)      | 0.8    | 50%      | 0    | none                |
+| sft-mask | 1         | `Answer: "`  | 0.8    | 50%      | 0    | answer-only         |
 
 - **SFT_STYLE=1** flips FT_LRM 0.05 → 0.8, WARMDOWN_FRAC 0.1 → 0.5, and
   weight-decay 0.28 → 0 (mirrors `chat_sft.py`'s `init_lr_frac=0.8`,
@@ -42,10 +42,23 @@ collide and `SKIP_DONE=1` works correctly per recipe.
 - Note: with the nodemos default `FT_LRM=0.05` and `final_lr_frac=0.05`,
   the "warmdown" is effectively a no-op (0.05 → 0.05). Real LR decay only
   happens under `SFT_STYLE=1`.
-- **MASK_BEFORE="Answer: "** tells the dataloader to set targets to -1
-  for all positions up to (and including) the tokenized form of
-  `"Answer: "` within each sub-document. Mirrors SFT's
-  assistant-only loss without requiring chat format.
+- **MASK_BEFORE=`Answer: "`** (note the opening quote!) tells the
+  dataloader to set targets to -1 for all positions up to (and including)
+  the tokenized form of `Answer: "` within each sub-document. Mirrors
+  SFT's assistant-only loss without requiring chat format.
+  - **Why the trailing quote matters**: BPE tokenizes a bare trailing
+    space (`Answer: `) differently in isolation vs in context — the
+    in-context space merges with the following `"` into a single ` "`
+    token. So `MASK_BEFORE="Answer: "` (no quote) tokenizes to
+    `[Answer, :, _]` standalone but the matching sequence never appears
+    in real docs → every sub-doc gets fully masked → BPE trains on zero
+    signal (silent failure mode; CSV will read all-zero accuracies).
+    `Answer: "` (with quote) tokenizes consistently in both contexts and
+    matches the boundary eval prompts end on. Byte tokenizer is
+    unaffected either way.
+  - The dataloader prints a one-shot warning on the first batch if the
+    marker is matching in <50% of sub-docs — your tripwire if the format
+    or marker changes.
 
 ## Default sweep matrix
 
@@ -59,10 +72,10 @@ collide and `SKIP_DONE=1` works correctly per recipe.
 ```bash
 # Just the anchor cells at the biggest sizes
 MODELS="d24-byte-l-early d24" SIZES="100000 30000" \
-    SFT_STYLE=1 MASK_BEFORE="Answer: " bash dev/sweep_cute_pt.sh
+    SFT_STYLE=1 MASK_BEFORE='Answer: "' bash dev/sweep_cute_pt.sh
 
 # Match training compute across models (otherwise BPE gets ~4× fewer steps)
-BUDGET_MODE=compute SFT_STYLE=1 MASK_BEFORE="Answer: " \
+BUDGET_MODE=compute SFT_STYLE=1 MASK_BEFORE='Answer: "' \
     bash dev/sweep_cute_pt.sh
 
 # Force regenerate data shards (e.g. after a gen_cute_pt_data fix)
@@ -103,7 +116,7 @@ NANOCHAT_DATA_DIR="cute_pt_data_nodemos_${SIZE}" \
 MODEL_TAG="$DST_TAG" \
 FT_STEPS=40 \
 SFT_STYLE=1 \
-MASK_BEFORE="Answer: " \
+MASK_BEFORE='Answer: "' \
 EVAL_EVERY=-1 CORE_METRIC_EVERY=-1 SAMPLE_EVERY=-1 \
 bash runs/cute_pt.sh
 

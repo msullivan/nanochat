@@ -113,6 +113,13 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         mask_before_ids = tokenizer.encode(mask_before)
         if not mask_before_ids:
             raise ValueError(f"mask_before {mask_before!r} encoded to empty token sequence")
+    # Sanity-check counters: BPE tokenizes `mask_before` *standalone*, but the
+    # marker is searched for in the *in-context* tokenization of packed docs.
+    # If BPE merges differ across those two settings (e.g. trailing space gets
+    # absorbed into the next token), the marker never matches and the whole
+    # sub-doc gets masked → zero training signal. Surface a loud one-shot
+    # warning on the first batch if the marker-not-found rate is high.
+    _marker_check_done = False
 
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
@@ -173,6 +180,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         # Applied AFTER the inputs/targets split so we don't corrupt inputs.
         if mask_before_ids is not None:
             _mb_len = len(mask_before_ids)
+            _n_found = 0
+            _n_subdocs = 0
             for ri in range(B):
                 row_list = row_buffer[ri].tolist()
                 bos_positions = [i for i, t in enumerate(row_list) if t == bos_token]
@@ -187,6 +196,9 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                         if row_list[j:j + _mb_len] == mask_before_ids:
                             marker_pos = j
                             break
+                    _n_subdocs += 1
+                    if marker_pos >= 0:
+                        _n_found += 1
                     # Prompt region in row coordinates: [s, mask_end).
                     # mask_end = marker_pos + _mb_len if found, else e (mask
                     # the whole sub-doc -- happens for cropped tails that
@@ -199,6 +211,21 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                     t_end = mask_end - 1  # exclusive
                     if t_end > t_start:
                         cpu_targets[ri, t_start:t_end] = -1
+            if not _marker_check_done:
+                _marker_check_done = True
+                _rate = _n_found / max(1, _n_subdocs)
+                if _rate < 0.5:
+                    print(f"!!! WARNING: mask_before marker {mask_before!r} -> "
+                          f"{mask_before_ids} found in only {_n_found}/{_n_subdocs} "
+                          f"({_rate:.0%}) sub-docs of first batch. Likely "
+                          f"BPE in-context vs standalone tokenization mismatch "
+                          f"(e.g. trailing space merging with following token). "
+                          f"Most/all training targets will be masked to -1 -> "
+                          f"zero gradient signal. Check that mask_before "
+                          f"tokenizes the same way in real packed docs.")
+                else:
+                    print(f"[dataloader] mask_before marker found in "
+                          f"{_n_found}/{_n_subdocs} ({_rate:.0%}) sub-docs of first batch")
 
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
