@@ -70,11 +70,18 @@ fi
 SEED_STEP=$(.venv/bin/python -c "import json; print(json.load(open('$LATEST_META'))['step'])")
 
 NUM_ITERATIONS=$(( SEED_STEP + FT_STEPS ))
-WARMDOWN_TAIL_STEPS=$(( FT_STEPS / 10 ))
-[ "$WARMDOWN_TAIL_STEPS" -lt 1 ] && WARMDOWN_TAIL_STEPS=1
-WARMDOWN_RATIO=$(.venv/bin/python -c "print(${WARMDOWN_TAIL_STEPS} / ${NUM_ITERATIONS})")
-WARMDOWN_START=$(( NUM_ITERATIONS - WARMDOWN_TAIL_STEPS ))
-LR_BREAKPOINTS="${SEED_STEP}:${FT_LRM},$((WARMDOWN_START - 1)):${FT_LRM}"
+if [ "$FT_STEPS" -le 2 ]; then
+    # Too few steps for a meaningful "stable + warmdown" split (the two LR
+    # breakpoints would collide or invert). Just anchor LR flat at FT_LRM.
+    WARMDOWN_RATIO=0
+    LR_BREAKPOINTS="${SEED_STEP}:${FT_LRM}"
+else
+    WARMDOWN_TAIL_STEPS=$(( FT_STEPS / 10 ))
+    [ "$WARMDOWN_TAIL_STEPS" -lt 1 ] && WARMDOWN_TAIL_STEPS=1
+    WARMDOWN_RATIO=$(.venv/bin/python -c "print(${WARMDOWN_TAIL_STEPS} / ${NUM_ITERATIONS})")
+    WARMDOWN_START=$(( NUM_ITERATIONS - WARMDOWN_TAIL_STEPS ))
+    LR_BREAKPOINTS="${SEED_STEP}:${FT_LRM},$((WARMDOWN_START - 1)):${FT_LRM}"
+fi
 
 echo "=== cute_pt: tag=$MODEL_TAG seed_step=$SEED_STEP +ft_steps=$FT_STEPS"
 echo "=== num_iterations=$NUM_ITERATIONS warmdown_ratio=$WARMDOWN_RATIO breakpoints=$LR_BREAKPOINTS"
