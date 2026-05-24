@@ -10,7 +10,10 @@
 # comparisons at every size you've reached, even if you ctrl-C halfway.
 #
 # ENV KNOBS
-#   SIZES        word counts for --num-words (default: "100 300 1000 3000 10000 30000")
+#   SIZES        word counts for --num-words (default: "1000 3000 10000 30000";
+#                100 and 300 were dropped after seeing 0% on spell at 100 — the
+#                model just doesn't have enough exposure to pick up the task at
+#                those sizes given a 1MB-per-step batch)
 #   MODELS       base model tags (default: "d24-byte-l-early d24-byte-l d24-byte-l-ext d24-stock")
 #   N_EPOCHS     epochs over each dataset (default: 2)
 #   FT_LRM       LR multiplier during finetune (default: 0.05)
@@ -25,7 +28,10 @@
 #   SKIP_DONE    set to 1 to skip (size, model) pairs that already have a results CSV row
 #   RESULT_CSV   results path (default: $NANOCHAT_BASE_DIR/cute_sweep/results.csv)
 #   PROMPT_STYLE eval prompt style: zero (default) or fewshot
-#   EVAL_MAX     --max-problems for cute_eval (default: 200; -1 = all)
+#   EVAL_MAX     --max-problems for cute_eval (default: 100; -1 = all). Eval
+#                is single-prompt sequential on one GPU so each eval costs
+#                ~1ms × max_problems × n_subtasks of wall clock; 100 is the
+#                sweet spot for sweep curves where shape > precision.
 
 set -e
 
@@ -34,14 +40,14 @@ source .venv/bin/activate
 export PYTHONPATH=.
 export OMP_NUM_THREADS=1
 
-SIZES="${SIZES:-100 300 1000 3000 10000 30000}"
+SIZES="${SIZES:-1000 3000 10000 30000}"
 MODELS="${MODELS:-d24-byte-l-early d24-byte-l d24-byte-l-ext d24-stock}"
 N_EPOCHS="${N_EPOCHS:-2}"
 FT_LRM="${FT_LRM:-0.05}"
 BATCH="${BATCH:-8}"
 MIN_STEPS="${MIN_STEPS:-1}"
 PROMPT_STYLE="${PROMPT_STYLE:-zero}"
-EVAL_MAX="${EVAL_MAX:-200}"
+EVAL_MAX="${EVAL_MAX:-100}"
 BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 RESULT_CSV="${RESULT_CSV:-$BASE_DIR/cute_sweep/results.csv}"
 
