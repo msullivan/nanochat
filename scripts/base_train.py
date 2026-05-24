@@ -19,6 +19,7 @@ import time
 import math
 import signal
 import argparse
+from collections import deque
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -570,6 +571,13 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 last_wandb_log_time = 0.0 # wall-clock of last train-stats wandb push; 0 forces an immediate first log
+# Rolling window of recent per-step dt for ETA. Using a window (instead of the
+# cumulative total_training_time / steps_done) keeps ETA accurate when
+# resuming a checkpoint trained on different hardware: e.g. cute_pt resuming
+# from a d24-stock checkpoint pretrained on 8×H100 (~1s/step) on a single
+# RTX 6000 PRO (~20s/step) would otherwise project ETA using the inherited
+# average dt and badly under-estimate remaining time.
+recent_dts = deque(maxlen=50)
 
 # Graceful save/exit signaling. Two triggers, both checked at the top of the
 # main loop:
@@ -785,10 +793,12 @@ while True:
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
         total_training_time += dt # only count the time after the first 10 steps
-    # Calculate ETA based on average time per step (excluding first 10 steps)
-    steps_done = step - 10
-    if steps_done > 0:
-        avg_time_per_step = total_training_time / steps_done
+        recent_dts.append(dt)
+    # ETA from a rolling window of recent dt (not cumulative average), so
+    # resuming with different hardware than the base checkpoint gives a
+    # meaningful number — see the recent_dts definition above.
+    if recent_dts:
+        avg_time_per_step = sum(recent_dts) / len(recent_dts)
         remaining_steps = num_iterations - step
         eta_seconds = remaining_steps * avg_time_per_step
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
