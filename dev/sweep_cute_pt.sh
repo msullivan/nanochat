@@ -10,11 +10,15 @@
 # comparisons at every size you've reached, even if you ctrl-C halfway.
 #
 # ENV KNOBS
-#   SIZES        word counts for --num-words (default: "100000 30000 10000 3000",
-#                largest first. 100/300/1000 dropped — even 1000 wasn't
-#                producing meaningful CUTE eval signal at FT_STEPS≈2,
-#                because the 1MB per-step batch dwarfs the dataset and
-#                "2 epochs" collapses to ~one gradient step at those sizes.)
+#   SIZES        word counts for --num-words (default:
+#                "100000 70000 50000 30000 10000 3000", largest first.
+#                50k and 70k interpolate the steep "manipulation tasks snap
+#                on" region observed between 30k (~0% on ins/del/swap_char)
+#                and 100k (~70-93% on those same subtasks) for the
+#                d24-byte-l-early model. 100/300/1000 dropped — even 1000
+#                wasn't producing meaningful CUTE eval signal at
+#                FT_STEPS≈2 because the 1MB per-step batch dwarfs the
+#                dataset.)
 #   MODELS       base model tags (default: "d24-byte-l-early d24-byte-l d24-byte-l-ext d24");
 #                "d24" is the stock BPE base — directory is just "d24", not "d24-stock"
 #   N_EPOCHS     epochs over each dataset (default: 2)
@@ -56,7 +60,7 @@ source .venv/bin/activate
 export PYTHONPATH=.
 export OMP_NUM_THREADS=1
 
-SIZES="${SIZES:-100000 30000 10000 3000}"
+SIZES="${SIZES:-100000 70000 50000 30000 10000 3000}"
 MODELS="${MODELS:-d24-byte-l-early d24-byte-l d24-byte-l-ext d24}"
 N_EPOCHS="${N_EPOCHS:-2}"
 FT_LRM="${FT_LRM:-0.05}"
