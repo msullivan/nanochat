@@ -19,7 +19,11 @@
 #                wasn't producing meaningful CUTE eval signal at
 #                FT_STEPS≈2 because the 1MB per-step batch dwarfs the
 #                dataset.)
-#   MODELS       base model tags (default: "d24-byte-l-early d24-byte-l d24-byte-l-ext d24");
+#   MODELS       base model tags (default: "d24-byte-l-early d24 d24-byte-l d24-byte-l-ext");
+#                ordered so the two anchor models (least-pretrained byte and
+#                BPE stock) fill in first at every size — those are the
+#                primary byte-vs-BPE comparison points; the intermediate byte
+#                models add resolution to the byte-pretraining axis after.
 #                "d24" is the stock BPE base — directory is just "d24", not "d24-stock"
 #   N_EPOCHS     epochs over each dataset (default: 2)
 #   FT_LRM       LR multiplier during finetune (default: 0.05)
@@ -61,7 +65,7 @@ export PYTHONPATH=.
 export OMP_NUM_THREADS=1
 
 SIZES="${SIZES:-100000 70000 50000 30000 10000 3000}"
-MODELS="${MODELS:-d24-byte-l-early d24-byte-l d24-byte-l-ext d24}"
+MODELS="${MODELS:-d24-byte-l-early d24 d24-byte-l d24-byte-l-ext}"
 N_EPOCHS="${N_EPOCHS:-2}"
 FT_LRM="${FT_LRM:-0.05}"
 BATCH="${BATCH:-8}"
