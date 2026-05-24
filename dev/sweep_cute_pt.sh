@@ -56,6 +56,17 @@
 #   TPW_BYTE     tokens-per-word for byte models (default: 800)
 #   TPW_BPE      tokens-per-word for BPE/non-byte models (default: 200; only
 #                used when BUDGET_MODE=epochs)
+#   SFT_STYLE    forwarded to cute_pt.sh. 1 = SFT-like LR schedule (high LR
+#                + 50% warmdown), 0 = default cute_pt schedule. Default: 0.
+#   MASK_BEFORE  forwarded to cute_pt.sh. e.g. "Answer: " enables per-doc
+#                loss masking (train only on the answer text).
+#   WARMDOWN_FRAC forwarded to cute_pt.sh. Overrides SFT_STYLE's default.
+#   RECIPE       tag for the training recipe; appears in DST_TAG (so different
+#                recipes don't share checkpoint dirs) and in the results CSV
+#                (so plots can distinguish them). Default: "nodemos" — matches
+#                existing checkpoint naming. If you set SFT_STYLE=1 or
+#                MASK_BEFORE without setting RECIPE, an appropriate label is
+#                auto-derived (e.g. "sft-mask", "sft", "mask").
 
 set -e
 
@@ -73,12 +84,49 @@ MIN_STEPS="${MIN_STEPS:-1}"
 PROMPT_STYLE="${PROMPT_STYLE:-zero}"
 EVAL_MAX="${EVAL_MAX:-100}"
 BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
-RESULT_CSV="${RESULT_CSV:-$BASE_DIR/cute_sweep/results.csv}"
+# RESULT_CSV is resolved below after RECIPE is auto-derived, since the default
+# path depends on the recipe (alternate recipes get their own CSV).
 
+SKIP_DONE="${SKIP_DONE:-1}"
+
+# Intervention env vars that forward to cute_pt.sh. Defaults preserve the
+# legacy "no-demos" recipe; setting any of these flips us into an explicit
+# alternate recipe and influences DST_TAG + CSV labeling.
+SFT_STYLE="${SFT_STYLE:-0}"
+MASK_BEFORE="${MASK_BEFORE:-}"
+WARMDOWN_FRAC="${WARMDOWN_FRAC:-}"  # empty = cute_pt picks default per SFT_STYLE
+
+# Auto-derive RECIPE from interventions if user didn't set it explicitly.
+# Keeps "nodemos" as the default-recipe name (matches existing checkpoint
+# dirs and CSV rows). Any user-set RECIPE overrides this.
+if [ -z "${RECIPE:-}" ]; then
+    if [ "$SFT_STYLE" = "1" ] && [ -n "$MASK_BEFORE" ]; then
+        RECIPE="sft-mask"
+    elif [ "$SFT_STYLE" = "1" ]; then
+        RECIPE="sft"
+    elif [ -n "$MASK_BEFORE" ]; then
+        RECIPE="mask"
+    else
+        RECIPE="nodemos"
+    fi
+fi
+echo "=== recipe: $RECIPE (SFT_STYLE=$SFT_STYLE MASK_BEFORE='${MASK_BEFORE}' WARMDOWN_FRAC='${WARMDOWN_FRAC}') ==="
+
+# Per-recipe CSV file: nodemos uses the canonical results.csv path for
+# back-compat with existing data; alternate recipes go to results_<recipe>.csv.
+# RESULT_CSV is still overridable explicitly if the user wants.
+if [ -z "${RESULT_CSV:-}" ]; then
+    if [ "$RECIPE" = "nodemos" ]; then
+        RESULT_CSV="$BASE_DIR/cute_sweep/results.csv"
+    else
+        RESULT_CSV="$BASE_DIR/cute_sweep/results_${RECIPE}.csv"
+    fi
+fi
 mkdir -p "$(dirname "$RESULT_CSV")"
 if [ ! -s "$RESULT_CSV" ]; then
     echo "model,size,subtask,accuracy,n_passed,n_total,ft_steps" > "$RESULT_CSV"
 fi
+echo "=== RESULT_CSV: $RESULT_CSV ==="
 
 # Subtask set for byte models' structural advantage (and what cute_pt
 # generates). Override via SUBTASKS env var if you want full 14.
@@ -118,8 +166,8 @@ TOKENS_PER_STEP="${TOKENS_PER_STEP:-1048576}"
 already_done() {
     [ "$SKIP_DONE" = "1" ] || return 1
     local model="$1" size="$2"
-    # Look for any row matching this (model, size) — if all 8 char-level
-    # subtasks are present we consider it done.
+    # Look for any row matching this (model, size) in the per-recipe CSV. If
+    # all 8 char-level subtasks are present, the cell is done for this recipe.
     local n
     n=$(awk -F, -v m="$model" -v s="$size" 'NR>1 && $1==m && $2==s {c++} END {print c+0}' "$RESULT_CSV")
     [ "$n" -ge 8 ]
@@ -148,7 +196,7 @@ for SIZE in $SIZES; do
             continue
         fi
 
-        DST_TAG="${MODEL}-cute-nodemos-${SIZE}w"
+        DST_TAG="${MODEL}-cute-${RECIPE}-${SIZE}w"
         DST_DIR="$BASE_DIR/cute_checkpoints/$DST_TAG"
         SRC_DIR="$BASE_DIR/base_checkpoints/$MODEL"
 
@@ -176,13 +224,22 @@ for SIZE in $SIZES; do
         FT_STEPS=$(( N_EPOCHS * STEPS_PER_EPOCH ))
         [ "$FT_STEPS" -lt "$MIN_STEPS" ] && FT_STEPS=$MIN_STEPS
 
-        echo "--- TRAIN: model=$MODEL size=$SIZE ft_steps=$FT_STEPS lrm=$FT_LRM budget=$BUDGET_MODE ---"
+        echo "--- TRAIN: model=$MODEL size=$SIZE recipe=$RECIPE ft_steps=$FT_STEPS budget=$BUDGET_MODE ---"
         # Disable in-training evals; the only eval we care about per iteration
         # is the post-finetune CUTE benchmark run a few lines below.
+        # Forward intervention flags. When SFT_STYLE=1, cute_pt.sh will pick
+        # its own SFT-default FT_LRM (0.8) unless FT_LRM is explicitly set
+        # — so we ONLY pass FT_LRM when SFT_STYLE is off, to avoid overriding
+        # the SFT-style defaults.
+        FT_LRM_FWD=""
+        [ "$SFT_STYLE" != "1" ] && FT_LRM_FWD="$FT_LRM"
         NANOCHAT_DATA_DIR="$(basename "$DATA_DIR")" \
             MODEL_TAG="$DST_TAG" \
             FT_STEPS="$FT_STEPS" \
-            FT_LRM="$FT_LRM" \
+            FT_LRM="$FT_LRM_FWD" \
+            SFT_STYLE="$SFT_STYLE" \
+            MASK_BEFORE="$MASK_BEFORE" \
+            WARMDOWN_FRAC="$WARMDOWN_FRAC" \
             EVAL_EVERY=-1 \
             CORE_METRIC_EVERY=-1 \
             SAMPLE_EVERY=-1 \
@@ -201,7 +258,7 @@ for SIZE in $SIZES; do
         EVAL_OUT=$(mktemp)
         .venv/bin/python "${EVAL_ARGS[@]}" 2>&1 | tee "$EVAL_OUT"
 
-        # Append rows to the CSV: model,size,subtask,acc,n,total,ft_steps
+        # Append rows to the per-recipe CSV: model,size,subtask,acc,n,total,ft_steps
         awk -v m="$MODEL" -v s="$SIZE" -v ft="$FT_STEPS" '
             /^[a-z_]+: [0-9]+\/[0-9]+ \([0-9.]+%\)/ {
                 sub(":", "", $1)
