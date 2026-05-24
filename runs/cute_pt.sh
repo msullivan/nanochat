@@ -52,7 +52,22 @@ export NANOCHAT_DATA_DIR="${NANOCHAT_DATA_DIR:-cute_pt_data}"
 
 MODEL_TAG="${MODEL_TAG:?MODEL_TAG is required (e.g. d24-byte-l-ext-cute)}"
 FT_STEPS="${FT_STEPS:-50}"
-FT_LRM="${FT_LRM:-0.05}"
+# SFT_STYLE=1 swaps in an SFT-like LR schedule: 80% of the pretrain peak LR
+# held flat then warmed down over the last 50% of FT_STEPS, instead of the
+# default cute_pt "barely nudge" 5% LR with 10% warmdown.
+SFT_STYLE="${SFT_STYLE:-0}"
+if [ "$SFT_STYLE" = "1" ]; then
+    FT_LRM="${FT_LRM:-0.8}"
+    WARMDOWN_FRAC="${WARMDOWN_FRAC:-0.5}"
+else
+    FT_LRM="${FT_LRM:-0.05}"
+    WARMDOWN_FRAC="${WARMDOWN_FRAC:-0.1}"
+fi
+# MASK_BEFORE: when set, loss-mask all training tokens before (and including)
+# this substring in each sub-document. e.g. MASK_BEFORE="Answer: " makes the
+# model train only on the answer portion of each Q/A doc, mirroring SFT's
+# assistant-only loss mask.
+MASK_BEFORE="${MASK_BEFORE:-}"
 WANDB_PROJECT="${WANDB_PROJECT:-nanochat-cute}"
 # In-training eval cadences. Sweep driver disables these (sets to -1) since
 # the only eval we care about per cute_pt run is the post-finetune CUTE
@@ -82,15 +97,15 @@ if [ "$FT_STEPS" -le 2 ]; then
     WARMDOWN_RATIO=0
     LR_BREAKPOINTS="${SEED_STEP}:${FT_LRM}"
 else
-    WARMDOWN_TAIL_STEPS=$(( FT_STEPS / 10 ))
-    [ "$WARMDOWN_TAIL_STEPS" -lt 1 ] && WARMDOWN_TAIL_STEPS=1
+    WARMDOWN_TAIL_STEPS=$(.venv/bin/python -c "print(max(1, int(${WARMDOWN_FRAC} * ${FT_STEPS})))")
     WARMDOWN_RATIO=$(.venv/bin/python -c "print(${WARMDOWN_TAIL_STEPS} / ${NUM_ITERATIONS})")
     WARMDOWN_START=$(( NUM_ITERATIONS - WARMDOWN_TAIL_STEPS ))
     LR_BREAKPOINTS="${SEED_STEP}:${FT_LRM},$((WARMDOWN_START - 1)):${FT_LRM}"
 fi
 
-echo "=== cute_pt: tag=$MODEL_TAG seed_step=$SEED_STEP +ft_steps=$FT_STEPS"
-echo "=== num_iterations=$NUM_ITERATIONS warmdown_ratio=$WARMDOWN_RATIO breakpoints=$LR_BREAKPOINTS"
+echo "=== cute_pt: tag=$MODEL_TAG seed_step=$SEED_STEP +ft_steps=$FT_STEPS sft_style=$SFT_STYLE"
+echo "=== num_iterations=$NUM_ITERATIONS lr_mult=$FT_LRM warmdown_ratio=$WARMDOWN_RATIO breakpoints=$LR_BREAKPOINTS"
+echo "=== mask_before=${MASK_BEFORE:-<none>}"
 echo "=== checkpoint_subdir=$CKPT_SUBDIR wandb_project=$WANDB_PROJECT"
 
 torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
@@ -107,5 +122,6 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --eval-tokens=1048576 \
     --core-metric-every="$CORE_METRIC_EVERY" \
     --sample-every="$SAMPLE_EVERY" \
+    --mask-before="$MASK_BEFORE" \
     --fp8 \
     --run="$MODEL_TAG"

@@ -88,6 +88,7 @@ parser.add_argument("--model-tag", type=str, default=None, help="override model 
 parser.add_argument("--byte-tokenizer", action="store_true", help="use byte-level tokenizer (vocab_size=256, no BPE)")
 parser.add_argument("--bigram-value-embeds", action="store_true", help="index value embeddings by (prev_byte, curr_byte_low7) -- 15-bit, 32k entries. UTF-8-aware. Only meaningful with --byte-tokenizer.")
 parser.add_argument("--disable-value-embeds", action="store_true", help="ablate the value-embedding contribution: zero-init the value_embeds + ve_gate weights and skip them in forward and the optimizer (params remain allocated for checkpoint compat)")
+parser.add_argument("--mask-before", type=str, default="", help='loss-mask every training token that comes before (and including) this substring in each sub-document. e.g. --mask-before="Answer: " makes cute_pt train only on the answer text in each Q/A doc. Empty (default) = no masking, every token contributes loss.')
 args = parser.parse_args()
 
 # If resuming, peek at the seed checkpoint's meta to recover the model
@@ -441,8 +442,9 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+_mask_before = args.mask_before if args.mask_before else None
+train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, mask_before=_mask_before)
+build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, mask_before=_mask_before)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------

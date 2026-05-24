@@ -75,7 +75,8 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer, B, T, split,
     tokenizer_threads=4, tokenizer_batch_size=128,
     device="cuda", resume_state_dict=None,
-    buffer_size=1000
+    buffer_size=1000,
+    mask_before=None,
 ):
     """
     BOS-aligned dataloader with Best-Fit Cropping.
@@ -100,6 +101,18 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     bos_token = tokenizer.get_bos_token_id()
     doc_buffer = []
     pq_idx, rg_idx, epoch = 0, 0, 1
+
+    # Per-document loss masking. If mask_before is given, every sub-document in
+    # a packed row has its targets set to -1 (ignore_index) up to and including
+    # the tokenized form of mask_before. Lets cute_pt-style runs train only on
+    # the answer portion of each Q/A document, mirroring SFT's assistant-only
+    # loss mask. Sub-docs that don't contain the marker (e.g., cropped tails)
+    # have their entire target region masked.
+    mask_before_ids = None
+    if mask_before:
+        mask_before_ids = tokenizer.encode(mask_before)
+        if not mask_before_ids:
+            raise ValueError(f"mask_before {mask_before!r} encoded to empty token sequence")
 
     def refill_buffer():
         nonlocal pq_idx, rg_idx, epoch
@@ -153,6 +166,39 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         # Copy to pinned CPU buffer, then single HtoD transfer
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
+
+        # Per-doc loss masking: for each row, find sub-document boundaries
+        # (BOS tokens) and the mask_before marker within each sub-doc, then
+        # set cpu_targets positions that "predict" the prompt region to -1.
+        # Applied AFTER the inputs/targets split so we don't corrupt inputs.
+        if mask_before_ids is not None:
+            _mb_len = len(mask_before_ids)
+            for ri in range(B):
+                row_list = row_buffer[ri].tolist()
+                bos_positions = [i for i, t in enumerate(row_list) if t == bos_token]
+                bos_positions.append(row_capacity)  # sentinel for last sub-doc end
+                for k in range(len(bos_positions) - 1):
+                    s = bos_positions[k]
+                    e = bos_positions[k + 1]  # exclusive
+                    # Locate mask_before_ids within row_list[s:e]
+                    marker_pos = -1
+                    limit = e - _mb_len + 1
+                    for j in range(s, limit):
+                        if row_list[j:j + _mb_len] == mask_before_ids:
+                            marker_pos = j
+                            break
+                    # Prompt region in row coordinates: [s, mask_end).
+                    # mask_end = marker_pos + _mb_len if found, else e (mask
+                    # the whole sub-doc -- happens for cropped tails that
+                    # don't contain the marker).
+                    mask_end = marker_pos + _mb_len if marker_pos >= 0 else e
+                    # target index t corresponds to row_buffer[ri, t+1].
+                    # Prompt input positions [s, mask_end) → target indices
+                    # [s-1, mask_end-1), clamped to >=0 for the first sub-doc.
+                    t_start = max(s - 1, 0)
+                    t_end = mask_end - 1  # exclusive
+                    if t_end > t_start:
+                        cpu_targets[ri, t_start:t_end] = -1
 
         state_dict = {"pq_idx": pq_idx, "rg_idx": rg_idx, "epoch": epoch}
 
