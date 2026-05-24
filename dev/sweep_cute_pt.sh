@@ -14,7 +14,8 @@
 #                largest first so you see whether the experiment is producing
 #                signal at all before burning time on small-data cells; even at
 #                1000 the model wasn't scoring on spell at FT_STEPS=2)
-#   MODELS       base model tags (default: "d24-byte-l-early d24-byte-l d24-byte-l-ext d24-stock")
+#   MODELS       base model tags (default: "d24-byte-l-early d24-byte-l d24-byte-l-ext d24");
+#                "d24" is the stock BPE base — directory is just "d24", not "d24-stock"
 #   N_EPOCHS     epochs over each dataset (default: 2)
 #   FT_LRM       LR multiplier during finetune (default: 0.05)
 #   BATCH        device-batch-size for cute_pt (default: 8)
@@ -41,7 +42,7 @@ export PYTHONPATH=.
 export OMP_NUM_THREADS=1
 
 SIZES="${SIZES:-30000 10000 3000 1000}"
-MODELS="${MODELS:-d24-byte-l-early d24-byte-l d24-byte-l-ext d24-stock}"
+MODELS="${MODELS:-d24-byte-l-early d24-byte-l d24-byte-l-ext d24}"
 N_EPOCHS="${N_EPOCHS:-2}"
 FT_LRM="${FT_LRM:-0.05}"
 BATCH="${BATCH:-8}"
