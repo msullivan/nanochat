@@ -92,6 +92,11 @@ def main():
     parser.add_argument("--no-prefill", action="store_true", help='Do not append \\n\\nAnswer: " to the prompt; let the model emit the answer turn itself')
     parser.add_argument("--prompt-style", type=str, default="fewshot", choices=["fewshot", "zero"], help="fewshot: use the published 4-shot CUTE prompt (default). zero: strip the demo block, keep only Question: onward. Pair with gen_cute_pt_data --no-demos so train and eval surface forms match.")
     parser.add_argument("--device-type", type=str, default="", choices=["", "cuda", "cpu", "mps"])
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile(model, dynamic=True). Compile is on by default since it "
+                        "amortizes well across all prompts in a normal eval (~30s first-shape cost, then "
+                        "real speedup). Set this for one-off debug runs where you don't want the first-prompt "
+                        "compile penalty.")
     args = parser.parse_args()
 
     if args.source in ("base", "cute") and args.mode == "chat":
@@ -111,6 +116,12 @@ def main():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
+    if not args.no_compile:
+        # dynamic=True so the variable prompt lengths and growing decode KV
+        # don't trigger a recompile per shape. SDPA + RoPE + MLP fuse into a
+        # single Inductor graph per shape-class, eliminating per-layer Python
+        # call overhead that dominates eager-mode eval at small batch sizes.
+        model = torch.compile(model, dynamic=True)
     engine = Engine(model, tokenizer)
 
     print0(f"CUTE eval | source={args.source} | mode={args.mode} | model={args.model_tag or 'default'} step={meta.get('step', '?')}")

@@ -93,6 +93,8 @@ Pending: run the ablation, confirm sft-mask closes the BPE gap, write up.
 - 300k cells for the two anchor models (early-byte, d24-BPE) — does byte saturate? Does BPE keep climbing or plateau?
 - General-eval impact: cute_pt with these recipes might degrade CORE; the original "(4) mix in general text" idea (deferred) would test that.
 - Apply same recipe-improvement approach to chat_sft? Probably orthogonal — chat_sft already has all 5 of these features built in.
+- **From-scratch BPE on 120M CUTE-only tokens**: if cute_pt-at-300k destroys general capability anyway, does the 11×-ish pretraining contribute anything to the final CUTE score? Train a fresh d24 from random init on the 300k CUTE data (60M tokens × 2 epochs = 120M training tokens), eval CUTE, compare to `d24-cute-sft-mask-300000w`. Three outcomes worth distinguishing: (a) from-scratch matches/beats → pretraining contributed nothing of value; the comparison was always "char-task model vs general model with char-data tacked on". (b) From-scratch dramatically worse → pretraining provides essential scaffolding (Q/A format, English priors, instruction-following) that 60M narrow tokens can't bootstrap. (c) Mixed by subtask → pretraining specifically helps word-knowledge tasks (spell_inverse, orth) but not pure manipulation. ~25 min train + 15 min eval per cell on RTX 6000 PRO; under 2h for a 3-seed average.
+- Confusion matrix for contains_char at 100k vs 300k: at 0.48 (chance on a 2-class task), we can't distinguish "lost capability but kept format" from "format collapse to one of Yes/No". Per-cell Yes/No prediction distribution + fraction of format-invalid predictions resolves it. Spot-checkable in minutes; would tell us *which* failure mode dominates the contains_char regression.
 
 ---
 
