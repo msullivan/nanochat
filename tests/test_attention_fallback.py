@@ -298,7 +298,8 @@ class TestSDPAOnly:
 
         cache = KVCache(
             batch_size=B, num_heads=H, seq_len=T_max, head_dim=D,
-            num_layers=n_layers, device=self.DEVICE, dtype=self.DTYPE
+            num_layers=n_layers, device=self.DEVICE, dtype=self.DTYPE,
+            n_embd=H * D,
         )
         k_cache, v_cache = cache.get_layer_cache(0)
 

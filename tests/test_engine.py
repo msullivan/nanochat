@@ -97,6 +97,7 @@ def test_kv_cache_basic():
         num_layers=num_layers,
         device="cpu",
         dtype=torch.float32,
+        n_embd=num_heads * head_dim,
     )
 
     # Check initial state
@@ -132,6 +133,7 @@ def test_kv_cache_prefill():
     src_cache = KVCache(
         batch_size=batch_size, num_heads=num_heads, seq_len=32,
         head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
+        n_embd=num_heads * head_dim,
     )
     # Write some data to source cache
     src_cache.k_cache[0, 0, :16, :, :] = 1.0
@@ -142,6 +144,7 @@ def test_kv_cache_prefill():
     dst_cache = KVCache(
         batch_size=batch_size, num_heads=num_heads, seq_len=64,
         head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
+        n_embd=num_heads * head_dim,
     )
 
     # Prefill

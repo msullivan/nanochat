@@ -496,42 +496,60 @@ class GPT(nn.Module):
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
-        T0 = 0 if kv_cache is None else kv_cache.get_pos()
-        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
+        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache.
+        # For cudagraph-friendly decode we slice with torch.narrow using a 0-d
+        # tensor offset (kv_cache.cache_seqlens[0]) instead of calling .item()
+        # to extract a Python int -- the latter forces a host sync that breaks
+        # cudagraph capture.
+        if kv_cache is None:
+            cos_sin = self.cos[:, :T], self.sin[:, :T]
+        else:
+            T0_t = kv_cache.cache_seqlens[0]
+            cos_sin = torch.narrow(self.cos, 1, T0_t, T), torch.narrow(self.sin, 1, T0_t, T)
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
         x = x.to(COMPUTE_DTYPE) # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
-        # Smear: mix previous token's embedding into current position (cheap bigram info)
+        # Smear: mix previous token's embedding into current position (cheap bigram info).
+        # KV-cache path uses an in-place copy_ into kv_cache.prev_embedding (rather than
+        # a Python attribute assignment) so the buffer's memory address stays stable
+        # across forwards, which is what CUDA graph capture requires for correctness on
+        # replay. Order matters: compute the smear contribution FIRST using the OLD
+        # prev_embedding, THEN write the current pre-smear last position back into the
+        # buffer, THEN apply the smear to x.
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
             x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        elif T > 1:
+            # Prefill: smear within x like training; save last pre-smear position
+            # for the next decode step's smear.
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
+            new_x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            kv_cache.prev_embedding.copy_(x[:, -1:, :])  # pre-smear last pos
+            x = new_x
         else:
-            # KV cache inference: read prev embedding from cache, store current for next step
-            x_pre_smear = kv_cache.prev_embedding
-            kv_cache.prev_embedding = x[:, -1:, :]
-            if T > 1:
-                # Prefill: apply smear to positions 1+, same as training
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
-            elif x_pre_smear is not None:
-                # Decode: single token, use cached prev embedding
-                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
-                x = x + gate * x_pre_smear
+            # Decode: single token. Compute smear from OLD prev_embedding first
+            # (using read), THEN overwrite prev_embedding with current pre-smear x.
+            gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, :, :24]))
+            smear_contribution = gate * kv_cache.prev_embedding
+            kv_cache.prev_embedding.copy_(x[:, -1:, :])
+            x = x + smear_contribution
 
         # Compute the index used for value-embedding lookups. Default = curr token.
         # When bigram_value_embeds is on, fold (prev_byte, curr_byte) into a 15-bit index.
+        # KV-cache path uses in-place copy_ into kv_cache.prev_token_id (stable address
+        # for CUDA graph capture). The buffer is initialized to zeros, which matches
+        # the original `None → BOS=0` semantics in compute_bigram_idx for the first call.
         if self.config.bigram_value_embeds:
-            prev_token_id = kv_cache.prev_token_id if (kv_cache is not None and getattr(kv_cache, 'prev_token_id', None) is not None) else None
-            ve_idx = compute_bigram_idx(idx, prev_token_id=prev_token_id)
-            if kv_cache is not None:
-                # Remember the last emitted token so the next decode step has its prev byte.
-                kv_cache.prev_token_id = idx[:, -1]
+            if kv_cache is None:
+                ve_idx = compute_bigram_idx(idx, prev_token_id=None)
+            else:
+                ve_idx = compute_bigram_idx(idx, prev_token_id=kv_cache.prev_token_id)
+                kv_cache.prev_token_id.copy_(idx[:, -1])
         else:
             ve_idx = idx
 
