@@ -117,10 +117,13 @@ def main():
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     if not args.no_compile:
-        # dynamic=True so the variable prompt lengths and growing decode KV
-        # don't trigger a recompile per shape. SDPA + RoPE + MLP fuse into a
-        # single Inductor graph per shape-class, eliminating per-layer Python
-        # call overhead that dominates eager-mode eval at small batch sizes.
+        # Plain torch.compile with dynamic=True. Doesn't include reduce-
+        # overhead's auto-cudagraph mode because we capture the decode step
+        # ourselves in engine.py (manual cudagraphs give us control over
+        # exactly what's in the captured region, avoiding the "mutated
+        # inputs" / mark_static_address dance with PyTorch's auto-wrapper).
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.recompile_limit = 64
         model = torch.compile(model, dynamic=True)
     engine = Engine(model, tokenizer)
 

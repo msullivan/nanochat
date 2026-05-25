@@ -237,10 +237,17 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
 
     FA3 updates k_cache/v_cache in-place. Our fallback does the same.
 
-    The FlexAttention backend routes inference through SDPA: block_mask depends
-    on cache_seqlens which changes every step, so the cache that makes flex fast
-    for training doesn't help here. Could be added later with per-step block_mask
-    rebuilds if inference latency becomes a bottleneck.
+    The non-FA3 fallback computes SDPA over the *full* preallocated cache with
+    an attention mask that blocks positions >= the current valid prefix length.
+    This keeps shapes constant across decode steps (no `[:, :end_pos]` slicing
+    whose output size grows with each token) so torch.compile mode="reduce-
+    overhead" can capture the decode forward into a CUDA graph. The trade is
+    a bit more attention compute per step (over zero-padded cache positions
+    that get masked-to-zero contribution anyway), in exchange for eliminating
+    the Python+dispatch overhead that dominates eager-mode decode on small
+    batches. Net win as long as the per-step Python overhead exceeds the cost
+    of attending to a few unused cache slots, which it does by a wide margin
+    at typical d24 scale.
 
     Args:
         q: Queries, shape (B, T_new, H, D)
@@ -259,27 +266,44 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
             causal=causal, window_size=window_size
         )
 
-    # SDPA fallback: manually manage KV cache (used by both BACKEND='flex' and 'sdpa')
+    # SDPA fallback: full-cache + mask, no `.item()`, no variable-shape slicing.
+    # Used by both BACKEND='flex' and 'sdpa' since neither has a dedicated
+    # KV-cache kernel on this hardware.
     B, T_new, H, D = q.shape
-    pos = cache_seqlens[0].item()  # assume uniform position across batch
+    _, T_max, H_kv, _ = k_cache.shape
+    device = q.device
+    pos = cache_seqlens[0]  # 0-d int tensor (no host sync vs. .item())
 
-    # Insert new k, v into cache (in-place, matching FA3 behavior)
+    # In-place insert into cache at position `pos`. Use index_copy_ rather
+    # than narrow+copy_ so we don't create an aliased view of k_cache that
+    # AOT autograd's merge_view_inputs would try (and fail) to dedupe with
+    # the cache as a regular input.
     if k is not None and v is not None:
-        k_cache[:, pos:pos+T_new, :, :] = k
-        v_cache[:, pos:pos+T_new, :, :] = v
+        indices = pos + torch.arange(T_new, device=k.device)  # (T_new,) int64
+        k_cache.index_copy_(1, indices, k)
+        v_cache.index_copy_(1, indices, v)
 
-    # Get full cache up to current position + new tokens
-    end_pos = pos + T_new
-    k_full = k_cache[:, :end_pos, :, :]
-    v_full = v_cache[:, :end_pos, :, :]
+    # Build attention mask: query i (absolute position pos+i) attends to keys
+    # at positions [max(0, pos+i-window), pos+i]. Shape is (T_new, T_max).
+    key_positions = torch.arange(T_max, device=device)
+    q_positions = pos + torch.arange(T_new, device=device)  # 1-D, (T_new,)
+    # Causal: key_pos <= q_pos
+    attn_mask = key_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # (T_new, T_max)
+    window = window_size[0]
+    if 0 <= window < T_max:
+        # Left sliding window: key_pos >= q_pos - window
+        attn_mask = attn_mask & (key_positions.unsqueeze(0) >= (q_positions.unsqueeze(1) - window))
 
-    # Transpose to SDPA layout: (B, T, H, D) -> (B, H, T, D)
+    # SDPA expects (B, H, T, D). attn_mask broadcasts (T_new, T_max) over (B, H).
     q_sdpa = q.transpose(1, 2)
-    k_sdpa = k_full.transpose(1, 2)
-    v_sdpa = v_full.transpose(1, 2)
-
+    k_sdpa = k_cache.transpose(1, 2)
+    v_sdpa = v_cache.transpose(1, 2)
     enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
-    y_sdpa = _sdpa_attention(q_sdpa, k_sdpa, v_sdpa, window_size, enable_gqa)
+
+    y_sdpa = F.scaled_dot_product_attention(
+        q_sdpa, k_sdpa, v_sdpa,
+        attn_mask=attn_mask, enable_gqa=enable_gqa,
+    )
 
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 

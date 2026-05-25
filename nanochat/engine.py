@@ -89,28 +89,45 @@ class KVCache:
     - Position tracked per batch element via cache_seqlens tensor
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, device, dtype, n_embd):
         self.batch_size = batch_size
         self.max_seq_len = seq_len
         self.n_layers = num_layers
         self.n_heads = num_heads
         self.head_dim = head_dim
+        self.n_embd = n_embd
         # Pre-allocate cache tensors: (n_layers, B, T, H, D)
         self.k_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         self.v_cache = torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, device=device, dtype=dtype)
         # Current sequence length per batch element (FA3 needs int32)
         self.cache_seqlens = torch.zeros(batch_size, dtype=torch.int32, device=device)
-        # Previous token's normalized embedding for smear (set by model forward pass)
-        self.prev_embedding = None
-        # Previous token id for bigram value embeddings (set by model forward pass).
-        # None means "use BOS for the bigram of the next call's first position".
-        self.prev_token_id = None
+        # Pre-allocate the smear "prev embedding" buffer. The model writes the
+        # current step's pre-smear last-position embedding into this buffer
+        # in-place each forward; the next forward reads it for the smear.
+        # Must be preallocated (not Python-attr-assigned per step) so CUDA
+        # graph capture sees a stable address across replays. Initialized to
+        # zeros, which is harmless because the first time it's read is always
+        # AFTER a prefill that overwrites it.
+        self.prev_embedding = torch.zeros(batch_size, 1, n_embd, device=device, dtype=dtype)
+        # Pre-allocate the bigram-value-embeds "prev token id" buffer. Same
+        # rationale: compute_bigram_idx reads this each forward and the model
+        # writes the last emitted token id back. Initialized to zero, which
+        # matches the original `None → BOS=0` semantics for the first call.
+        self.prev_token_id = torch.zeros(batch_size, dtype=torch.long, device=device)
+        # Tell torch.compile / cudagraphs that these tensors live at stable
+        # memory addresses across calls. Without this, the cudagraph wrapper
+        # sees k_cache/v_cache mutated in-place each forward and refuses to
+        # capture ("skipping cudagraphs due to mutated inputs"). With it, the
+        # cache is treated as graph-owned state and capture proceeds.
+        for t in (self.k_cache, self.v_cache, self.cache_seqlens,
+                  self.prev_embedding, self.prev_token_id):
+            torch._dynamo.mark_static_address(t)
 
     def reset(self):
         """Reset cache to empty state."""
         self.cache_seqlens.zero_()
-        self.prev_embedding = None
-        self.prev_token_id = None
+        self.prev_embedding.zero_()
+        self.prev_token_id.zero_()
 
     def get_pos(self):
         """Get current position (assumes all batch elements at same position)."""
@@ -136,12 +153,12 @@ class KVCache:
         self.k_cache[:, :, :other_pos, :, :] = other.k_cache[:, :, :other_pos, :, :]
         self.v_cache[:, :, :other_pos, :, :] = other.v_cache[:, :, :other_pos, :, :]
         self.cache_seqlens.fill_(other_pos)
-        # Copy smear state: expand batch=1 prev_embedding to num_samples
-        if other.prev_embedding is not None:
-            self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
-        # Copy bigram-VE state: expand batch=1 prev_token_id to num_samples
-        if other.prev_token_id is not None:
-            self.prev_token_id = other.prev_token_id.expand(self.batch_size).clone()
+        # Copy smear state in-place: expand other's batch=1 to self.batch_size
+        # then write into our preallocated buffer (preserves the stable
+        # address that mark_static_address registered).
+        self.prev_embedding.copy_(other.prev_embedding.expand(self.batch_size, -1, -1))
+        # Same for bigram-VE prev_token_id
+        self.prev_token_id.copy_(other.prev_token_id.expand(self.batch_size))
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
@@ -215,7 +232,7 @@ class Engine:
 
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
-        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer, "n_embd": m.n_embd}
         kv_cache_prefill = KVCache(
             batch_size=1,
             seq_len=len(tokens),
