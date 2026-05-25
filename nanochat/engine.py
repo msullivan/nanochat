@@ -197,8 +197,17 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Same as generate, but does single prefill and then clones the KV cache."""
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42,
+                 use_cuda_graphs=False):
+        """Same as generate, but does single prefill and then clones the KV cache.
+
+        use_cuda_graphs: if True, capture the per-token decode forward into a
+        torch.cuda.CUDAGraph after prefill and replay it for each subsequent
+        decode step. Eliminates Python loop and kernel-launch overhead between
+        layers (the main cost at d24 single-token decode on Blackwell where
+        no FA3 kernel is available). Requires CUDA. ~50-200ms one-time cost
+        per generate() call for warmup+capture.
+        """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
         # NOTE: setting the dtype here and in this way is an ugly hack.
@@ -256,6 +265,56 @@ class Engine:
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around
 
+        # 2b) Optionally capture the per-token decode forward into a CUDA graph.
+        # Done AFTER prefill (so the cache is in its real post-prefill state)
+        # but BEFORE the decode loop. Strategy:
+        #   - Allocate static input/logits buffers at fixed addresses.
+        #   - Snapshot cache state.
+        #   - Warmup 3 forwards on a side stream (lets PyTorch finalize lazy
+        #     init like Triton compiles, autotune, allocator warmup -- these
+        #     can't happen during torch.cuda.graph capture).
+        #   - Restore snapshot (warmup advanced the cache).
+        #   - Capture: forward(input_buffer) -> logits_buffer.copy_(last_pos).
+        #   - Restore snapshot again (capture also ran one forward).
+        graph = input_buffer = logits_buffer = None
+        if use_cuda_graphs:
+            assert device.type == "cuda", "CUDA graphs require a CUDA device"
+            vocab_size = self.model.config.vocab_size
+            input_buffer = torch.zeros(num_samples, 1, dtype=torch.long, device=device)
+            logits_buffer = torch.zeros(num_samples, vocab_size, device=device, dtype=dtype)
+
+            # Snapshot cache state (everything that gets mutated during a forward).
+            snap_seqlens = kv_cache_decode.cache_seqlens.clone()
+            snap_k = kv_cache_decode.k_cache.clone()
+            snap_v = kv_cache_decode.v_cache.clone()
+            snap_prev_emb = kv_cache_decode.prev_embedding.clone()
+            snap_prev_tid = kv_cache_decode.prev_token_id.clone()
+
+            def restore_cache():
+                kv_cache_decode.cache_seqlens.copy_(snap_seqlens)
+                kv_cache_decode.k_cache.copy_(snap_k)
+                kv_cache_decode.v_cache.copy_(snap_v)
+                kv_cache_decode.prev_embedding.copy_(snap_prev_emb)
+                kv_cache_decode.prev_token_id.copy_(snap_prev_tid)
+
+            # Warmup on a side stream so any allocator activity doesn't
+            # contaminate the capture stream.
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                for _ in range(3):
+                    out = self.model.forward(input_buffer, kv_cache=kv_cache_decode)
+                    logits_buffer.copy_(out[:, -1, :])
+            torch.cuda.current_stream().wait_stream(side_stream)
+            restore_cache()
+
+            # Capture the decode step.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                out = self.model.forward(input_buffer, kv_cache=kv_cache_decode)
+                logits_buffer.copy_(out[:, -1, :])
+            restore_cache()
+
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
 
@@ -310,8 +369,19 @@ class Engine:
             num_generated += 1
 
             # Prepare logits for next iteration
-            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            if graph is not None:
+                # Graph path: copy next tokens into the static input buffer
+                # (the graph's captured kernels read from this address) and
+                # replay. logits_buffer gets written in-place by the captured
+                # `logits_buffer.copy_(out[:, -1, :])` call.
+                input_buffer.copy_(
+                    torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+                )
+                graph.replay()
+                logits = logits_buffer
+            else:
+                ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+                logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

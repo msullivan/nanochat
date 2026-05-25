@@ -497,15 +497,18 @@ class GPT(nn.Module):
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache.
-        # For cudagraph-friendly decode we slice with torch.narrow using a 0-d
-        # tensor offset (kv_cache.cache_seqlens[0]) instead of calling .item()
-        # to extract a Python int -- the latter forces a host sync that breaks
-        # cudagraph capture.
+        # For cudagraph-friendly decode we slice via index_select using a
+        # positions tensor derived from kv_cache.cache_seqlens. torch.narrow
+        # with a tensor `start` reads the start tensor's value at call time
+        # (host sync) to compute the storage offset, which breaks capture
+        # ("operation not permitted when stream is capturing"). index_select
+        # defers the indexing to kernel runtime, so no host sync.
         if kv_cache is None:
             cos_sin = self.cos[:, :T], self.sin[:, :T]
         else:
             T0_t = kv_cache.cache_seqlens[0]
-            cos_sin = torch.narrow(self.cos, 1, T0_t, T), torch.narrow(self.sin, 1, T0_t, T)
+            positions = T0_t + torch.arange(T, device=self.cos.device, dtype=torch.long)
+            cos_sin = self.cos.index_select(1, positions), self.sin.index_select(1, positions)
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token

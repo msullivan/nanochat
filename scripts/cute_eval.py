@@ -28,7 +28,8 @@ from nanochat.engine import Engine
 from tasks.cute import CUTE, CUTE_SUBTASKS, CUTE_CHAR_LEVEL
 
 
-def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0):
+def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0,
+                     use_cuda_graphs=False):
     from tasks.cute import extract_cute_answer
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = engine.model.get_device() if hasattr(engine, "model") else None
@@ -50,6 +51,7 @@ def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problem
             max_tokens=max_new_tokens,
             temperature=0.0,
             top_k=50,
+            use_cuda_graphs=use_cuda_graphs,
         )
         prefix_length = len(encoded_prompt)
         completion = tokenizer.decode(results[0][prefix_length:])
@@ -97,6 +99,11 @@ def main():
                         "amortizes well across all prompts in a normal eval (~30s first-shape cost, then "
                         "real speedup). Set this for one-off debug runs where you don't want the first-prompt "
                         "compile penalty.")
+    parser.add_argument("--no-cuda-graphs", action="store_true",
+                        help="Disable manual CUDA graph capture in engine.generate. Graphs are on by default "
+                        "on CUDA devices; they cut per-token Python/dispatch overhead by replaying the decode "
+                        "forward as a single GPU launch. ~50-200ms per-prompt capture cost amortized over "
+                        "all decoded tokens. Disable for debug or when capture itself misbehaves.")
     args = parser.parse_args()
 
     if args.source in ("base", "cute", "scratch", "mix") and args.mode == "chat":
@@ -130,10 +137,16 @@ def main():
     print0(f"CUTE eval | source={args.source} | mode={args.mode} | model={args.model_tag or 'default'} step={meta.get('step', '?')}")
     print0(f"Subtasks: {subtasks}")
 
+    use_cuda_graphs = (not args.no_cuda_graphs) and (device_type == "cuda")
+    if use_cuda_graphs:
+        print0("Using manual CUDA graph capture in decode loop.")
+
     results = {}
     for subtask in subtasks:
         task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill, prompt_style=args.prompt_style)
-        num_passed, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens, max_problems=args.max_problems, debug_n=args.debug_n)
+        num_passed, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens,
+                                             max_problems=args.max_problems, debug_n=args.debug_n,
+                                             use_cuda_graphs=use_cuda_graphs)
         acc = num_passed / total if total > 0 else 0.0
         results[subtask] = acc
         print0(f"{subtask}: {num_passed}/{total} ({100*acc:.2f}%)")
