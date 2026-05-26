@@ -6,6 +6,17 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ## 2026-05-25: Inference speedup on Blackwell — manual CUDA graphs beat torch.compile
 
+**Epistemic-status caveat**: this entire entry was written by Claude during
+the debugging session. The **wallclock numbers and microbench results are
+empirical** (msully ran them and reported them). Everything else —
+explanations for *why* one approach was faster than another, claims about
+what PyTorch's reduce-overhead wrapper does internally, claims about
+per-call kernel-launch overheads, claims about why gpt-fast's pattern works
+for them but not us, etc. — is the LLM's best-guess interpretation, not
+verified against PyTorch source code or profiler data. Treat the rationale
+as plausible-but-unconfirmed. The measurements stand; the stories about
+them might be wrong in places.
+
 Multi-hour debugging session trying to make cute_eval decode faster on the
 RTX 6000 PRO (Blackwell sm120, no FA3 available). Final result: **1:22 for
 200 prompts of contains_char (~13.7 ms/token at d24), ~3× faster than the
