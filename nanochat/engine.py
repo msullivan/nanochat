@@ -195,11 +195,6 @@ class Engine:
         # input_buffer, input_pos_buffer, logits_buffer). Captured on the
         # first decode call for a given num_samples value, reused after.
         self._graphs = {}
-        # Lazy-init temp KVCache at batch_size=1 used for prefill on
-        # multi-sample generations. Allocated on first need, then reused
-        # across all subsequent generate() calls. ~25MB at d24 / max_seq_len
-        # 2048, worth keeping around to avoid per-call alloc.
-        self._prefill_cache = None
 
     def _get_or_capture_decode_graph(self, num_samples, device, dtype):
         """Return (graph, input_buffer, input_pos_buffer, logits_buffer) for
@@ -269,39 +264,6 @@ class Engine:
         self._graphs[key] = result
         return result
 
-    def _prefill_and_broadcast(self, tokens, num_samples, input_pos, max_seq_length, dtype, device):
-        """Prefill the prompt at batch=1 into a temp cache, then broadcast
-        the result into self.model.kv_cache across the batch dim. Avoids
-        the Nx prefill compute that "prefill at batch=num_samples with the
-        prompt duplicated across batch" would do.
-
-        Returns the last-position prefill logits expanded to (num_samples, V).
-        """
-        c = self.model.config
-        if (self._prefill_cache is None
-                or self._prefill_cache.max_seq_len < max_seq_length
-                or self._prefill_cache.k_cache.dtype != dtype
-                or self._prefill_cache.k_cache.device != device):
-            self._prefill_cache = KVCache(
-                batch_size=1, num_heads=c.n_kv_head, seq_len=max_seq_length,
-                head_dim=c.n_embd // c.n_head, num_layers=c.n_layer,
-                dtype=dtype, n_embd=c.n_embd,
-            ).to(device)
-        else:
-            self._prefill_cache.reset()
-        temp = self._prefill_cache
-        ids = torch.tensor([tokens], dtype=torch.long, device=device)
-        prefill_logits = self.model.forward(ids, input_pos=input_pos, kv_cache=temp)[:, -1, :]
-        # Broadcast temp -> main across the batch dim. copy_ broadcasts the
-        # B=1 source up to the B=num_samples destination size.
-        main = self.model.kv_cache
-        prompt_len = ids.size(1)
-        main.k_cache[:, :, :prompt_len].copy_(temp.k_cache[:, :, :prompt_len])
-        main.v_cache[:, :, :prompt_len].copy_(temp.v_cache[:, :, :prompt_len])
-        main.prev_embedding.copy_(temp.prev_embedding)
-        main.prev_token_id.copy_(temp.prev_token_id)
-        return prefill_logits.expand(num_samples, -1)
-
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
         """Single prefill + decode loop with kv cache attached to the model.
@@ -347,20 +309,14 @@ class Engine:
         max_seq_length = self.model.config.sequence_len
         self.model.setup_caches(batch_size=num_samples, max_seq_length=max_seq_length, dtype=dtype)
 
-        # 2) Prefill. For num_samples=1, just run it through the main cache.
-        # For num_samples>1, prefill at B=1 with a temp cache and broadcast
-        # the result into the main B=N cache -- the prompt is identical
-        # across the batch dim so we don't need to compute prefill N times.
-        # (At long prompt lengths and large num_samples, the B=N variant
-        # would be an Nx prefill compute regression.)
+        # 2) Prefill at batch=num_samples (prompt duplicated across batch dim).
+        # For num_samples=1 (cute_eval) no waste; for num_samples>1 we trade a
+        # bit of redundant prefill compute for a simpler graph-capturable
+        # decode path (single cache, no batch-1 -> batch-N copy).
         prompt_len = len(tokens)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device).expand(num_samples, -1).contiguous()
         input_pos = torch.arange(prompt_len, device=device, dtype=torch.long)
-        if num_samples == 1:
-            ids = torch.tensor([tokens], dtype=torch.long, device=device)
-            logits = self.model.forward(ids, input_pos=input_pos)[:, -1, :]
-        else:
-            logits = self._prefill_and_broadcast(tokens, num_samples, input_pos,
-                                                  max_seq_length, dtype, device)
+        logits = self.model.forward(ids, input_pos=input_pos)[:, -1, :]  # (num_samples, vocab_size)
 
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
