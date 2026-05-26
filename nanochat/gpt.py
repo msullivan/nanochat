@@ -527,25 +527,27 @@ class GPT(nn.Module):
             n_embd=c.n_embd,
         ).to(device)
 
-    def forward(self, idx, targets=None, input_pos=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, input_pos=None, kv_cache=None, loss_reduction='mean'):
         """
         Args:
             idx: (B, T) token ids
             targets: (B, T) target token ids for training (None for inference)
             input_pos: (T,) absolute positions of the tokens in `idx`. Required
-                       for inference (kv-cache present); ignored for training.
+                       for inference; ignored for training.
+            kv_cache: explicit KVCache to use for this call. Default None means
+                      "use self.kv_cache (attached via setup_caches)". Engine
+                      passes an explicit cache during multi-sample prefill so
+                      it can run prefill at B=1 (cheap) and then broadcast
+                      into the B=N main cache for decode.
             loss_reduction: 'mean' or 'sum'
-
-        For inference, the KV cache is read from self.kv_cache (attached via
-        setup_caches). input_pos tells the cache where to write the new k,v
-        and where in the rotary table to look up positions. Passing input_pos
-        explicitly (rather than reading from cache_seqlens internally) means
-        forward has no host syncs -- prerequisite for cudagraph capture.
         """
-        # Use kv cache only when an explicit input_pos is provided. The naive
-        # GPT.generate (no input_pos) and training (targets given) both want
-        # the no-cache full-sequence path.
-        kv_cache = self.kv_cache if (targets is None and input_pos is not None) else None
+        # Resolve which cache to use. Use the explicit override if given,
+        # else self.kv_cache when in inference mode (targets=None + input_pos
+        # given). Training and the naive GPT.generate skip the cache.
+        if kv_cache is None and targets is None and input_pos is not None:
+            kv_cache = self.kv_cache
+        elif targets is not None:
+            kv_cache = None  # training never uses the cache regardless of attribute
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
