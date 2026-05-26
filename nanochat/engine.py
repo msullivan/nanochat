@@ -205,13 +205,23 @@ class Engine:
         warmup) before capture, but warmup mutates the cache buffers, so we
         snapshot and restore around it. The captured graph references the
         cache + input buffer addresses; replay re-runs the same kernels.
-        """
-        key = num_samples
-        if key in self._graphs:
-            return self._graphs[key]
 
+        Graphs are keyed on (num_samples, id(model.kv_cache)). If setup_caches
+        reallocates the cache (e.g. when batch_size changes between calls),
+        the old cache's buffers get freed -- any captured graph still
+        referencing them would access freed memory on replay. The id() in
+        the key forces a cache miss after reallocation; we also drop stale
+        entries that reference the prior cache to release their refs.
+        """
         kv = self.model.kv_cache
         assert kv is not None, "model.kv_cache not set up; call model.setup_caches first"
+        kv_id = id(kv)
+        key = (num_samples, kv_id)
+        if key in self._graphs:
+            return self._graphs[key]
+        # Drop entries that reference a different kv_cache -- they're stale
+        # (the cache they captured against has been freed or replaced).
+        self._graphs = {k: v for k, v in self._graphs.items() if k[1] == kv_id}
         vocab_size = self.model.config.vocab_size
 
         # Allocate the static input/output buffers used by the captured graph.
