@@ -291,48 +291,49 @@ class TestSDPAOnly:
         set_impl(None)
 
     def test_kvcache(self):
-        """Test SDPA with KV cache."""
+        """Test SDPA fallback with the new input_pos-based KV cache API.
+
+        Now input_pos is an explicit (T_new,) tensor of absolute positions
+        passed to flash_attn_with_kvcache (instead of the cache tracking
+        cache_seqlens internally). Engine maintains/advances input_pos.
+        """
         set_impl('sdpa')
         B, T_max, H, D = 2, 64, 4, 32
         n_layers = 1
 
         cache = KVCache(
             batch_size=B, num_heads=H, seq_len=T_max, head_dim=D,
-            num_layers=n_layers, device=self.DEVICE, dtype=self.DTYPE,
+            num_layers=n_layers, dtype=self.DTYPE,
             n_embd=H * D,
-        )
+        ).to(self.DEVICE)
         k_cache, v_cache = cache.get_layer_cache(0)
 
-        # Prefill
+        # Prefill: positions 0..T_prefill-1
         T_prefill = 16
         q = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
         k = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
         v = torch.randn(B, T_prefill, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        input_pos = torch.arange(T_prefill, device=self.DEVICE, dtype=torch.long)
 
         y = flash_attn.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v,
-            cache_seqlens=cache.cache_seqlens,
+            input_pos=input_pos,
             causal=True, window_size=(T_max, 0)
         )
-        cache.advance(T_prefill)
-
         assert y.shape == (B, T_prefill, H, D)
-        assert cache.get_pos() == T_prefill
 
-        # Generate single token
+        # Generate single token at position T_prefill
         q_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
         k_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
         v_single = torch.randn(B, 1, H, D, device=self.DEVICE, dtype=self.DTYPE)
+        input_pos_single = torch.tensor([T_prefill], device=self.DEVICE, dtype=torch.long)
 
         y_single = flash_attn.flash_attn_with_kvcache(
             q_single, k_cache, v_cache, k=k_single, v=v_single,
-            cache_seqlens=cache.cache_seqlens,
+            input_pos=input_pos_single,
             causal=True, window_size=(T_max, 0)
         )
-        cache.advance(1)
-
         assert y_single.shape == (B, 1, H, D)
-        assert cache.get_pos() == T_prefill + 1
         set_impl(None)
 
 

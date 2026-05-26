@@ -36,15 +36,16 @@ class MockModel:
     def get_device(self):
         return self._device
 
-    def forward(self, ids, kv_cache=None):
+    def forward(self, ids, input_pos=None, targets=None, loss_reduction='mean'):
         """Return uniform logits so sampling is spread across vocab."""
         B, T = ids.shape
-        # With FA3, flash_attn_with_kvcache updates cache in-place and we advance position
-        if kv_cache is not None:
-            kv_cache.advance(T)
         # Uniform logits -> equal probability for all tokens
         logits = torch.zeros(B, T, self.vocab_size)
         return logits
+
+    def setup_caches(self, batch_size, max_seq_length, dtype):
+        """No-op for the mock; engine.generate calls this before each gen."""
+        pass
 
 
 class ByteTokenizer:
@@ -82,7 +83,12 @@ class ByteTokenizer:
         return bytes(byte_tokens).decode("utf-8", errors="replace")
 
 def test_kv_cache_basic():
-    """Test basic KVCache functionality for FA3."""
+    """Basic shape/dtype check for the new KVCache (nn.Module + register_buffer).
+
+    Position tracking is now external (engine maintains input_pos), so the
+    old get_pos/advance/prefill API is gone -- this test just verifies the
+    module constructs and exposes the expected buffers.
+    """
     batch_size = 2
     num_heads = 3
     seq_len = 64
@@ -95,67 +101,26 @@ def test_kv_cache_basic():
         seq_len=seq_len,
         head_dim=head_dim,
         num_layers=num_layers,
-        device="cpu",
         dtype=torch.float32,
         n_embd=num_heads * head_dim,
     )
 
-    # Check initial state
-    assert kv_cache.get_pos() == 0
     assert kv_cache.k_cache.shape == (num_layers, batch_size, seq_len, num_heads, head_dim)
     assert kv_cache.v_cache.shape == (num_layers, batch_size, seq_len, num_heads, head_dim)
+    assert kv_cache.prev_embedding.shape == (batch_size, 1, num_heads * head_dim)
+    assert kv_cache.prev_token_id.shape == (batch_size,)
 
-    # Test advance
-    kv_cache.advance(10)
-    assert kv_cache.get_pos() == 10
-
-    kv_cache.advance(5)
-    assert kv_cache.get_pos() == 15
-
-    # Test reset
-    kv_cache.reset()
-    assert kv_cache.get_pos() == 0
-
-    # Test get_layer_cache returns correct views
+    # get_layer_cache still returns per-layer slices
     k_layer0, v_layer0 = kv_cache.get_layer_cache(0)
     assert k_layer0.shape == (batch_size, seq_len, num_heads, head_dim)
     assert v_layer0.shape == (batch_size, seq_len, num_heads, head_dim)
 
-
-def test_kv_cache_prefill():
-    """Test KVCache.prefill() copies data correctly."""
-    batch_size = 1
-    num_heads = 4
-    head_dim = 8
-    num_layers = 2
-
-    # Create source cache and advance it
-    src_cache = KVCache(
-        batch_size=batch_size, num_heads=num_heads, seq_len=32,
-        head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
-        n_embd=num_heads * head_dim,
-    )
-    # Write some data to source cache
-    src_cache.k_cache[0, 0, :16, :, :] = 1.0
-    src_cache.v_cache[0, 0, :16, :, :] = 2.0
-    src_cache.advance(16)
-
-    # Create destination cache with larger seq_len
-    dst_cache = KVCache(
-        batch_size=batch_size, num_heads=num_heads, seq_len=64,
-        head_dim=head_dim, num_layers=num_layers, device="cpu", dtype=torch.float32,
-        n_embd=num_heads * head_dim,
-    )
-
-    # Prefill
-    dst_cache.prefill(src_cache)
-
-    # Check position was copied
-    assert dst_cache.get_pos() == 16
-
-    # Check data was copied
-    assert (dst_cache.k_cache[0, 0, :16, :, :] == 1.0).all()
-    assert (dst_cache.v_cache[0, 0, :16, :, :] == 2.0).all()
+    # reset() zeros transient state
+    kv_cache.prev_embedding.fill_(1.0)
+    kv_cache.prev_token_id.fill_(42)
+    kv_cache.reset()
+    assert (kv_cache.prev_embedding == 0).all()
+    assert (kv_cache.prev_token_id == 0).all()
 
 
 def test_multi_sample_first_token_diversity():

@@ -237,68 +237,64 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     return y.transpose(1, 2)  # back to (B, T, H, D)
 
 
-def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
+def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
                             causal=False, window_size=(-1, -1)):
     """
     Flash Attention with KV cache for inference.
 
-    FA3 updates k_cache/v_cache in-place. Our fallback does the same.
-
-    The non-FA3 fallback computes SDPA over the *full* preallocated cache with
-    an attention mask that blocks positions >= the current valid prefix length.
-    This keeps shapes constant across decode steps (no `[:, :end_pos]` slicing
-    whose output size grows with each token) so torch.compile mode="reduce-
-    overhead" can capture the decode forward into a CUDA graph. The trade is
-    a bit more attention compute per step (over zero-padded cache positions
-    that get masked-to-zero contribution anyway), in exchange for eliminating
-    the Python+dispatch overhead that dominates eager-mode decode on small
-    batches. Net win as long as the per-step Python overhead exceeds the cost
-    of attending to a few unused cache slots, which it does by a wide margin
-    at typical d24 scale.
-
     Args:
         q: Queries, shape (B, T_new, H, D)
         k_cache, v_cache: Pre-allocated cache tensors, shape (B, T_max, H_kv, D)
-        k, v: New keys/values to insert, shape (B, T_new, H_kv, D)
-        cache_seqlens: Current position in cache, shape (B,) int32
+        k, v: New keys/values to insert at positions input_pos, shape (B, T_new, H_kv, D)
+        input_pos: (T_new,) absolute positions where the new k,v are written into
+                   the cache, and which the resulting queries attend to causally.
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
 
     Returns:
         Output tensor of shape (B, T_new, H, D)
+
+    For FA3 (Hopper): forwards to flash_attn_with_kvcache, deriving
+    cache_seqlens from input_pos[:1]. FA3 advances the cache position via
+    cache_seqlens and writes new k,v at that offset internally.
+
+    For the SDPA fallback (everything else): writes new k,v at input_pos via
+    index_copy_, then computes SDPA over the FULL preallocated cache with a
+    bool mask built from input_pos. Shapes are constant across decode steps
+    (no variable `[:, :end_pos]` slice), which is what torch.compile mode=
+    "reduce-overhead" needs to capture the decode forward into a cuda graph.
+    Costs a few extra microseconds per layer per step over zero-padded cache
+    positions (which get masked-to-zero contribution anyway), but the
+    cudagraph wins back far more.
     """
     if BACKEND == 'fa3':
+        # FA3 wants cache_seqlens (per-batch position). Derive from input_pos[0]
+        # broadcast across the batch dim -- our input_pos is shared across batch.
+        B = q.shape[0]
+        cache_seqlens = input_pos[:1].to(torch.int32).expand(B)
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
         )
 
     # SDPA fallback: full-cache + mask, no `.item()`, no variable-shape slicing.
-    # Used by both BACKEND='flex' and 'sdpa' since neither has a dedicated
-    # KV-cache kernel on this hardware.
     B, T_new, H, D = q.shape
     _, T_max, H_kv, _ = k_cache.shape
     device = q.device
-    pos = cache_seqlens[0]  # 0-d int tensor (no host sync vs. .item())
 
-    # In-place insert into cache at position `pos`. Use index_copy_ rather
-    # than narrow+copy_ so we don't create an aliased view of k_cache that
-    # AOT autograd's merge_view_inputs would try (and fail) to dedupe with
-    # the cache as a regular input.
+    # In-place insert into cache at positions input_pos.
     if k is not None and v is not None:
-        indices = pos + torch.arange(T_new, device=k.device)  # (T_new,) int64
-        k_cache.index_copy_(1, indices, k)
-        v_cache.index_copy_(1, indices, v)
+        k_cache.index_copy_(1, input_pos, k)
+        v_cache.index_copy_(1, input_pos, v)
 
-    # Build attention mask: query i (absolute position pos+i) attends to keys
-    # at positions [max(0, pos+i-window), pos+i]. Shape is (T_new, T_max).
+    # Build attention mask: query at absolute position input_pos[i] attends to
+    # keys at positions [max(0, input_pos[i] - window), input_pos[i]].
+    # Shape is (T_new, T_max).
     key_positions = torch.arange(T_max, device=device)
-    q_positions = pos + torch.arange(T_new, device=device)  # 1-D, (T_new,)
-    # Causal: key_pos <= q_pos
-    attn_mask = key_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # (T_new, T_max)
+    q_positions = input_pos  # (T_new,)
+    attn_mask = key_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # causal
     window = window_size[0]
     if 0 <= window < T_max:
-        # Left sliding window: key_pos >= q_pos - window
         attn_mask = attn_mask & (key_positions.unsqueeze(0) >= (q_positions.unsqueeze(1) - window))
 
     # SDPA expects (B, H, T, D). attn_mask broadcasts (T_new, T_max) over (B, H).
@@ -307,10 +303,18 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=N
     v_sdpa = v_cache.transpose(1, 2)
     enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
 
-    y_sdpa = F.scaled_dot_product_attention(
-        q_sdpa, k_sdpa, v_sdpa,
-        attn_mask=attn_mask, enable_gqa=enable_gqa,
-    )
+    # Force cuDNN backend: SDPA's default selection on Blackwell sm120 picks
+    # the MATH backend (slow) for our (full-cache + bool mask + GQA) combo
+    # because Flash refuses non-null masks and Efficient/cuDNN are runtime-
+    # disabled in the default scoring. cuDNN explicitly supports masks and
+    # is ~2.4x faster than MATH on this hardware for our shapes (microbench
+    # in dev/sdpa_bench.py).
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+        y_sdpa = F.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            attn_mask=attn_mask, enable_gqa=enable_gqa,
+        )
 
     return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
 

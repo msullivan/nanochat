@@ -28,8 +28,7 @@ from nanochat.engine import Engine
 from tasks.cute import CUTE, CUTE_SUBTASKS, CUTE_CHAR_LEVEL
 
 
-def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0,
-                     use_cuda_graphs=False):
+def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0):
     from tasks.cute import extract_cute_answer
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = engine.model.get_device() if hasattr(engine, "model") else None
@@ -51,7 +50,6 @@ def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problem
             max_tokens=max_new_tokens,
             temperature=0.0,
             top_k=50,
-            use_cuda_graphs=use_cuda_graphs,
         )
         prefix_length = len(encoded_prompt)
         completion = tokenizer.decode(results[0][prefix_length:])
@@ -95,15 +93,9 @@ def main():
     parser.add_argument("--prompt-style", type=str, default="fewshot", choices=["fewshot", "zero"], help="fewshot: use the published 4-shot CUTE prompt (default). zero: strip the demo block, keep only Question: onward. Pair with gen_cute_pt_data --no-demos so train and eval surface forms match.")
     parser.add_argument("--device-type", type=str, default="", choices=["", "cuda", "cpu", "mps"])
     parser.add_argument("--no-compile", action="store_true",
-                        help="Disable torch.compile(model, dynamic=True). Compile is on by default since it "
-                        "amortizes well across all prompts in a normal eval (~30s first-shape cost, then "
-                        "real speedup). Set this for one-off debug runs where you don't want the first-prompt "
-                        "compile penalty.")
-    parser.add_argument("--no-cuda-graphs", action="store_true",
-                        help="Disable manual CUDA graph capture in engine.generate. Graphs are on by default "
-                        "on CUDA devices; they cut per-token Python/dispatch overhead by replaying the decode "
-                        "forward as a single GPU launch. ~50-200ms per-prompt capture cost amortized over "
-                        "all decoded tokens. Disable for debug or when capture itself misbehaves.")
+                        help="Disable torch.compile(model, mode='reduce-overhead'). With compile on (default), "
+                        "PyTorch wraps the decode forward in a cudagraph automatically -- big speedup at the "
+                        "cost of ~30s first-shape compile + ~30s decode shape compile. Disable for debug.")
     args = parser.parse_args()
 
     if args.source in ("base", "cute", "scratch", "mix") and args.mode == "chat":
@@ -123,30 +115,26 @@ def main():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
-    if not args.no_compile:
-        # Plain torch.compile with dynamic=True. Doesn't include reduce-
-        # overhead's auto-cudagraph mode because we capture the decode step
-        # ourselves in engine.py (manual cudagraphs give us control over
-        # exactly what's in the captured region, avoiding the "mutated
-        # inputs" / mark_static_address dance with PyTorch's auto-wrapper).
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.config.recompile_limit = 64
-        model = torch.compile(model, dynamic=True)
-    engine = Engine(model, tokenizer)
+    # Decode compile/cudagraph is owned by Engine itself -- wraps just the
+    # per-decode-step forward (fixed shape (B,1) -> one captured cudagraph
+    # reused for every decoded token). Prefill is intentionally left
+    # uncompiled so its variable prompt-length doesn't trigger per-shape
+    # cudagraph recapture, which would tank wallclock at eval.
+    torch._dynamo.config.recompile_limit = 64
+    # cudagraph_trees has more per-call overhead than basic cudagraph wrapping
+    # (private allocator pool, multi-shape bookkeeping). For our one-graph-
+    # reused-every-step pattern, the simpler wrapper wins.
+    torch._inductor.config.triton.cudagraph_trees = False
+    engine = Engine(model, tokenizer, compile_decode=(not args.no_compile))
 
     print0(f"CUTE eval | source={args.source} | mode={args.mode} | model={args.model_tag or 'default'} step={meta.get('step', '?')}")
     print0(f"Subtasks: {subtasks}")
-
-    use_cuda_graphs = (not args.no_cuda_graphs) and (device_type == "cuda")
-    if use_cuda_graphs:
-        print0("Using manual CUDA graph capture in decode loop.")
 
     results = {}
     for subtask in subtasks:
         task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill, prompt_style=args.prompt_style)
         num_passed, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens,
-                                             max_problems=args.max_problems, debug_n=args.debug_n,
-                                             use_cuda_graphs=use_cuda_graphs)
+                                             max_problems=args.max_problems, debug_n=args.debug_n)
         acc = num_passed / total if total > 0 else 0.0
         results[subtask] = acc
         print0(f"{subtask}: {num_passed}/{total} ({100*acc:.2f}%)")

@@ -129,7 +129,7 @@ class CausalSelfAttention(nn.Module):
         ve_layer = has_ve(layer_idx, config.n_layer) and not config.disable_value_embeds
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if ve_layer else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -157,18 +157,17 @@ class CausalSelfAttention(nn.Module):
             # Training: causal attention with optional sliding window
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
-            # Inference: use flash_attn_with_kvcache which handles cache management
+            # Inference: use flash_attn_with_kvcache. input_pos tells the cache
+            # where to insert these k,v and is consumed by the mask construction
+            # in the SDPA fallback path / cache_seqlens in the FA3 path.
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
                 k=k, v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
+                input_pos=input_pos,
                 causal=True,
                 window_size=window_size,
             )
-            # Advance position after last layer processes
-            if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -195,8 +194,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, input_pos)
         x = x + self.mlp(norm(x))
         return x
 
@@ -210,6 +209,12 @@ class GPT(nn.Module):
         """
         super().__init__()
         self.config = config
+        # KV cache (None during training; set by setup_caches() for inference).
+        # Attaching as a model attribute -- rather than passing through forward
+        # as a parameter -- means torch.compile mode="reduce-overhead" treats
+        # cache mutations as graph-owned state instead of as mutations to
+        # external inputs (which would block cudagraph capture).
+        self.kv_cache = None
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
@@ -489,26 +494,74 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def setup_caches(self, batch_size, max_seq_length, dtype):
+        """Attach a KV cache to the model for inference.
+
+        Allocates the cache as a registered submodule so its buffers are
+        treated as model state (rather than as forward arguments), which is
+        what torch.compile mode="reduce-overhead" needs to capture decode
+        steps into a CUDA graph.
+
+        Idempotent: if a cache exists at the requested (batch_size,
+        max_seq_length) or larger, reuses it and just resets transient
+        state. Otherwise reallocates.
+        """
+        from nanochat.engine import KVCache
+        c = self.config
+        existing = self.kv_cache
+        if (existing is not None
+                and existing.batch_size == batch_size
+                and existing.max_seq_len >= max_seq_length
+                and existing.k_cache.dtype == dtype):
+            existing.reset()
+            return
+        # device is taken from an existing parameter (model already on the right device by now)
+        device = self.lm_head.weight.device
+        self.kv_cache = KVCache(
+            batch_size=batch_size,
+            num_heads=c.n_kv_head,
+            seq_len=max_seq_length,
+            head_dim=c.n_embd // c.n_head,
+            num_layers=c.n_layer,
+            dtype=dtype,
+            n_embd=c.n_embd,
+        ).to(device)
+
+    def forward(self, idx, targets=None, input_pos=None, loss_reduction='mean'):
+        """
+        Args:
+            idx: (B, T) token ids
+            targets: (B, T) target token ids for training (None for inference)
+            input_pos: (T,) absolute positions of the tokens in `idx`. Required
+                       for inference (kv-cache present); ignored for training.
+            loss_reduction: 'mean' or 'sum'
+
+        For inference, the KV cache is read from self.kv_cache (attached via
+        setup_caches). input_pos tells the cache where to write the new k,v
+        and where in the rotary table to look up positions. Passing input_pos
+        explicitly (rather than reading from cache_seqlens internally) means
+        forward has no host syncs -- prerequisite for cudagraph capture.
+        """
+        # Use kv cache only when an explicit input_pos is provided. The naive
+        # GPT.generate (no input_pos) and training (targets given) both want
+        # the no-cache full-sequence path.
+        kv_cache = self.kv_cache if (targets is None and input_pos is not None) else None
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
         assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
         assert self.cos.dtype == COMPUTE_DTYPE, f"Rotary embeddings must be in {COMPUTE_DTYPE}, got {self.cos.dtype}"
-        # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache.
-        # For cudagraph-friendly decode we slice via index_select using a
-        # positions tensor derived from kv_cache.cache_seqlens. torch.narrow
-        # with a tensor `start` reads the start tensor's value at call time
-        # (host sync) to compute the storage offset, which breaks capture
-        # ("operation not permitted when stream is capturing"). index_select
-        # defers the indexing to kernel runtime, so no host sync.
+        # Slice the rotary table at the absolute positions where these tokens live.
+        # For training/no-cache: input_pos is None and we use the dense slice [0:T].
+        # For inference: input_pos is the (T,) tensor of absolute positions, fed in
+        # externally so the model doesn't need to read kv_cache state internally
+        # (which would force a host sync and break cudagraph capture).
         if kv_cache is None:
             cos_sin = self.cos[:, :T], self.sin[:, :T]
         else:
-            T0_t = kv_cache.cache_seqlens[0]
-            positions = T0_t + torch.arange(T, device=self.cos.device, dtype=torch.long)
-            cos_sin = self.cos.index_select(1, positions), self.sin.index_select(1, positions)
+            assert input_pos is not None, "input_pos required when kv_cache is present"
+            cos_sin = self.cos.index_select(1, input_pos), self.sin.index_select(1, input_pos)
 
         # Embed the tokens
         x = self.transformer.wte(idx) # embed current token
@@ -564,7 +617,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](ve_idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, input_pos)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
