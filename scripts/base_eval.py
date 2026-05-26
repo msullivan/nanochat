@@ -299,10 +299,18 @@ def main():
         print0("="*80)
         core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, task_names=args.task_name)
 
-        # Write CSV output
+        # Write CSV output. Drop in a per-model-tag subdirectory so concurrent
+        # runs of different models don't collide (and so the files are
+        # self-describing -- the old scheme of just step-number-keyed
+        # filenames in a flat base_eval/ dir loses model identity).
+        # HF models go under the slugified hf_path.
         if ddp_rank == 0:
             base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+            if is_hf_model:
+                tag_dir = args.hf_path.replace("/", "-")
+            else:
+                tag_dir = args.model_tag or "default"
+            output_csv_path = os.path.join(base_dir, "base_eval", tag_dir, f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
