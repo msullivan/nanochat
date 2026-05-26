@@ -115,17 +115,12 @@ def main():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
-    # Decode compile/cudagraph is owned by Engine itself -- wraps just the
-    # per-decode-step forward (fixed shape (B,1) -> one captured cudagraph
-    # reused for every decoded token). Prefill is intentionally left
-    # uncompiled so its variable prompt-length doesn't trigger per-shape
-    # cudagraph recapture, which would tank wallclock at eval.
-    torch._dynamo.config.recompile_limit = 64
-    # cudagraph_trees has more per-call overhead than basic cudagraph wrapping
-    # (private allocator pool, multi-shape bookkeeping). For our one-graph-
-    # reused-every-step pattern, the simpler wrapper wins.
-    torch._inductor.config.triton.cudagraph_trees = False
-    engine = Engine(model, tokenizer, compile_decode=(not args.no_compile))
+    # Manual CUDA graph capture of the decode forward, owned by Engine.
+    # At d24 scale this beats torch.compile mode="reduce-overhead" by ~2x
+    # (the compile wrapper's per-call overhead exceeds savings on small
+    # per-op GPU work). Graphs are lazily captured on the first decode call
+    # and reused across all prompts.
+    engine = Engine(model, tokenizer, use_cuda_graphs=(not args.no_compile))
 
     print0(f"CUTE eval | source={args.source} | mode={args.mode} | model={args.model_tag or 'default'} step={meta.get('step', '?')}")
     print0(f"Subtasks: {subtasks}")

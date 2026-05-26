@@ -174,26 +174,85 @@ class RowState:
 
 class Engine:
 
-    def __init__(self, model, tokenizer, compile_decode=True):
+    def __init__(self, model, tokenizer, use_cuda_graphs=True):
         """
-        compile_decode: if True (default on CUDA), wrap the per-decode-step
-        model forward in torch.compile(mode="reduce-overhead"). Decode is
-        always shape (B, 1) so PyTorch captures one cudagraph and reuses it
-        for every decoded token. Prefill is left uncompiled (or relies on a
-        separately-compiled model passed in) so its variable prompt-length
-        doesn't trigger per-shape cudagraph recapture.
+        use_cuda_graphs: if True (default on CUDA), capture the per-decode-step
+        forward into a torch.cuda.CUDAGraph and replay it for each subsequent
+        decode step. ~2x faster on small models (d24) than torch.compile
+        mode="reduce-overhead", which has per-call wrapper overhead (Dynamo
+        guards, Inductor dispatch, cudagraph_trees machinery) that exceeds
+        what it saves when per-op GPU work is already small. Manual capture
+        is just one C++ graph.replay() call per token -- no Python overhead.
+
+        Graphs are captured lazily on first decode call and reused across all
+        subsequent generate() calls with the same (num_samples) signature.
+        Prefill is always run uncompiled (variable shape across prompts).
         """
         self.model = model
         self.tokenizer = tokenizer # needed for tool use
-        # Wrap the decode step. We use a tiny local function (not a method)
-        # so torch.compile sees a clean callable -- this avoids issues with
-        # compiling bound methods and keeps the captured graph small.
-        if compile_decode and torch.cuda.is_available():
-            def _decode_step(ids, input_pos):
-                return model.forward(ids, input_pos=input_pos)
-            self._decode = torch.compile(_decode_step, mode="reduce-overhead", dynamic=False)
-        else:
-            self._decode = lambda ids, input_pos: model.forward(ids, input_pos=input_pos)
+        self.use_cuda_graphs = use_cuda_graphs and torch.cuda.is_available()
+        # Lazy-init cuda graph state: dict from num_samples -> (graph,
+        # input_buffer, input_pos_buffer, logits_buffer). Captured on the
+        # first decode call for a given num_samples value, reused after.
+        self._graphs = {}
+
+    def _get_or_capture_decode_graph(self, num_samples, device, dtype):
+        """Return (graph, input_buffer, input_pos_buffer, logits_buffer) for
+        this num_samples, capturing on first call.
+
+        Snapshot/warmup/restore/capture/restore pattern: we need to warmup
+        the model's kernel paths (Triton compiles, autotune, allocator
+        warmup) before capture, but warmup mutates the cache buffers, so we
+        snapshot and restore around it. The captured graph references the
+        cache + input buffer addresses; replay re-runs the same kernels.
+        """
+        key = num_samples
+        if key in self._graphs:
+            return self._graphs[key]
+
+        kv = self.model.kv_cache
+        assert kv is not None, "model.kv_cache not set up; call model.setup_caches first"
+        vocab_size = self.model.config.vocab_size
+
+        # Allocate the static input/output buffers used by the captured graph.
+        input_buffer = torch.zeros(num_samples, 1, dtype=torch.long, device=device)
+        input_pos_buffer = torch.zeros(1, dtype=torch.long, device=device)
+        logits_buffer = torch.zeros(num_samples, vocab_size, device=device, dtype=dtype)
+
+        # Snapshot everything the forward mutates so we can restore after
+        # warmup (which runs 3 forwards) and after capture (which runs 1).
+        snap_k = kv.k_cache.clone()
+        snap_v = kv.v_cache.clone()
+        snap_prev_emb = kv.prev_embedding.clone()
+        snap_prev_tid = kv.prev_token_id.clone()
+
+        def restore():
+            kv.k_cache.copy_(snap_k)
+            kv.v_cache.copy_(snap_v)
+            kv.prev_embedding.copy_(snap_prev_emb)
+            kv.prev_token_id.copy_(snap_prev_tid)
+
+        # Warmup on a side stream so allocator activity doesn't pollute the
+        # capture stream.
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                out = self.model.forward(input_buffer, input_pos=input_pos_buffer)
+                logits_buffer.copy_(out[:, -1, :])
+        torch.cuda.current_stream().wait_stream(side_stream)
+        restore()
+
+        # Capture.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = self.model.forward(input_buffer, input_pos=input_pos_buffer)
+            logits_buffer.copy_(out[:, -1, :])
+        restore()
+
+        result = (graph, input_buffer, input_pos_buffer, logits_buffer)
+        self._graphs[key] = result
+        return result
 
     @torch.inference_mode()
     def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
@@ -252,12 +311,18 @@ class Engine:
         # 3) Initialize states for each sample
         row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
 
-        # 4) Decode loop. input_pos is a static-shape (1,) tensor that we
-        # increment in-place each step; the captured graph reads from its
-        # address. ids_buf is similarly a static (B, 1) tensor that holds
-        # the next token to feed in.
-        ids_buf = torch.zeros(num_samples, 1, dtype=torch.long, device=device)
-        input_pos = torch.tensor([prompt_len], device=device, dtype=torch.long)
+        # 4) Decode loop. If use_cuda_graphs, get (or lazily capture) the
+        # decode graph + its static buffers. The graph reads from those
+        # buffer addresses; we copy_ next-token-id and current position
+        # into the buffers each step and replay.
+        if self.use_cuda_graphs:
+            graph, ids_buf, input_pos_buf, logits_buf = self._get_or_capture_decode_graph(
+                num_samples, device, dtype)
+            input_pos_buf.fill_(prompt_len)
+        else:
+            graph = ids_buf = input_pos_buf = logits_buf = None
+            ids_buf_fallback = torch.zeros(num_samples, 1, dtype=torch.long, device=device)
+            input_pos_buf_fallback = torch.tensor([prompt_len], device=device, dtype=torch.long)
         num_generated = 0
         while True:
             if max_tokens is not None and num_generated >= max_tokens:
@@ -300,31 +365,18 @@ class Engine:
             yield token_column, token_masks
             num_generated += 1
 
-            # Feed the next tokens to the model: copy_ into the static input
-            # buffer so the same memory address is reused each call (lets
-            # torch.compile reduce-overhead reuse its captured cudagraph).
-            ids_buf.copy_(torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1))
-            if getattr(self, "_time_decode", False):
-                import time
-                torch.cuda.synchronize()
-                _t0 = time.perf_counter()
-                logits = self._decode(ids_buf, input_pos)[:, -1, :]
-                torch.cuda.synchronize()
-                _dt = (time.perf_counter() - _t0) * 1000
-                if not hasattr(self, "_dt_samples"):
-                    self._dt_samples = []
-                self._dt_samples.append(_dt)
-                if len(self._dt_samples) == 50:
-                    print0(f"\n[engine] decode step ms (50 samples): "
-                           f"mean={sum(self._dt_samples)/50:.2f}, "
-                           f"min={min(self._dt_samples):.2f}, "
-                           f"max={max(self._dt_samples):.2f}, "
-                           f"p50={sorted(self._dt_samples)[25]:.2f}, "
-                           f"p90={sorted(self._dt_samples)[45]:.2f}")
-                    self._dt_samples = []
+            # Feed the next tokens to the model. The graph captures reads from
+            # ids_buf and input_pos_buf at fixed addresses, so we copy_ into
+            # them and graph.replay() instead of calling forward directly.
+            if graph is not None:
+                ids_buf.copy_(torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1))
+                graph.replay()
+                logits = logits_buf
+                input_pos_buf += 1
             else:
-                logits = self._decode(ids_buf, input_pos)[:, -1, :]
-            input_pos += 1
+                ids_buf_fallback.copy_(torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1))
+                logits = self.model.forward(ids_buf_fallback, input_pos=input_pos_buf_fallback)[:, -1, :]
+                input_pos_buf_fallback += 1
 
     def generate_batch(self, tokens, num_samples=1, **kwargs):
         """

@@ -308,7 +308,9 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
     # because Flash refuses non-null masks and Efficient/cuDNN are runtime-
     # disabled in the default scoring. cuDNN explicitly supports masks and
     # is ~2.4x faster than MATH on this hardware for our shapes (microbench
-    # in dev/sdpa_bench.py).
+    # in dev/sdpa_bench.py). The context-manager has per-call Python overhead
+    # (~140us); inside a captured cudagraph it's traced once and replayed
+    # without that overhead, so the forcing is a net win for the graph path.
     from torch.nn.attention import SDPBackend, sdpa_kernel
     with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
         y_sdpa = F.scaled_dot_product_attention(
