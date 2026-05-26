@@ -4,6 +4,108 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-05-25: Inference speedup on Blackwell — manual CUDA graphs beat torch.compile
+
+Multi-hour debugging session trying to make cute_eval decode faster on the
+RTX 6000 PRO (Blackwell sm120, no FA3 available). Final result: **1:22 for
+200 prompts of contains_char (~13.7 ms/token at d24), ~3× faster than the
+eager baseline of 4:00**.
+
+### Headline tally of approaches tried
+
+| approach | 200-prompt wallclock |
+|---|---:|
+| Eager `--no-compile` (original) | 4:00 |
+| Eager + `sdpa_kernel([CUDNN_ATTENTION])` forcing | 4:21 (slower — per-call ctx mgr overhead in eager) |
+| Manual cudagraph, per-prompt capture (f3449ef era) | ~5:00 (extrapolated from 2:30/100) |
+| `torch.compile(mode="reduce-overhead")` + cudagraph_trees | 9:25 |
+| `torch.compile(mode="reduce-overhead")` + cuDNN forcing | 7:39 |
+| **Manual cudagraph + cached across calls + cuDNN forcing** | **1:22** ← winner |
+
+### The non-obvious lesson: gpt-fast's pattern is wrong for small models
+
+Meta's gpt-fast (the reference for fast PyTorch-native inference) uses
+`torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)`.
+Their benchmarks show this winning vs eager on Llama 7B/13B/70B. We naively
+followed this pattern and got **2× slower than eager**, with no warnings.
+
+Why: `reduce-overhead` has per-call wrapper overhead (Dynamo guard checks,
+Inductor dispatch, cudagraph_trees machinery) that's negligible relative to
+GPU work for 7B+ models but dominates at d24 (770M) where per-op GPU work is
+already small. Manual `torch.cuda.CUDAGraph().replay()` is a single C++ call
+with no Python tax.
+
+If you re-attempt this in the future, **start with manual capture, not
+reduce-overhead**.
+
+### Why our cudagraph is so much faster than eager (when it works)
+
+At d24 single-token decode, ~150 CUDA kernels launch per token across 24
+layers. Each launch has ~5-10 µs of Python+dispatch overhead in eager →
+~1-2 ms per token of pure overhead, plus actual GPU work. Cudagraph
+captures all 150 launches as one replay-able sequence; replay is one
+`graph.replay()` call. The Python overhead disappears.
+
+Training doesn't hit this because B*T tokens per forward amortize the
+overhead. (We get 50K tps in training vs 73 tps in eager inference at d24.)
+
+### What's in the code now
+
+- `nanochat/engine.py`: `KVCache` is an `nn.Module` with `register_buffer`s,
+  attached to the model via `GPT.setup_caches(...)`. `Engine` lazily
+  captures a decode-step graph on first call, caches per `num_samples`,
+  reuses across all subsequent `generate()` calls.
+- `nanochat/gpt.py`: `forward(idx, targets=None, input_pos=None, ...)` —
+  `input_pos` is an explicit tensor argument (no `.item()` host syncs
+  inside forward). Smear and bigram_value_embeds refactored to use
+  in-place `copy_` into preallocated buffers (Python attribute mutations
+  on the cache would break cudagraph correctness).
+- `nanochat/flash_attention.py`: SDPA fallback uses full-cache + bool mask
+  (fixed shape across decode steps — needed for cudagraph). Forces cuDNN
+  backend via `sdpa_kernel([CUDNN_ATTENTION])` context manager — without
+  this, SDPA's default selection picks MATH (2.4× slower) because Flash
+  refuses non-null masks and Mem-Efficient/cuDNN are "runtime disabled"
+  in default scoring on sm120. The context manager's per-call overhead
+  matters in eager mode (the 4:00→4:21 regression above) but is traced
+  out by graph capture, so it's a net win for the cudagraph path.
+
+### Things rejected with data (don't redo)
+
+- **`torch.compile(mode="reduce-overhead", fullgraph=True)`**: slower than
+  manual cudagraph by 2-4× at our scale, see table above. Right answer for
+  7B+ models; wrong for us.
+- **FlexAttention with BlockMask**: bench showed compiled flex_attention at
+  0.163 ms/call vs cuDNN at 0.085 ms/call for our exact shape. The
+  Triton-generated kernel doesn't beat cuDNN's hand-written kernel at our
+  shape, so integration would have made things slower. (gpt-fast uses
+  FlexAttention because it gives them a clean way to express sliding-window
+  + causal + paged-cache; we have a simpler attention pattern.)
+- **SDPA default backend selection**: picks MATH for our (bool mask + GQA)
+  on sm120 because the fast backends are "runtime disabled" in the default
+  scoring. Force cuDNN explicitly.
+- **Compiling the whole model with `torch.compile`**: per-prompt
+  recompiles on variable prompt length killed wallclock. Compile only the
+  decode step (fixed shape) — and even then, manual capture wins.
+
+### Still on the table for future work (if you want to push further)
+
+- `torch._inductor.config.coordinate_descent_tuning = True` (gpt-fast uses
+  this; tunes Triton kernel block sizes per shape). Could help marginally.
+- Fused custom attention kernel for our exact shape (Triton or CUDA C++).
+  Would need to actually saturate Blackwell's memory bandwidth (~1.7 TB/s);
+  we're probably at 20-30% utilization with the cuDNN call.
+- FA3 sm120 port lands (tracking: Dao-AILab/flash-attention#2307). Would
+  give us a dedicated KV-cache kernel; no port committed as of 2026-05.
+
+### Diagnostic tooling
+
+- `dev/sdpa_bench.py` — microbenchmark + backend probe for SDPA on our
+  decode shapes. Forces each `SDPBackend` explicitly and reports which
+  accept our inputs and how fast each runs. Also benchmarks FlexAttention
+  compiled vs uncompiled. Useful for spotting backend selection issues.
+
+---
+
 ## 2026-05-23: Byte vs BPE on CUTE char-level tasks (sweep + recipe ablation)
 
 Setting up an experiment to measure whether byte-tokenizer models have a structural advantage over BPE on character-level tasks (the CUTE benchmark — Edman et al. EMNLP 2024). Approach: train a cheap "midtraining" (cute_pt) on synthetic CUTE-format examples, then eval zero-shot on the real CUTE benchmark. Sweep across (base model × dataset size × training recipe).
