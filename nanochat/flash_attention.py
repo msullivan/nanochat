@@ -99,11 +99,18 @@ _compiled_flex_attention = None
 def _get_compiled_flex_attention():
     global _compiled_flex_attention
     if _compiled_flex_attention is None:
+        import os
         from torch.nn.attention.flex_attention import flex_attention
         # Default mode. max-autotune-no-cudagraphs OOMs at d24 on Blackwell
         # (autotune keeps multiple kernel candidates resident) and didn't help
         # throughput when it did fit, so not worth it.
-        _compiled_flex_attention = torch.compile(flex_attention, dynamic=False)
+        # NANOCHAT_FLEX_DYNAMIC=1 forces dynamic-shape compilation: one shared
+        # kernel across (B, T) instead of one specialised kernel per shape.
+        # Useful for variable-shape eval (e.g. CORE) where static recompilation
+        # blows past dynamo's recompile_limit and the function silently falls
+        # back to eager flex_attention.
+        dynamic = os.environ.get("NANOCHAT_FLEX_DYNAMIC", "0") == "1"
+        _compiled_flex_attention = torch.compile(flex_attention, dynamic=dynamic)
     return _compiled_flex_attention
 
 
