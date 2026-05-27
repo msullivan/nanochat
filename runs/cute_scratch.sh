@@ -33,8 +33,11 @@ set -ex
 #   DEPTH           model depth (default: 24, matches our existing byte models)
 #   BATCH           device-batch-size (default: 8, single-GPU friendly)
 #   WANDB_PROJECT   override wandb project (default: nanochat-cute-scratch)
-#   FP8             "1" enables --fp8 (default off; only meaningful on
-#                   H100+, and we're on Blackwell here)
+#   FP8             "1" (default) enables --fp8. Required to fit
+#                   max-seq-len=8192 + device-batch=8 in 24GB on Blackwell;
+#                   cuBLAS _scaled_mm supports fp8 on sm120 (RTX 6000 PRO)
+#                   and sm90 (H100). Set "0" only if you know your hardware
+#                   can't do it.
 
 cd "$(dirname "$0")/.."
 source .venv/bin/activate
@@ -46,8 +49,21 @@ MODEL_TAG="${MODEL_TAG:?MODEL_TAG is required (e.g. d24-byte-scratch-100000w)}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-200}"
 DEPTH="${DEPTH:-24}"
 BATCH="${BATCH:-8}"
+# Architecture defaults match the d24-byte-l-* family (per runs/resume_d24_byte_l.sh):
+# max-seq-len=8192 (vs base_train default 2048) and window-pattern=L (all-L,
+# full attention every layer; vs base_train default SSSL). Needed so the
+# from-scratch model has identical architecture to the pretrained byte
+# baseline -- otherwise we're comparing "model A trained 5500 steps on real
+# text + cute_pt" vs "different model B trained from scratch on CUTE only",
+# which conflates the from-scratch vs pretrained question with architecture.
+MAX_SEQ_LEN="${MAX_SEQ_LEN:-8192}"
+WINDOW_PATTERN="${WINDOW_PATTERN:-L}"
 WANDB_PROJECT="${WANDB_PROJECT:-nanochat-cute-scratch}"
-FP8="${FP8:-0}"
+# fp8 on by default to match the d24-byte-l-* family (and what cute_pt uses).
+# cuBLAS _scaled_mm supports fp8 on sm120 Blackwell (RTX 6000 PRO) and sm90
+# Hopper. Halves activation memory vs bf16; without it you'll OOM at
+# device-batch=8 + max-seq=8192 on a 24GB card.
+FP8="${FP8:-1}"
 EVAL_EVERY="${EVAL_EVERY:-250}"
 CORE_METRIC_EVERY="${CORE_METRIC_EVERY:--1}"
 SAMPLE_EVERY="${SAMPLE_EVERY:--1}"
@@ -62,7 +78,10 @@ FP8_ARG=""
 torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --depth="$DEPTH" \
     --byte-tokenizer \
+    --max-seq-len="$MAX_SEQ_LEN" \
+    --window-pattern="$WINDOW_PATTERN" \
     --device-batch-size="$BATCH" \
+    --total-batch-size=1048576 \
     --num-iterations="$NUM_ITERATIONS" \
     --save-every=-1 \
     --model-tag="$MODEL_TAG" \
