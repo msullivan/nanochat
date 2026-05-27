@@ -192,7 +192,7 @@ def main():
     parser.add_argument('--eval', type=str, default='core,bpb,sample', help='Comma-separated evaluations to run: core,bpb,sample (default: all)')
     parser.add_argument('--hf-path', type=str, default=None, help='HuggingFace model path (e.g. openai-community/gpt2-xl)')
     parser.add_argument('--model-tag', type=str, default=None, help='nanochat model tag to identify the checkpoint directory')
-    parser.add_argument('--source', type=str, default='base', choices=['base', 'cute', 'sft', 'rl'], help='Checkpoint source dir (base_checkpoints/cute_checkpoints/etc)')
+    parser.add_argument('--source', type=str, default='base', choices=['base', 'cute', 'scratch', 'mix', 'sft', 'rl'], help='Checkpoint source dir (base_checkpoints/cute_checkpoints/etc)')
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('-a', '--task-name', type=str, action='append', default=None, help="CORE task label to run (repeat for multiple). Default = all tasks. Note: core_metric will be averaged only over the tasks that ran.")
