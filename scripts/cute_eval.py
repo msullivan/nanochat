@@ -81,7 +81,7 @@ def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problem
 
 def main():
     parser = argparse.ArgumentParser(description="CUTE benchmark eval")
-    parser.add_argument("-i", "--source", type=str, required=True, choices=["base", "cute", "sft", "rl"], help="Checkpoint source")
+    parser.add_argument("-i", "--source", type=str, required=True, choices=["base", "cute", "scratch", "sft", "rl"], help="Checkpoint source")
     parser.add_argument("--mode", type=str, default="completion", choices=["completion", "chat"], help="Prompt format")
     parser.add_argument("--subtasks", type=str, default=None, help="Comma-separated subset of subtasks (default: all 14). Use 'char' for the char-level subset.")
     parser.add_argument("-g", "--model-tag", type=str, default=None, help="Model tag to load")
@@ -99,7 +99,7 @@ def main():
                         "compile penalty.")
     args = parser.parse_args()
 
-    if args.source in ("base", "cute") and args.mode == "chat":
+    if args.source in ("base", "cute", "scratch") and args.mode == "chat":
         parser.error(f"--source {args.source} --mode chat is invalid: these models have no chat tokens")
 
     if args.subtasks is None:
