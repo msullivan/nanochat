@@ -136,22 +136,33 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     tokenizer_threads=4,
     device="cuda",
     buffer_size=1000,
+    pack_strategy="bestfit",
+    rng_seed=0,
 ):
     """
-    BOS-aligned dataloader with Best-Fit Cropping.
+    BOS-aligned dataloader with two pack strategies:
 
-    Reduces token waste compared to simple greedy cropping by searching a buffer
-    for documents that fit well, while maintaining 100% utilization (no padding).
+    pack_strategy="bestfit" (default, single-stream pretraining):
+        Best-fit cropping over the buffer -- for each slot, pick the LARGEST
+        doc that fits entirely; only crop when nothing fits. Minimizes wasted
+        tokens (~35% cropped at T=2048). DON'T use this with a merged stream
+        of size-disparate sources (CUTE + ClimbMix), because best-fit
+        systematically wins for the larger source and the smaller-doc source
+        ends up as crop fodder at row tails -- with mask_before applied, the
+        marker is chopped off and the masking signal is destroyed.
 
-    Algorithm for each row:
-    1. From buffered docs, pick the LARGEST doc that fits entirely
-    2. Repeat until no doc fits
-    3. When nothing fits, crop a doc to fill remaining space exactly
+    pack_strategy="sequential" (mixed-source training):
+        Shuffle the buffer after each refill, then FIFO-pop into each row,
+        cropping only the last doc that doesn't fit. Random buffer order
+        means per-placement Bernoulli at the buffer's mix ratio, so the
+        realized mix matches mix_fraction. ~10% of placements per row are
+        the cropped tail; if that happens to be a maskable doc, that one
+        sub-doc loses its marker -- but the rest of the maskable placements
+        are full docs with intact markers.
 
-    Key properties:
+    Key properties (both strategies):
     - Every row starts with BOS
     - 100% utilization (no padding, every token is trained on)
-    - Approximately 35% of all tokens are discarded due to cropping
 
     doc_stream: iterator yielding (text_batch, info, mask_before_ids) tuples.
        - text_batch: list[str] of raw documents to tokenize+pack.
@@ -166,11 +177,17 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     Each yielded doc carries its batch's mask_before_ids through the packer
     so a single merged stream can interleave masked and unmasked docs.
     """
+    import random as _random
+    assert pack_strategy in ("bestfit", "sequential"), f"unknown pack_strategy: {pack_strategy}"
     row_capacity = T + 1
     bos_token = tokenizer.get_bos_token_id()
     # Each buffered doc is (tokens, mask_before_ids). mask_before_ids may be None.
     doc_buffer = []
     last_info = None
+    # Per-rank-equivalent RNG used by sequential mode to shuffle the buffer
+    # after each refill. Seeded so two DDP ranks shuffle differently (caller
+    # passes rank-dependent seed).
+    _pack_rng = _random.Random(rng_seed)
 
     # Sanity-check counters: BPE tokenizes `mask_before` *standalone*, but the
     # marker is searched for in the *in-context* tokenization of packed docs.
@@ -187,6 +204,12 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         token_lists = tokenizer.encode(text_batch, prepend=bos_token, num_threads=tokenizer_threads)
         for tokens in token_lists:
             doc_buffer.append((tokens, mask_before_ids))
+        # Sequential mode needs random buffer order so per-placement FIFO pops
+        # give Bernoulli interleaving across sources. Refills arrive batch-at-
+        # a-time (128 docs from one stream), so without shuffling the front of
+        # the buffer would be all-one-source.
+        if pack_strategy == "sequential":
+            _pack_rng.shuffle(doc_buffer)
 
     # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
     # This gives us contiguous views and a single HtoD transfer
@@ -213,28 +236,43 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
 
                 remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely (origin-agnostic best-fit).
-                best_idx = -1
-                best_len = 0
-                for i, (doc, _mb) in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
+                if pack_strategy == "bestfit":
+                    # Find largest doc that fits entirely.
+                    best_idx = -1
+                    best_len = 0
+                    for i, (doc, _mb) in enumerate(doc_buffer):
+                        doc_len = len(doc)
+                        if doc_len <= remaining and doc_len > best_len:
+                            best_idx = i
+                            best_len = doc_len
 
-                if best_idx >= 0:
-                    doc, mb = doc_buffer.pop(best_idx)
-                    doc_len = len(doc)
-                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
-                    placements[row_idx].append((pos, pos + doc_len, mb))
-                    pos += doc_len
+                    if best_idx >= 0:
+                        doc, mb = doc_buffer.pop(best_idx)
+                        doc_len = len(doc)
+                        row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                        placements[row_idx].append((pos, pos + doc_len, mb))
+                        pos += doc_len
+                    else:
+                        # No doc fits - crop shortest in buffer to fill remaining.
+                        shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i][0]))
+                        doc, mb = doc_buffer.pop(shortest_idx)
+                        row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                        placements[row_idx].append((pos, pos + remaining, mb))
+                        pos += remaining
                 else:
-                    # No doc fits - crop shortest in buffer to fill remaining.
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i][0]))
-                    doc, mb = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    placements[row_idx].append((pos, pos + remaining, mb))
-                    pos += remaining
+                    # sequential: FIFO pop. Buffer was shuffled at refill so the
+                    # front is random across sources. Place full if it fits;
+                    # otherwise crop and end the row.
+                    doc, mb = doc_buffer.pop(0)
+                    doc_len = len(doc)
+                    if doc_len <= remaining:
+                        row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                        placements[row_idx].append((pos, pos + doc_len, mb))
+                        pos += doc_len
+                    else:
+                        row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                        placements[row_idx].append((pos, pos + remaining, mb))
+                        pos += remaining
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])

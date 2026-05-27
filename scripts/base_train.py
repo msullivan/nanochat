@@ -467,8 +467,12 @@ if args.mix_data_dir:
         [(_pri_stream, 1.0 - args.mix_fraction), (_mix_stream, args.mix_fraction)],
         rng=_rng,
     )
+    # sequential pack + shuffled buffer in mixed mode; best-fit would
+    # systematically push smaller (CUTE) docs into row-tail crops and chop
+    # off mask_before markers.
     train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
         tokenizer, args.device_batch_size, args.max_seq_len, _train_stream, device=device,
+        pack_strategy="sequential", rng_seed=1337 + ddp_rank,
     )
     # val loader is single-stream on the primary (climbmix-equivalent) data --
     # validates against the general pretraining distribution, not CUTE.
