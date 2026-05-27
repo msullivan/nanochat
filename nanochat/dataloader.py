@@ -1,5 +1,5 @@
 """
-Distributed dataloaders for pretraining.
+Distributed dataloader for pretraining.
 
 BOS-aligned bestfit:
    - Every row starts with BOS token
@@ -7,27 +7,23 @@ BOS-aligned bestfit:
    - When no document fits remaining space, crops a document to fill exactly
    - 100% utilization (no padding), ~35% tokens cropped at T=2048
 
-Compared to the original tokenizing_distributed_data_loader:
-BOS-aligned loses ~35% of tokens to cropping, but ensures that
-there are fewer "confusing" tokens in the train/val batches as every token can
-now attend back to the BOS token and sees the full context of the document.
-
-Fallback to the original if you have very limited data AND long documents:
-https://github.com/karpathy/nanochat/blob/3c3a3d7/nanochat/dataloader.py#L78-L117
-
 API shape:
    - `_document_batches(...)` -> iterator of (text_batch, info), one source's docs.
    - `attach_mask(stream, mask_before_ids)` -> wraps a stream so each yield
      carries a per-batch mask_before_ids (or None = no mask for these docs).
-   - `merge_streams(streams_with_weights, rng)` -> Bernoulli-merges several such
-     streams. The merged stream's items carry whichever source's mask_before_ids
-     came along.
-   - `tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, B, T,
-     doc_stream, ...)` -> the single packer. Takes any stream of
-     (text_batch, info, mask_before_ids) yields; doesn't care if the underlying
-     source is one parquet dir or a merged mix of several.
+   - `build_single_stream(...)` -> convenience: parquet source -> stream with
+     a fixed mask config.
+   - `tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, B, T, streams_with_weights, ...)` -> the packer. Takes a
+     list of (stream, weight) tuples; for each row, Bernoulli-picks one
+     source and packs the entire row from that source's buffer with
+     best-fit. Per-row source selection is the standard production pattern
+     for dataset mixing -- mask config is uniform per row, best-fit works
+     within-source where doc sizes are comparable, and the realized mix
+     ratio exactly matches the weights.
 """
 
+import random
 import torch
 import pyarrow.parquet as pq
 
@@ -64,15 +60,14 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=N
         while pq_idx < len(parquet_paths):
             filepath = parquet_paths[pq_idx]
             pf = pq.ParquetFile(filepath)
-            # Start from resume point if resuming on same file, otherwise from DDP rank
             if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
                 base_idx = resume_rg_idx // ddp_world_size
-                base_idx += 1  # advance by 1 so we don't repeat data after resuming
+                base_idx += 1
                 rg_idx = base_idx * ddp_world_size + ddp_rank
                 if rg_idx >= pf.num_row_groups:
                     pq_idx += 1
                     continue
-                resume_rg_idx = None  # only do this once
+                resume_rg_idx = None
             else:
                 rg_idx = ddp_rank
             while rg_idx < pf.num_row_groups:
@@ -90,129 +85,93 @@ def attach_mask(stream, mask_before_ids):
     """
     Wraps a (text_batch, info) stream so each yield additionally carries the
     per-batch mask_before_ids (a list of token IDs, or None for no mask).
-    All docs produced by this stream share the same mask config -- the packer
-    later uses it to mark which sub-docs to apply loss-masking to.
+    All docs produced by this stream share the same mask config.
     """
     for text_batch, info in stream:
         yield text_batch, info, mask_before_ids
 
 
-def merge_streams(streams_with_weights, rng):
+def build_single_stream(tokenizer, split, resume_state_dict, mask_before=None,
+                        tokenizer_batch_size=128, data_dir=None):
     """
-    Merge several (text_batch, info, mask_before_ids) streams by per-batch
-    Bernoulli sampling. Each yield is whichever item the picked source
-    produced next, so the consumed batch's mask_before_ids comes along
-    naturally. info is wrapped as {source_index: info} so the consumer can
-    track per-source position for resume; last-seen info per source is
-    accumulated, not overwritten on a non-selected source.
-
-    streams_with_weights: list of (stream, weight). Weights are normalised
-    internally so they don't have to sum to 1.
+    Convenience: build a (text_batch, info, mask_before_ids) stream from one
+    parquet source. Tokenizes mask_before once.
     """
-    streams = [s for s, _ in streams_with_weights]
-    weights = [w for _, w in streams_with_weights]
-    total = sum(weights)
-    assert total > 0, "merge_streams: weights sum to 0"
-    cum = []
-    acc = 0.0
-    for w in weights:
-        acc += w / total
-        cum.append(acc)
-    last_infos = [None] * len(streams)
-    while True:
-        r = rng.random()
-        # linear scan -- list is tiny (2 streams in practice)
-        i = 0
-        while i < len(cum) - 1 and r > cum[i]:
-            i += 1
-        text_batch, info, mask_before_ids = next(streams[i])
-        last_infos[i] = info
-        merged_info = {str(j): inf for j, inf in enumerate(last_infos)}
-        yield text_batch, merged_info, mask_before_ids
+    mask_before_ids = None
+    if mask_before:
+        mask_before_ids = tokenizer.encode(mask_before)
+        if not mask_before_ids:
+            raise ValueError(f"mask_before {mask_before!r} encoded to empty token sequence")
+    base = _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=data_dir)
+    return attach_mask(base, mask_before_ids)
 
 
 def tokenizing_distributed_data_loader_with_state_bos_bestfit(
-    tokenizer, B, T, doc_stream,
+    tokenizer, B, T, streams_with_weights,
     tokenizer_threads=4,
     device="cuda",
     buffer_size=1000,
-    pack_strategy="bestfit",
     rng_seed=0,
 ):
     """
-    BOS-aligned dataloader with two pack strategies:
+    BOS-aligned dataloader with per-row source selection + within-source best-fit.
 
-    pack_strategy="bestfit" (default, single-stream pretraining):
-        Best-fit cropping over the buffer -- for each slot, pick the LARGEST
-        doc that fits entirely; only crop when nothing fits. Minimizes wasted
-        tokens (~35% cropped at T=2048). DON'T use this with a merged stream
-        of size-disparate sources (CUTE + ClimbMix), because best-fit
-        systematically wins for the larger source and the smaller-doc source
-        ends up as crop fodder at row tails -- with mask_before applied, the
-        marker is chopped off and the masking signal is destroyed.
+    streams_with_weights: list of (stream, weight). Each stream yields
+        (text_batch, info, mask_before_ids). Weights normalized internally.
+        For single-source use, pass [(stream, 1.0)].
 
-    pack_strategy="sequential" (mixed-source training):
-        Shuffle the buffer after each refill, then FIFO-pop into each row,
-        cropping only the last doc that doesn't fit. Random buffer order
-        means per-placement Bernoulli at the buffer's mix ratio, so the
-        realized mix matches mix_fraction. ~10% of placements per row are
-        the cropped tail; if that happens to be a maskable doc, that one
-        sub-doc loses its marker -- but the rest of the maskable placements
-        are full docs with intact markers.
+    For each row:
+      1. Bernoulli-pick a source by weight.
+      2. Pack the row entirely from that source's buffer using best-fit
+         (largest-doc-that-fits, crop shortest when nothing fits).
+      3. Row's sub-docs all carry the picked source's mask_before_ids.
 
-    Key properties (both strategies):
+    Why per-row and not within-row: when mixing sources with very different
+    average doc sizes (CUTE Q/A ~80 bytes vs ClimbMix web text ~5000 bytes),
+    within-row best-fit systematically picks the larger source and the
+    smaller one ends up as crop fodder at row tails -- with mask_before set,
+    the marker is chopped off and masking signal is destroyed. Per-row
+    selection makes each row internally consistent: best-fit works fine on
+    similarly-sized docs, and mask_before is applied uniformly.
+
+    Properties:
     - Every row starts with BOS
-    - 100% utilization (no padding, every token is trained on)
+    - 100% utilization (no padding)
+    - Realized mix ratio matches weights (one Bernoulli per row × B rows
+      per batch -> ratio converges quickly)
 
-    doc_stream: iterator yielding (text_batch, info, mask_before_ids) tuples.
-       - text_batch: list[str] of raw documents to tokenize+pack.
-       - info: opaque per-batch state (passed back out in state_dict so
-         the caller can resume).
-       - mask_before_ids: list[int] | None. If non-None, every doc in this
-         batch will have its loss-targets masked up to and including the
-         first occurrence of this subsequence in the packed row. None = no
-         masking for this batch's docs (e.g. general pretraining text in a
-         mixed run).
-
-    Each yielded doc carries its batch's mask_before_ids through the packer
-    so a single merged stream can interleave masked and unmasked docs.
+    state_dict carries per-source position info + RNG state for approximate
+    resume. Legacy single-stream state dicts (no "sources" key) are ignored.
     """
-    import random as _random
-    assert pack_strategy in ("bestfit", "sequential"), f"unknown pack_strategy: {pack_strategy}"
+    assert len(streams_with_weights) > 0, "need at least one (stream, weight)"
     row_capacity = T + 1
     bos_token = tokenizer.get_bos_token_id()
-    # Each buffered doc is (tokens, mask_before_ids). mask_before_ids may be None.
-    doc_buffer = []
-    last_info = None
-    # Per-rank-equivalent RNG used by sequential mode to shuffle the buffer
-    # after each refill. Seeded so two DDP ranks shuffle differently (caller
-    # passes rank-dependent seed).
-    _pack_rng = _random.Random(rng_seed)
 
-    # Sanity-check counters: BPE tokenizes `mask_before` *standalone*, but the
-    # marker is searched for in the *in-context* tokenization of packed docs.
-    # If BPE merges differ across those two settings (e.g. trailing space gets
-    # absorbed into the next token), the marker never matches and the whole
-    # sub-doc gets masked -> zero training signal. Surface a loud one-shot
-    # warning on the first batch where any maskable docs were present.
+    streams = [s for s, _ in streams_with_weights]
+    weights = [float(w) for _, w in streams_with_weights]
+    total_w = sum(weights)
+    assert total_w > 0, "weights sum to 0"
+    cum = []
+    acc = 0.0
+    for w in weights:
+        acc += w / total_w
+        cum.append(acc)
+
+    n_sources = len(streams)
+    source_buffers = [[] for _ in range(n_sources)]
+    source_last_infos = [None] * n_sources
+
+    rng = random.Random(rng_seed)
+
     _marker_check_done = False
 
-    def refill_buffer():
-        nonlocal last_info
-        text_batch, info, mask_before_ids = next(doc_stream)
-        last_info = info
+    def refill(src_idx):
+        text_batch, info, mask_before_ids = next(streams[src_idx])
+        source_last_infos[src_idx] = info
         token_lists = tokenizer.encode(text_batch, prepend=bos_token, num_threads=tokenizer_threads)
         for tokens in token_lists:
-            doc_buffer.append((tokens, mask_before_ids))
-        # Sequential mode needs random buffer order so per-placement FIFO pops
-        # give Bernoulli interleaving across sources. Refills arrive batch-at-
-        # a-time (128 docs from one stream), so without shuffling the front of
-        # the buffer would be all-one-source.
-        if pack_strategy == "sequential":
-            _pack_rng.shuffle(doc_buffer)
+            source_buffers[src_idx].append((tokens, mask_before_ids))
 
-    # Pre-allocate buffers once: layout is [inputs (B*T) | targets (B*T)]
-    # This gives us contiguous views and a single HtoD transfer
     use_cuda = device == "cuda"
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
     cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
@@ -222,62 +181,56 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
     inputs = gpu_buffer[:B * T].view(B, T)
     targets = gpu_buffer[B * T:].view(B, T)
 
+    def pick_source():
+        r = rng.random()
+        i = 0
+        while i < len(cum) - 1 and r > cum[i]:
+            i += 1
+        return i
+
     while True:
-        # Per-row placement records: (start_pos, end_pos, mask_before_ids). The
-        # mask pass uses these instead of re-scanning for BOS so each sub-doc
-        # gets exactly its origin batch's mask config.
+        # Per-row placements: (start_pos, end_pos, mask_before_ids). Used by
+        # the mask pass and (in single-stream mode) also serves as the BOS
+        # boundary record without needing to re-scan.
         placements = [[] for _ in range(B)]
 
         for row_idx in range(B):
+            src_idx = pick_source()
+            buf = source_buffers[src_idx]
+
             pos = 0
             while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
+                while len(buf) < buffer_size:
+                    refill(src_idx)
 
                 remaining = row_capacity - pos
 
-                if pack_strategy == "bestfit":
-                    # Find largest doc that fits entirely.
-                    best_idx = -1
-                    best_len = 0
-                    for i, (doc, _mb) in enumerate(doc_buffer):
-                        doc_len = len(doc)
-                        if doc_len <= remaining and doc_len > best_len:
-                            best_idx = i
-                            best_len = doc_len
-
-                    if best_idx >= 0:
-                        doc, mb = doc_buffer.pop(best_idx)
-                        doc_len = len(doc)
-                        row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
-                        placements[row_idx].append((pos, pos + doc_len, mb))
-                        pos += doc_len
-                    else:
-                        # No doc fits - crop shortest in buffer to fill remaining.
-                        shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i][0]))
-                        doc, mb = doc_buffer.pop(shortest_idx)
-                        row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                        placements[row_idx].append((pos, pos + remaining, mb))
-                        pos += remaining
-                else:
-                    # sequential: FIFO pop. Buffer was shuffled at refill so the
-                    # front is random across sources. Place full if it fits;
-                    # otherwise crop and end the row.
-                    doc, mb = doc_buffer.pop(0)
+                # Best-fit within this row's chosen source.
+                best_idx = -1
+                best_len = 0
+                for i, (doc, _mb) in enumerate(buf):
                     doc_len = len(doc)
-                    if doc_len <= remaining:
-                        row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
-                        placements[row_idx].append((pos, pos + doc_len, mb))
-                        pos += doc_len
-                    else:
-                        row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                        placements[row_idx].append((pos, pos + remaining, mb))
-                        pos += remaining
+                    if doc_len <= remaining and doc_len > best_len:
+                        best_idx = i
+                        best_len = doc_len
+
+                if best_idx >= 0:
+                    doc, mb = buf.pop(best_idx)
+                    doc_len = len(doc)
+                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                    placements[row_idx].append((pos, pos + doc_len, mb))
+                    pos += doc_len
+                else:
+                    shortest_idx = min(range(len(buf)), key=lambda i: len(buf[i][0]))
+                    doc, mb = buf.pop(shortest_idx)
+                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    placements[row_idx].append((pos, pos + remaining, mb))
+                    pos += remaining
 
         cpu_inputs.copy_(row_buffer[:, :-1])
         cpu_targets.copy_(row_buffer[:, 1:])
 
-        # Per-doc loss masking. Each placement carries its batch's
+        # Per-doc loss masking. Each placement carries its source's
         # mask_before_ids; None placements are left untouched. For maskable
         # placements: find the marker subsequence within [s, e). If found,
         # mask targets up to and including the marker. If not found (e.g. a
@@ -285,7 +238,7 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
         _n_found = 0
         _n_maskable_subdocs = 0
         for ri in range(B):
-            row_list = None  # lazy: only materialize per row when needed
+            row_list = None
             for (s, e, mb) in placements[ri]:
                 if mb is None:
                     continue
@@ -315,47 +268,27 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                       f"maskable sub-docs of first batch. Likely BPE in-context "
                       f"vs standalone tokenization mismatch. Most maskable "
                       f"targets will be -1 -> zero gradient signal on those docs.")
-                # One-shot debug dump of every maskable placement, so we can
-                # see at a glance whether they're cropped tails (length < doc
-                # len) or full docs that should have matched.
-                print(f"[debug] maskable placement dump (first batch):")
-                _dumped = 0
-                for ri in range(B):
-                    for (s, e, mb) in placements[ri]:
-                        if mb is None or _dumped >= 16:
-                            continue
-                        _dumped += 1
-                        seg = row_buffer[ri, s:e].tolist()
-                        _seg_bytes = bytes(b if 2 <= b < 256 else 0x3f for b in seg)
-                        _mb_in_seg = (mb in [seg[k:k+len(mb)] for k in range(len(seg) - len(mb) + 1)]) if len(seg) >= len(mb) else False
-                        print(f"  row={ri} s={s} e={e} len={e-s} mb_len={len(mb)} mb_id(0..3)={mb[:4]} "
-                              f"seg_id(0..3)={seg[:4]} mb_in_seg={_mb_in_seg}")
-                        print(f"    head: {_seg_bytes[:80]!r}")
-                        if e - s > 80:
-                            print(f"    tail: {_seg_bytes[-40:]!r}")
             else:
                 print(f"[dataloader] mask_before marker found in "
                       f"{_n_found}/{_n_maskable_subdocs} ({_rate:.0%}) "
                       f"maskable sub-docs of first batch")
 
-        # state_dict is whatever info the stream last gave us. For a single
-        # _document_batches stream this is (pq_idx, rg_idx, epoch); for a
-        # merged stream it's a dict keyed by source index. We also surface
-        # the legacy top-level pq_idx/rg_idx/epoch keys when present so
-        # base_train's progress-line logging keeps working without a format
-        # check (mirroring whichever source produced the most recent batch).
-        state_dict = {"info": last_info}
-        if isinstance(last_info, tuple) and len(last_info) == 3:
-            state_dict["pq_idx"] = last_info[0]
-            state_dict["rg_idx"] = last_info[1]
-            state_dict["epoch"] = last_info[2]
-        elif isinstance(last_info, dict):
-            # merged stream: surface source 0's position as the top-level summary
-            primary_info = last_info.get("0")
-            if isinstance(primary_info, tuple) and len(primary_info) == 3:
-                state_dict["pq_idx"] = primary_info[0]
-                state_dict["rg_idx"] = primary_info[1]
-                state_dict["epoch"] = primary_info[2]
+        # state_dict carries per-source position info. For single-source the
+        # consumer can still use the legacy top-level pq_idx/rg_idx/epoch via
+        # the convenience copy below (mirrors source 0).
+        state_dict = {
+            "sources": [
+                {"pq_idx": info[0], "rg_idx": info[1], "epoch": info[2]}
+                if isinstance(info, tuple) and len(info) == 3 else {"info": info}
+                for info in source_last_infos
+            ],
+            "rng_state": rng.getstate(),
+        }
+        s0 = source_last_infos[0]
+        if isinstance(s0, tuple) and len(s0) == 3:
+            state_dict["pq_idx"] = s0[0]
+            state_dict["rg_idx"] = s0[1]
+            state_dict["epoch"] = s0[2]
 
         gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
         yield inputs, targets, state_dict
@@ -365,20 +298,3 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
-
-
-def build_single_stream(tokenizer, split, resume_state_dict, mask_before=None,
-                        tokenizer_batch_size=128, data_dir=None):
-    """
-    Convenience: build a (text_batch, info, mask_before_ids) stream from one
-    parquet source. Tokenizes mask_before once. Use this when you have a
-    single data dir; for multi-source mixes use merge_streams over several
-    of these.
-    """
-    mask_before_ids = None
-    if mask_before:
-        mask_before_ids = tokenizer.encode(mask_before)
-        if not mask_before_ids:
-            raise ValueError(f"mask_before {mask_before!r} encoded to empty token sequence")
-    base = _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=data_dir)
-    return attach_mask(base, mask_before_ids)

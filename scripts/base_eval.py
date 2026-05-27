@@ -288,7 +288,9 @@ def main():
 
         for split_name in ["train", "val"]:
             stream = build_single_stream(tokenizer, split_name, None, mask_before=None)
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, stream, device=device)
+            loader = tokenizing_distributed_data_loader_bos_bestfit(
+                tokenizer, args.device_batch_size, sequence_len, [(stream, 1.0)], device=device,
+            )
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")
