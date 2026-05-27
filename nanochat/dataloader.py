@@ -48,8 +48,7 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=N
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    warn_on_legacy = ddp_rank == 0 and split == "train" and data_dir is None # only warn for the default stream
-    parquet_paths = list_parquet_files(data_dir=data_dir, warn_on_legacy=warn_on_legacy)
+    parquet_paths = list_parquet_files(data_dir=data_dir)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
