@@ -277,6 +277,24 @@ def tokenizing_distributed_data_loader_with_state_bos_bestfit(
                       f"maskable sub-docs of first batch. Likely BPE in-context "
                       f"vs standalone tokenization mismatch. Most maskable "
                       f"targets will be -1 -> zero gradient signal on those docs.")
+                # One-shot debug dump of every maskable placement, so we can
+                # see at a glance whether they're cropped tails (length < doc
+                # len) or full docs that should have matched.
+                print(f"[debug] maskable placement dump (first batch):")
+                _dumped = 0
+                for ri in range(B):
+                    for (s, e, mb) in placements[ri]:
+                        if mb is None or _dumped >= 16:
+                            continue
+                        _dumped += 1
+                        seg = row_buffer[ri, s:e].tolist()
+                        _seg_bytes = bytes(b if 2 <= b < 256 else 0x3f for b in seg)
+                        _mb_in_seg = (mb in [seg[k:k+len(mb)] for k in range(len(seg) - len(mb) + 1)]) if len(seg) >= len(mb) else False
+                        print(f"  row={ri} s={s} e={e} len={e-s} mb_len={len(mb)} mb_id(0..3)={mb[:4]} "
+                              f"seg_id(0..3)={seg[:4]} mb_in_seg={_mb_in_seg}")
+                        print(f"    head: {_seg_bytes[:80]!r}")
+                        if e - s > 80:
+                            print(f"    tail: {_seg_bytes[-40:]!r}")
             else:
                 print(f"[dataloader] mask_before marker found in "
                       f"{_n_found}/{_n_maskable_subdocs} ({_rate:.0%}) "
