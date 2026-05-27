@@ -31,7 +31,8 @@ from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import (
     tokenizing_distributed_data_loader_bos_bestfit,
     tokenizing_distributed_data_loader_with_state_bos_bestfit,
-    tokenizing_distributed_data_loader_with_state_bos_bestfit_mixed,
+    build_single_stream,
+    merge_streams,
 )
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -450,21 +451,38 @@ if scaler is not None:
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 _mask_before = args.mask_before if args.mask_before else None
 if args.mix_data_dir:
-    # Two-stream mixed loader. Mix dir is resolved like NANOCHAT_DATA_DIR:
-    # absolute paths used as-is, relative paths joined to base_dir.
+    # Mixed-source training. Primary stream = the default data dir
+    # (NANOCHAT_DATA_DIR or climbmix), never masked. Mix stream = the dir
+    # passed by --mix-data-dir, gets the mask_before applied. The merger
+    # picks per-batch which source to draw from with prob = mix_fraction.
+    import random
     _mix_dir = args.mix_data_dir if os.path.isabs(args.mix_data_dir) else os.path.join(get_base_dir(), args.mix_data_dir)
-    print0(f"Using mixed dataloader: mix_data_dir={_mix_dir} mix_fraction={args.mix_fraction}")
-    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_mixed(
-        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
-        mix_data_dir=_mix_dir, mix_fraction=args.mix_fraction,
-        device=device, resume_state_dict=dataloader_resume_state_dict, mask_before=_mask_before,
+    print0(f"Using merged dataloader: mix_data_dir={_mix_dir} mix_fraction={args.mix_fraction}")
+    # Per-rank RNG so each rank's mix sampling is independent; the realised
+    # global ratio still converges to mix_fraction.
+    _rng = random.Random(1337 + ddp_rank)
+    _pri_stream = build_single_stream(tokenizer, "train", None, mask_before=None)
+    _mix_stream = build_single_stream(tokenizer, "train", None, mask_before=_mask_before, data_dir=_mix_dir)
+    _train_stream = merge_streams(
+        [(_pri_stream, 1.0 - args.mix_fraction), (_mix_stream, args.mix_fraction)],
+        rng=_rng,
+    )
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, _train_stream, device=device,
     )
     # val loader is single-stream on the primary (climbmix-equivalent) data --
     # validates against the general pretraining distribution, not CUTE.
-    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, mask_before=None)
+    def build_val_loader():
+        val_stream = build_single_stream(tokenizer, "val", None, mask_before=None)
+        return tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, val_stream, device=device)
 else:
-    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, mask_before=_mask_before)
-    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, mask_before=_mask_before)
+    train_stream = build_single_stream(tokenizer, "train", dataloader_resume_state_dict, mask_before=_mask_before)
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(
+        tokenizer, args.device_batch_size, args.max_seq_len, train_stream, device=device,
+    )
+    def build_val_loader():
+        val_stream = build_single_stream(tokenizer, "val", None, mask_before=_mask_before)
+        return tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, val_stream, device=device)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------

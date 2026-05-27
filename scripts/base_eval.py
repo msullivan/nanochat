@@ -36,7 +36,7 @@ from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
 from nanochat.byte_tokenizer import ByteTokenizer, get_byte_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, build_single_stream
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 
@@ -287,7 +287,8 @@ def main():
         steps = args.split_tokens // tokens_per_step
 
         for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+            stream = build_single_stream(tokenizer, split_name, None, mask_before=None)
+            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, stream, device=device)
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")
