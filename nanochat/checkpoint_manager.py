@@ -228,6 +228,7 @@ def load_model(source, *args, **kwargs):
         "base": "base_checkpoints",
         "cute": "cute_checkpoints",
         "scratch": "scratch_checkpoints",
+        "mix": "cute_mix_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
     }[source]

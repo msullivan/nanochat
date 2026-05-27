@@ -28,7 +28,11 @@ import torch
 import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
-from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.dataloader import (
+    tokenizing_distributed_data_loader_bos_bestfit,
+    tokenizing_distributed_data_loader_with_state_bos_bestfit,
+    tokenizing_distributed_data_loader_with_state_bos_bestfit_mixed,
+)
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.byte_tokenizer import ByteTokenizer, get_byte_token_bytes
@@ -89,6 +93,8 @@ parser.add_argument("--byte-tokenizer", action="store_true", help="use byte-leve
 parser.add_argument("--bigram-value-embeds", action="store_true", help="index value embeddings by (prev_byte, curr_byte_low7) -- 15-bit, 32k entries. UTF-8-aware. Only meaningful with --byte-tokenizer.")
 parser.add_argument("--disable-value-embeds", action="store_true", help="ablate the value-embedding contribution: zero-init the value_embeds + ve_gate weights and skip them in forward and the optimizer (params remain allocated for checkpoint compat)")
 parser.add_argument("--mask-before", type=str, default="", help='loss-mask every training token that comes before (and including) this substring in each sub-document. e.g. --mask-before="Answer: " makes cute_pt train only on the answer text in each Q/A doc. Empty (default) = no masking, every token contributes loss.')
+parser.add_argument("--mix-data-dir", type=str, default="", help="when set, switches to the two-stream mixed dataloader. Primary stream is NANOCHAT_DATA_DIR (or climbmix default); --mix-data-dir is the auxiliary stream. Absolute path or relative to NANOCHAT_BASE_DIR. Use case: cute_mix-style runs that interleave synthetic CUTE data with general pretraining text to preserve capability.")
+parser.add_argument("--mix-fraction", type=float, default=0.0, help="probability per document of drawing from --mix-data-dir instead of the primary stream. Only used when --mix-data-dir is set. --mask-before, if set, applies ONLY to mix-stream docs.")
 args = parser.parse_args()
 
 # If resuming, peek at the seed checkpoint's meta to recover the model
@@ -443,8 +449,22 @@ if scaler is not None:
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 _mask_before = args.mask_before if args.mask_before else None
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, mask_before=_mask_before)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, mask_before=_mask_before)
+if args.mix_data_dir:
+    # Two-stream mixed loader. Mix dir is resolved like NANOCHAT_DATA_DIR:
+    # absolute paths used as-is, relative paths joined to base_dir.
+    _mix_dir = args.mix_data_dir if os.path.isabs(args.mix_data_dir) else os.path.join(get_base_dir(), args.mix_data_dir)
+    print0(f"Using mixed dataloader: mix_data_dir={_mix_dir} mix_fraction={args.mix_fraction}")
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit_mixed(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+        mix_data_dir=_mix_dir, mix_fraction=args.mix_fraction,
+        device=device, resume_state_dict=dataloader_resume_state_dict, mask_before=_mask_before,
+    )
+    # val loader is single-stream on the primary (climbmix-equivalent) data --
+    # validates against the general pretraining distribution, not CUTE.
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, mask_before=None)
+else:
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict, mask_before=_mask_before)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device, mask_before=_mask_before)
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------

@@ -22,18 +22,21 @@ import pyarrow.parquet as pq
 from nanochat.common import get_dist_info
 from nanochat.dataset import list_parquet_files
 
-def _document_batches(split, resume_state_dict, tokenizer_batch_size):
+def _document_batches(split, resume_state_dict, tokenizer_batch_size, data_dir=None):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
     Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
     where text_batch is a list of document strings, indices track position for resumption,
     and epoch counts how many times we've cycled through the dataset (starts at 1).
+
+    data_dir overrides the default (NANOCHAT_DATA_DIR / climbmix). Used by the mixed
+    loader to draw from two independent streams without disturbing the global default.
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
-    warn_on_legacy = ddp_rank == 0 and split == "train" # rank 0 on train split will warn on legacy
-    parquet_paths = list_parquet_files(warn_on_legacy=warn_on_legacy)
+    warn_on_legacy = ddp_rank == 0 and split == "train" and data_dir is None # only warn for the default stream
+    parquet_paths = list_parquet_files(data_dir=data_dir, warn_on_legacy=warn_on_legacy)
     assert len(parquet_paths) != 0, "No dataset parquet files found, did you run dataset.py?"
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
 
@@ -237,3 +240,202 @@ def tokenizing_distributed_data_loader_bos_bestfit(*args, **kwargs):
     """Helper that omits state_dict from yields."""
     for inputs, targets, state_dict in tokenizing_distributed_data_loader_with_state_bos_bestfit(*args, **kwargs):
         yield inputs, targets
+
+
+def tokenizing_distributed_data_loader_with_state_bos_bestfit_mixed(
+    tokenizer, B, T, split,
+    mix_data_dir, mix_fraction,
+    tokenizer_threads=4, tokenizer_batch_size=128,
+    device="cuda", resume_state_dict=None,
+    buffer_size=1000,
+    mask_before=None,
+    rng_seed=0,
+):
+    """
+    Two-stream bestfit dataloader. Each doc placement is drawn from one of two
+    parquet sources by Bernoulli(mix_fraction):
+      - primary stream: the default data dir (NANOCHAT_DATA_DIR or climbmix)
+      - mix stream:    `mix_data_dir`
+
+    Per-doc origin is tracked through the packer. `mask_before`, if set, applies
+    ONLY to docs from the mix stream -- primary-stream docs are never masked.
+
+    Intended use: continued pretraining where the mix stream is a structured
+    Q/A corpus (CUTE) whose answer-only loss mask must not also clobber the
+    general-pretraining data we're interleaving to preserve capability.
+
+    State dict carries independent (pq_idx, rg_idx, epoch) per stream + the
+    Bernoulli RNG state. Legacy single-stream state dicts (no "primary" key)
+    are ignored -- streams start fresh, which is what you want when seeding
+    from a base pretraining checkpoint.
+    """
+    import random
+    assert split in ["train", "val"], "split must be 'train' or 'val'"
+    assert 0.0 <= mix_fraction <= 1.0, f"mix_fraction must be in [0, 1], got {mix_fraction}"
+
+    row_capacity = T + 1
+    bos_token = tokenizer.get_bos_token_id()
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
+
+    # Restore per-stream resume state only if the saved dict has the mixed-loader
+    # format (key "primary"). A legacy single-stream state dict from a base seed
+    # is ignored: its (pq_idx, rg_idx) refer to the seed's data layout, not ours,
+    # and starting both streams fresh is the right behavior for cute_mix-style
+    # runs that seed from a pretraining checkpoint.
+    if resume_state_dict and "primary" in resume_state_dict:
+        pri_state = resume_state_dict["primary"]
+        mix_state = resume_state_dict["mix"]
+    else:
+        pri_state = None
+        mix_state = None
+
+    pri_batches = _document_batches(split, pri_state, tokenizer_batch_size)
+    mix_batches = _document_batches(split, mix_state, tokenizer_batch_size, data_dir=mix_data_dir)
+    pri_buf, mix_buf = [], []
+    # Last-seen (pq_idx, rg_idx, epoch) for each stream, mirrored into state_dict.
+    pri_pos = (0, 0, 1)
+    mix_pos = (0, 0, 1)
+
+    # Per-rank RNG so each rank's Bernoulli draws are independent; ratio still
+    # converges to mix_fraction across the global batch. Seeded by rank so two
+    # ranks don't apply the same mix pattern.
+    rng = random.Random(rng_seed + ddp_rank)
+    if resume_state_dict and "rng_state" in resume_state_dict:
+        # state from rng.getstate() is JSON-unsafe (tuple of giant ints) but
+        # torch.save handles it via pickle. Wrapped in try/except so a stale
+        # state from a different Python/random version doesn't kill the run.
+        try:
+            rng.setstate(resume_state_dict["rng_state"])
+        except (ValueError, TypeError):
+            pass
+
+    mask_before_ids = None
+    if mask_before:
+        mask_before_ids = tokenizer.encode(mask_before)
+        if not mask_before_ids:
+            raise ValueError(f"mask_before {mask_before!r} encoded to empty token sequence")
+    _marker_check_done = False
+
+    def refill_pri():
+        nonlocal pri_pos
+        doc_batch, pri_pos = next(pri_batches)
+        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        pri_buf.extend(token_lists)
+
+    def refill_mix():
+        nonlocal mix_pos
+        doc_batch, mix_pos = next(mix_batches)
+        token_lists = tokenizer.encode(doc_batch, prepend=bos_token, num_threads=tokenizer_threads)
+        mix_buf.extend(token_lists)
+
+    use_cuda = device == "cuda"
+    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
+    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=use_cuda)
+    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+    cpu_inputs = cpu_buffer[:B * T].view(B, T)
+    cpu_targets = cpu_buffer[B * T:].view(B, T)
+    inputs = gpu_buffer[:B * T].view(B, T)
+    targets = gpu_buffer[B * T:].view(B, T)
+
+    while True:
+        # Per-row placement records so the mask pass knows each sub-doc's origin
+        # without re-scanning for BOS. Entries: (start_pos, end_pos, origin).
+        placements = [[] for _ in range(B)]
+
+        for row_idx in range(B):
+            pos = 0
+            while pos < row_capacity:
+                while len(pri_buf) < buffer_size:
+                    refill_pri()
+                while len(mix_buf) < buffer_size:
+                    refill_mix()
+
+                remaining = row_capacity - pos
+
+                # Pick stream by Bernoulli, then best-fit within that stream.
+                # Per-placement rather than per-row so the realized mix ratio
+                # converges quickly even at small B.
+                origin = 'mix' if rng.random() < mix_fraction else 'primary'
+                buf = mix_buf if origin == 'mix' else pri_buf
+
+                best_idx = -1
+                best_len = 0
+                for i, doc in enumerate(buf):
+                    doc_len = len(doc)
+                    if doc_len <= remaining and doc_len > best_len:
+                        best_idx = i
+                        best_len = doc_len
+
+                if best_idx >= 0:
+                    doc = buf.pop(best_idx)
+                    doc_len = len(doc)
+                    row_buffer[row_idx, pos:pos + doc_len] = torch.tensor(doc, dtype=torch.long)
+                    placements[row_idx].append((pos, pos + doc_len, origin))
+                    pos += doc_len
+                else:
+                    # No doc in the chosen stream fits -> crop the shortest from it
+                    # to fill the remainder. Keeps mix-ratio honest: we don't fall
+                    # back to the other stream just because this one had no short doc.
+                    shortest_idx = min(range(len(buf)), key=lambda i: len(buf[i]))
+                    doc = buf.pop(shortest_idx)
+                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    placements[row_idx].append((pos, pos + remaining, origin))
+                    pos += remaining
+
+        cpu_inputs.copy_(row_buffer[:, :-1])
+        cpu_targets.copy_(row_buffer[:, 1:])
+
+        # Mask_before: applies ONLY to mix-origin placements. Primary-stream
+        # docs are never masked -- they're general pretraining text where we
+        # want the full next-token-prediction signal.
+        if mask_before_ids is not None:
+            _mb_len = len(mask_before_ids)
+            _n_found = 0
+            _n_subdocs_mix = 0
+            for ri in range(B):
+                row_list = row_buffer[ri].tolist()
+                for (s, e, origin) in placements[ri]:
+                    if origin != 'mix':
+                        continue
+                    _n_subdocs_mix += 1
+                    marker_pos = -1
+                    limit = e - _mb_len + 1
+                    for j in range(s, limit):
+                        if row_list[j:j + _mb_len] == mask_before_ids:
+                            marker_pos = j
+                            break
+                    if marker_pos >= 0:
+                        _n_found += 1
+                    mask_end = marker_pos + _mb_len if marker_pos >= 0 else e
+                    t_start = max(s - 1, 0)
+                    t_end = mask_end - 1
+                    if t_end > t_start:
+                        cpu_targets[ri, t_start:t_end] = -1
+            if not _marker_check_done and _n_subdocs_mix > 0:
+                _marker_check_done = True
+                _rate = _n_found / max(1, _n_subdocs_mix)
+                if _rate < 0.5:
+                    print(f"!!! WARNING: mask_before marker {mask_before!r} -> "
+                          f"{mask_before_ids} found in only {_n_found}/{_n_subdocs_mix} "
+                          f"({_rate:.0%}) MIX sub-docs of first batch. Likely BPE "
+                          f"in-context vs standalone tokenization mismatch. Most "
+                          f"mix-stream gradient signal will be zeroed -- only the "
+                          f"primary stream will train.")
+                else:
+                    print(f"[mixed dataloader] mask_before marker found in "
+                          f"{_n_found}/{_n_subdocs_mix} ({_rate:.0%}) mix sub-docs of first batch")
+
+        # state_dict carries both stream positions + RNG. Top-level pq_idx/rg_idx/epoch
+        # mirror the primary stream so legacy logging code (e.g. base_train's progress
+        # line) keeps working without a format check.
+        state_dict = {
+            "primary": {"pq_idx": pri_pos[0], "rg_idx": pri_pos[1], "epoch": pri_pos[2]},
+            "mix": {"pq_idx": mix_pos[0], "rg_idx": mix_pos[1], "epoch": mix_pos[2]},
+            "rng_state": rng.getstate(),
+            "pq_idx": pri_pos[0],
+            "rg_idx": pri_pos[1],
+            "epoch": pri_pos[2],
+        }
+
+        gpu_buffer.copy_(cpu_buffer, non_blocking=use_cuda)
+        yield inputs, targets, state_dict
