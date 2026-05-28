@@ -105,7 +105,10 @@ for SIZE in $SIZES; do
 
     for MIX in $MIX_FRACTIONS; do
         MIX_PCT=$(fraction_pct "$MIX")
-        DST_TAG="${MODEL}-mix${MIX_PCT}-${SIZE}w"
+        # CELL_TAG_SUFFIX lets you distinguish recipe variants (different
+        # N_EPOCHS, etc.) without clobbering each other's checkpoint dirs
+        # or CSV rows. e.g. CELL_TAG_SUFFIX=-e4 for an "epochs=4" rerun.
+        DST_TAG="${MODEL}-mix${MIX_PCT}-${SIZE}w${CELL_TAG_SUFFIX:-}"
 
         if already_done "$DST_TAG" "$SIZE"; then
             echo "--- SKIP (already in $RESULT_CSV): $DST_TAG size=$SIZE ---"
