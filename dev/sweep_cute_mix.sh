@@ -151,9 +151,12 @@ print(max($MIN_STEPS, math.ceil($CUTE_TOKENS_TARGET / ($TOKENS_PER_STEP * $MIX))
             FT_STEPS="$FT_STEPS" \
             FT_LRM="$FT_LRM" \
             MASK_BEFORE="$MASK_BEFORE" \
-            EVAL_EVERY=-1 \
-            CORE_METRIC_EVERY=-1 \
-            SAMPLE_EVERY=-1 \
+            EVAL_EVERY="${EVAL_EVERY:--1}" \
+            CORE_METRIC_EVERY="${CORE_METRIC_EVERY:--1}" \
+            SAMPLE_EVERY="${SAMPLE_EVERY:--1}" \
+            CUTE_EVERY="${CUTE_EVERY:--1}" \
+            CUTE_SUBTASKS="${CUTE_SUBTASKS:-spell,contains_char}" \
+            CUTE_MAX_PROBLEMS="${CUTE_MAX_PROBLEMS:-20}" \
             bash runs/cute_mix.sh
 
         echo "--- EVAL: tag=$DST_TAG size=$SIZE prompt=$PROMPT_STYLE ---"

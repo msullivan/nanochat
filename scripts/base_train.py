@@ -86,6 +86,9 @@ parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
+parser.add_argument("--cute-every", type=int, default=-1, help="in-training mini-CUTE eval every N steps (-1 = disable). Runs --cute-subtasks at --cute-max-problems each on the in-memory model. Logs cute/<subtask> to wandb so you can watch the curve in real time.")
+parser.add_argument("--cute-subtasks", type=str, default="spell,contains_char", help="comma-separated CUTE subtasks for the in-training mini-eval. Default = the two most-diagnostic ones (spell is the canary, contains_char surfaces bias collapse).")
+parser.add_argument("--cute-max-problems", type=int, default=20, help="problems per subtask for the in-training mini-eval. Keep small (~20) so the per-eval cost stays under ~30s.")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -743,6 +746,28 @@ while True:
             "core_metric": results["core_metric"],
             "centered_results": results["centered_results"],
         })
+        model.train()
+
+    # once in a while: mini-CUTE eval (all ranks; cute_eval's run_cute_subtask
+    # shards problems across ranks via dist.all_reduce). Uses the in-memory
+    # uncompiled model; tiny problem count so the per-eval cost stays low
+    # (~10s at d24 for 20 problems × 2 subtasks at most). Each subtask's
+    # accuracy is logged to wandb as cute/<subtask> so you can watch the
+    # curve climb as training goes on.
+    if args.cute_every > 0 and step != args.resume_from_step and (last_step or (step > 0 and step % args.cute_every == 0)):
+        from tasks.cute import CUTE
+        from scripts.cute_eval import run_cute_subtask
+        model.eval()
+        subtasks = [s.strip() for s in args.cute_subtasks.split(",") if s.strip()]
+        engine = Engine(orig_model, tokenizer)
+        cute_log = {"step": step, "total_training_flops": flops_so_far}
+        for subtask in subtasks:
+            task = CUTE(subtask=subtask, mode="completion", prefill=True, prompt_style="zero")
+            num_passed, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64, max_problems=args.cute_max_problems)
+            acc = num_passed / total if total > 0 else 0.0
+            print0(f"Step {step:05d} | cute/{subtask}: {num_passed}/{total} ({100*acc:.1f}%)")
+            cute_log[f"cute/{subtask}"] = acc
+        wandb_run.log(cute_log)
         model.train()
 
     # once in a while: sample from the model (only on master process)

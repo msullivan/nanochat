@@ -82,6 +82,9 @@ WANDB_PROJECT="${WANDB_PROJECT:-nanochat-cute-mix}"
 EVAL_EVERY="${EVAL_EVERY:-25}"
 CORE_METRIC_EVERY="${CORE_METRIC_EVERY:-50}"
 SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
+CUTE_EVERY="${CUTE_EVERY:--1}"
+CUTE_SUBTASKS="${CUTE_SUBTASKS:-spell,contains_char}"
+CUTE_MAX_PROBLEMS="${CUTE_MAX_PROBLEMS:-20}"
 CKPT_SUBDIR=cute_mix_checkpoints
 export NANOCHAT_REPORT_TAG="$MODEL_TAG"
 
@@ -128,5 +131,8 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --mask-before="$MASK_BEFORE" \
     --mix-data-dir="$MIX_DATA_DIR" \
     --mix-fraction="$MIX_FRACTION" \
+    --cute-every="$CUTE_EVERY" \
+    --cute-subtasks="$CUTE_SUBTASKS" \
+    --cute-max-problems="$CUTE_MAX_PROBLEMS" \
     --fp8 \
     --run="$MODEL_TAG"
