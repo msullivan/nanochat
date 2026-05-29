@@ -34,7 +34,7 @@ These are the "capability ceilings" the CUTE-trained variants are measured again
 | cell | CUTE mean | CORE |
 |------|-----------|------|
 | d24-BPE @ 300k cute_pt        | 0.75 | **−0.008** |
-| byte-l-ext @ 30k cute_pt      | ~0.85 | 0.003 |
+| byte-l-ext @ 30k cute_pt      | 0.925 | 0.003 |
 | byte-l-ext @ 10k cute_pt      | —     | 0.087 |
 
 Catastrophic forgetting: the model learns CUTE format and loses everything else.
