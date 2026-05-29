@@ -4,6 +4,118 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-05-28: CUTE experiment inventory + mixed-data capability preservation
+
+**Why this entry exists**: the CUTE work started as a clean grid and drifted
+into several ad-hoc clusters. This is the map. Each cluster is coherent on its
+own; they don't stack into one grid because **each holds a different thing
+constant**. Numbers below are CUTE char-subtask mean (8 subtasks, 100 problems
+each, zero-shot completion) and CORE (max-per-task 500, single GPU).
+
+### The datasets on disk (`~/.cache/nanochat/cute_sweep/`)
+
+- `results_sft-mask.csv` — **the main grid.** sft-mask recipe (FT_LRM=0.8,
+  WARMDOWN_FRAC=0.5, WD=0, MASK_BEFORE='Answer: "'). 4 base models ×
+  up to 7 sizes (1k,3k,10k,30k,50k,100k,300k). Holds **recipe + ~2-epoch
+  CUTE exposure** constant; varies base model and data size.
+- `results_mix.csv` — the capability-preservation experiments (below).
+- `results_scratch.csv` — from-scratch byte LM, 2 cells only (30k, 100k).
+  Abandoned (see below).
+- `results.csv`, `results_sft-mask-OLD.csv` — dead/superseded (old "nodemos"
+  recipe and a prior grid version). Ignore.
+
+### Base-model CORE (no CUTE training), for reference
+d24 (BPE) = 0.260, byte-l-ext = 0.253, byte-l = 0.195, byte-l-early = 0.169.
+These are the "capability ceilings" the CUTE-trained variants are measured against.
+
+### Cluster A — cute_pt destroys capability (the motivating finding)
+100% CUTE midtraining (no general data). CUTE accuracy is high but CORE collapses:
+
+| cell | CUTE mean | CORE |
+|------|-----------|------|
+| d24-BPE @ 300k cute_pt        | 0.75 | **−0.008** |
+| byte-l-ext @ 30k cute_pt      | ~0.85 | 0.003 |
+| byte-l-ext @ 10k cute_pt      | —     | 0.087 |
+
+Catastrophic forgetting: the model learns CUTE format and loses everything else.
+`contains_char` also bias-collapses (≈0.48, constant-ish answer) at high saturation.
+
+### Cluster B — byte mix @ 30k (holds CUTE-tokens-seen constant)
+byte-l-ext base, mix fraction ∈ {10,20,50}%, MASK_BEFORE applied only to the
+CUTE stream. **Each cell sees the same ~2 epochs of the 30k CUTE data**, so
+total step count varies with 1/mix_frac (458 / 229 / 92). This holds CUTE
+exposure fixed and varies dilution.
+
+| cell    | ft_steps | CUTE mean | CORE  |
+|---------|----------|-----------|-------|
+| mix10   | 458      | 0.967     | 0.250 |
+| mix20   | 229      | 0.968     | 0.243 |
+| mix50   | 92       | 0.908     | 0.242 |
+
+All preserve CORE (≈ base 0.253). mix10/20 saturate CUTE; mix50 dips on
+`contains_char` (under-trained at 92 steps). Byte models pay almost no CUTE
+cost for mixing — they're already character-native.
+
+### Cluster C — BPE mix @ 300k (two sub-experiments, different held-constant)
+d24-BPE base. This is where it got ad-hoc. Two crossing slices:
+
+*C1 — hold CUTE-tokens-seen constant (~2 epochs), vary mix fraction:*
+| cell      | ft_steps | CUTE mean | CORE  |
+|-----------|----------|-----------|-------|
+| mix50-e1  | 229      | 0.51      | 0.268 |
+| mix70-e1  | 164      | 0.48      | (not run) |
+
+*C2 — hold mix fraction, vary CUTE exposure (epoch bumps, the -e3/-e4 tags):*
+| cell        | ft_steps | CUTE mean | CORE  |
+|-------------|----------|-----------|-------|
+| mix70-e3    | 246      | 0.57      | 0.268 |
+| mix50-e4    | 458      | 0.67      | **0.276** |
+
+**Conclusion for BPE**: every mix cell preserves CORE (0.268–0.276, all ≥ base
+0.260, even slightly above). CUTE accuracy is **compute/exposure-limited, not
+mix-ratio-limited** — mix50-e4 (more total training) beats mix70-e3 (higher CUTE
+share, less training) on both CUTE and CORE. mix50-e4 reaches 0.67 CUTE (89% of
+cute_pt's 0.75) with zero capability loss. The last ~0.08 of CUTE that cute_pt
+buys costs the entire model.
+
+`contains_char` recovers from cute_pt's collapsed 0.48 to 0.88 under mix50-e4 —
+mixing fixes the bias-collapse failure mode.
+
+### Cluster D — from-scratch byte (abandoned)
+Train a byte LM from random init on CUTE-only data; does pretraining matter for
+CUTE? 100k-words cell: spell 26% / spell_inverse 23% (vs ~100% for
+pretrained+cute_pt at the same size). Pretraining is essential; from-scratch is
+not competitive. Stopped after 100k. (Note: used base_train's default warmdown
+schedule, which at ~150 steps is mostly warmup+warmdown with little plateau —
+but the schedule wasn't judged to be the cause; the gap is too large.)
+
+### Headline
+The capability-preservation thesis holds for **both tokenizers**: mixing ~50%
+general (ClimbMix) data with CUTE preserves CORE fully while still teaching the
+character tasks. Pure cute_pt's CORE collapse is avoidable. The cost is some
+CUTE accuracy (recoverable with more compute), not capability.
+
+### If re-cleaning the grid
+The clean version of Cluster C would be one (model, size) with mix_fraction ×
+total-steps as explicit axes, rather than the current two crossing slices that
+each hold a different thing fixed. Tooling supports it: `CELL_TAG_SUFFIX` lets
+variant runs coexist without clobbering, and `--cute-every` logs mid-training
+CUTE curves to wandb.
+
+### Code produced (this session, branch `cudagraph`)
+- `nanochat/dataloader.py`: per-row source selection — loader takes
+  `[(stream, weight), ...]`, Bernoulli-picks a source per row, best-fits within
+  it. mask_before applies per-stream. (Replaced two earlier attempts: within-row
+  best-fit pushed small CUTE docs to row-tail crops and chopped the mask marker;
+  sequential+shuffle fixed that but lost best-fit's low waste.)
+- `nanochat/dataset.py`: removed the silent FineWeb-EDU fallback (it masked a
+  missing-CUTE-dir bug as "training fine on web text").
+- `runs/cute_mix.sh`, `dev/sweep_cute_mix.sh`: mixed-data launcher + sweep.
+- `scripts/base_train.py`: `--mix-data-dir`/`--mix-fraction`, `--cute-every`
+  in-training mini-CUTE eval.
+
+---
+
 ## 2026-05-25: Inference speedup on Blackwell — manual CUDA graphs beat torch.compile
 
 **Epistemic-status caveat**: this entire entry was written by Claude during
