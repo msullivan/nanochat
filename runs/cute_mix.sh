@@ -85,6 +85,9 @@ SAMPLE_EVERY="${SAMPLE_EVERY:-50}"
 CUTE_EVERY="${CUTE_EVERY:--1}"
 CUTE_SUBTASKS="${CUTE_SUBTASKS:-spell,contains_char}"
 CUTE_MAX_PROBLEMS="${CUTE_MAX_PROBLEMS:-20}"
+# In-training CORE cadence uses this many examples/task. base_train's default
+# is 500 (~15 min/eval); drop it for frequent in-training CORE curves.
+CORE_MAX_PER_TASK="${CORE_MAX_PER_TASK:-500}"
 CKPT_SUBDIR=cute_mix_checkpoints
 export NANOCHAT_REPORT_TAG="$MODEL_TAG"
 
@@ -127,6 +130,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --eval-every="$EVAL_EVERY" \
     --eval-tokens=1048576 \
     --core-metric-every="$CORE_METRIC_EVERY" \
+    --core-metric-max-per-task="$CORE_MAX_PER_TASK" \
     --sample-every="$SAMPLE_EVERY" \
     --mask-before="$MASK_BEFORE" \
     --mix-data-dir="$MIX_DATA_DIR" \
