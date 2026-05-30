@@ -755,18 +755,28 @@ while True:
     # accuracy is logged to wandb as cute/<subtask> so you can watch the
     # curve climb as training goes on.
     if args.cute_every > 0 and step != args.resume_from_step and (last_step or (step > 0 and step % args.cute_every == 0)):
-        from tasks.cute import CUTE
+        from tasks.cute import CUTE, CUTE_CHAR_LEVEL
         from scripts.cute_eval import run_cute_subtask
         model.eval()
-        subtasks = [s.strip() for s in args.cute_subtasks.split(",") if s.strip()]
+        # "char" expands to the 8 char-level subtasks (same as cute_eval), so
+        # --cute-subtasks char gives a full graph-quality eval, not just a
+        # 2-subtask smoke check.
+        if args.cute_subtasks.strip() == "char":
+            subtasks = list(CUTE_CHAR_LEVEL)
+        else:
+            subtasks = [s.strip() for s in args.cute_subtasks.split(",") if s.strip()]
         engine = Engine(orig_model, tokenizer)
         cute_log = {"step": step, "total_training_flops": flops_so_far}
+        accs = []
         for subtask in subtasks:
             task = CUTE(subtask=subtask, mode="completion", prefill=True, prompt_style="zero")
             num_passed, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64, max_problems=args.cute_max_problems)
             acc = num_passed / total if total > 0 else 0.0
             print0(f"Step {step:05d} | cute/{subtask}: {num_passed}/{total} ({100*acc:.1f}%)")
             cute_log[f"cute/{subtask}"] = acc
+            accs.append(acc)
+        cute_log["cute/mean"] = sum(accs) / len(accs) if accs else 0.0
+        print0(f"Step {step:05d} | cute/mean: {100*cute_log['cute/mean']:.1f}%")
         wandb_run.log(cute_log)
         model.train()
 
