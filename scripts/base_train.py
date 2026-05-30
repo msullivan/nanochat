@@ -89,6 +89,8 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--cute-every", type=int, default=-1, help="in-training mini-CUTE eval every N steps (-1 = disable). Runs --cute-subtasks at --cute-max-problems each on the in-memory model. Logs cute/<subtask> to wandb so you can watch the curve in real time.")
 parser.add_argument("--cute-subtasks", type=str, default="spell,contains_char", help="comma-separated CUTE subtasks for the in-training mini-eval. Default = the two most-diagnostic ones (spell is the canary, contains_char surfaces bias collapse).")
 parser.add_argument("--cute-max-problems", type=int, default=20, help="problems per subtask for the in-training mini-eval. Keep small (~20) so the per-eval cost stays under ~30s.")
+parser.add_argument("--cute-at-steps", type=str, default="", help="comma-separated ABSOLUTE step numbers at which to fire the CUTE eval, in addition to (or instead of) --cute-every. Use for log-spaced evals on a learning curve, e.g. dense early then sparse. Fires when the global step is in this set.")
+parser.add_argument("--core-at-steps", type=str, default="", help="comma-separated ABSOLUTE step numbers at which to fire the CORE eval, in addition to --core-metric-every. Same purpose as --cute-at-steps for log-spaced CORE.")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -155,6 +157,11 @@ if args.resume_from_step != "-1":
         resume_wandb_run_id = _seed_run_id
 
 user_config = vars(args).copy()  # for logging
+# Parse explicit eval-at-step lists (absolute steps) into sets for O(1) lookup.
+# Enables log-spaced evals (dense early, sparse late) for clean learning curves.
+_parse_step_set = lambda s: set(int(x) for x in s.split(",") if x.strip()) if s else set()
+cute_at_steps = _parse_step_set(args.cute_at_steps)
+core_at_steps = _parse_step_set(args.core_at_steps)
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
 
@@ -735,7 +742,8 @@ while True:
     # use the original uncompiled model because the inputs keep changing shape
     # disable FP8 for evaluation to use BF16 for more consistent/accurate results
     results = {}
-    if args.core_metric_every > 0 and step != args.resume_from_step and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    _core_fire = last_step or (args.core_metric_every > 0 and step > 0 and step % args.core_metric_every == 0) or (step in core_at_steps)
+    if _core_fire and step != args.resume_from_step and (args.core_metric_every > 0 or core_at_steps):
         model.eval()
         with disable_fp8(orig_model):
             results = evaluate_core(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
@@ -754,7 +762,8 @@ while True:
     # (~10s at d24 for 20 problems × 2 subtasks at most). Each subtask's
     # accuracy is logged to wandb as cute/<subtask> so you can watch the
     # curve climb as training goes on.
-    if args.cute_every > 0 and step != args.resume_from_step and (last_step or (step > 0 and step % args.cute_every == 0)):
+    _cute_fire = last_step or (args.cute_every > 0 and step > 0 and step % args.cute_every == 0) or (step in cute_at_steps)
+    if _cute_fire and step != args.resume_from_step and (args.cute_every > 0 or cute_at_steps):
         from tasks.cute import CUTE, CUTE_CHAR_LEVEL
         from scripts.cute_eval import run_cute_subtask
         model.eval()

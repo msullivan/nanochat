@@ -88,6 +88,13 @@ CUTE_MAX_PROBLEMS="${CUTE_MAX_PROBLEMS:-20}"
 # In-training CORE cadence uses this many examples/task. base_train's default
 # is 500 (~15 min/eval); drop it for frequent in-training CORE curves.
 CORE_MAX_PER_TASK="${CORE_MAX_PER_TASK:-500}"
+# LOG_EVALS=1 generates a log-spaced eval schedule (offsets 1,2,4,8,...,FT_STEPS)
+# for both CUTE and CORE, instead of (or on top of) the every-N cadence. Dense
+# early to capture the fast initial rise, sparse on the plateau -- ideal for a
+# learning-curve graph. Absolute step lists are computed from SEED_STEP below.
+LOG_EVALS="${LOG_EVALS:-0}"
+CUTE_AT_STEPS=""
+CORE_AT_STEPS=""
 CKPT_SUBDIR=cute_mix_checkpoints
 export NANOCHAT_REPORT_TAG="$MODEL_TAG"
 
@@ -108,6 +115,21 @@ else
     WARMDOWN_RATIO=$(.venv/bin/python -c "print(${WARMDOWN_TAIL_STEPS} / ${NUM_ITERATIONS})")
     WARMDOWN_START=$(( NUM_ITERATIONS - WARMDOWN_TAIL_STEPS ))
     LR_BREAKPOINTS="${SEED_STEP}:${FT_LRM},$((WARMDOWN_START - 1)):${FT_LRM}"
+fi
+
+if [ "$LOG_EVALS" = "1" ]; then
+    # Offsets 1,2,4,8,... up to FT_STEPS, plus the final step; absolute = SEED+offset.
+    LOG_STEPS=$(.venv/bin/python -c "
+seed, ft = $SEED_STEP, $FT_STEPS
+offs, k = [], 1
+while k < ft:
+    offs.append(k); k *= 2
+offs.append(ft)
+print(','.join(str(seed + o) for o in offs))
+")
+    CUTE_AT_STEPS="$LOG_STEPS"
+    CORE_AT_STEPS="$LOG_STEPS"
+    echo "=== LOG_EVALS: at steps $LOG_STEPS"
 fi
 
 echo "=== cute_mix: tag=$MODEL_TAG seed_step=$SEED_STEP +ft_steps=$FT_STEPS"
@@ -138,5 +160,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --cute-every="$CUTE_EVERY" \
     --cute-subtasks="$CUTE_SUBTASKS" \
     --cute-max-problems="$CUTE_MAX_PROBLEMS" \
+    --cute-at-steps="$CUTE_AT_STEPS" \
+    --core-at-steps="$CORE_AT_STEPS" \
     --fp8 \
     --run="$MODEL_TAG"
