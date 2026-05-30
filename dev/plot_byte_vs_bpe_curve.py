@@ -16,8 +16,9 @@ import matplotlib.pyplot as plt
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--csv", default="dev/curve_data.csv",
                     help="input CSV from fetch_curve_data.py (default: dev/curve_data.csv)")
-parser.add_argument("--out", default="byte_vs_bpe_curve.png",
-                    help="output image path (default: byte_vs_bpe_curve.png in cwd)")
+parser.add_argument("--out", nargs="+", default=["byte_vs_bpe_curve.png", "byte_vs_bpe_curve.svg"],
+                    help="output image path(s); format inferred from each extension "
+                         "(default: byte_vs_bpe_curve.png + .svg in cwd)")
 args = parser.parse_args()
 
 CSV = args.csv
@@ -146,5 +147,6 @@ fig.suptitle(
     "(50% mix of ClimbMix + synthetic CUTE, 300k words, LR 0.05, WD 0.28)\n"
     "On this data BPE tokens are 3.0x denser than bytes.",
     fontsize=14, y=0.97)
-plt.savefig(args.out, dpi=130, bbox_inches="tight")
-print(f"saved {args.out}")
+for path in args.out:
+    plt.savefig(path, dpi=130, bbox_inches="tight")
+    print(f"saved {path}")
