@@ -203,12 +203,6 @@ else:
 # time-based) without misaligning train vs val vs core curves.
 wandb_run.define_metric("step")
 wandb_run.define_metric("*", step_metric="step")
-# Eval-curve metrics use ft_step (finetune-relative) instead, so learning
-# curves plot from ~0 on resumed runs (absolute step starts at the seed value).
-# These specific patterns override the "*" wildcard above.
-wandb_run.define_metric("ft_step")
-wandb_run.define_metric("cute/*", step_metric="ft_step")
-wandb_run.define_metric("core_metric", step_metric="ft_step")
 
 # Flash Attention status
 from nanochat.flash_attention import BACKEND
