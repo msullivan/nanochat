@@ -162,5 +162,6 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --cute-max-problems="$CUTE_MAX_PROBLEMS" \
     --cute-at-steps="$CUTE_AT_STEPS" \
     --core-at-steps="$CORE_AT_STEPS" \
+    --log-step-offset="$SEED_STEP" \
     --fp8 \
     --run="$MODEL_TAG"
