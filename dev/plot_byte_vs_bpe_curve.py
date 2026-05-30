@@ -53,14 +53,16 @@ for m in data:
 
 # 6 columns: 4 subtask cols + a narrow empty spacer + the summary col. The
 # spacer gives the divider line a gutter to live in so it doesn't cross any
-# tick labels / xlabels.
-fig = plt.figure(figsize=(21, 8), constrained_layout=True)
-gs = fig.add_gridspec(2, 6, width_ratios=[1, 1, 1, 1, 0.18, 1])
+# tick labels / xlabels. Top band reserved for suptitle + boxed legend.
+fig = plt.figure(figsize=(20, 8))
+gs = fig.add_gridspec(2, 6, width_ratios=[1, 1, 1, 1, 0.22, 1],
+                      top=0.81, bottom=0.085, left=0.035, right=0.99,
+                      hspace=0.30, wspace=0.06)
 SUBTASK_COLS = [0, 1, 2, 3]   # grid columns that hold the 8 subtasks
-SUMMARY_COL = 5               # grid column for MEAN (row0) / CORE (row1)
+SUMMARY_COL = 5               # grid column for mean (row0) / CORE (row1)
 
 # Map each panel to a (row, gridcol): subtasks fill the 4 left cols across
-# both rows; MEAN -> (0, summary), CORE -> (1, summary).
+# both rows; mean -> (0, summary), CORE -> (1, summary).
 slots = {}
 sub = [p for p in PANELS if p[0] not in ("cute/mean", "core_metric")]
 for i, p in enumerate(sub):          # 8 subtasks, row-major over 2x4 left block
@@ -77,20 +79,40 @@ for (row, col), (metric, title) in slots.items():
         if not pts:
             continue
         xs, ys = zip(*pts)
-        ax.plot(xs, ys, marker=st["marker"], color=st["color"], lw=2, ms=6, label=st["label"])
+        ax.plot(xs, ys, marker=st["marker"], color=st["color"], lw=2, ms=7, label=st["label"])
     ax.set_xscale("log")
-    ax.set_title(title, fontsize=11)
-    ax.set_ylim(-0.03, 1.03)
-    ax.grid(True, which="both", alpha=0.25)
-    ax.set_xlabel("finetune tokens (log)")
+    ax.set_title(title, fontsize=12)
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, alpha=0.3)
+    # 0.5 chance line on the binary tasks, matching plot_cute_sweep.py.
+    if metric in ("cute/contains_char", "cute/orth"):
+        ax.axhline(0.5, color="gray", linestyle=":", alpha=0.7,
+                   label="chance (binary task)" if metric == "cute/contains_char" else None)
+    # Labels/ticklabels only on edges. The summary column is visually detached
+    # (spacer + divider) so it gets its own y-label; within each block, x-label
+    # only on the bottom row, y-label only on the left edge.
+    is_summary = (col == SUMMARY_COL)
+    is_left_edge = (col == 0) or is_summary
+    is_bottom = (row == 1)
+    if is_bottom:
+        ax.set_xlabel("finetune tokens (log)")
+    else:
+        ax.tick_params(labelbottom=False)
+    if is_left_edge:
+        ax.set_ylabel("accuracy")
+    else:
+        ax.tick_params(labelleft=False)
     if metric == "cute/mean":
         mean_ax = ax
 
-# Figure-level legend (outside the panels), below the bottom row with padding
-# so it clears the x-axis labels.
-handles, labels = mean_ax.get_legend_handles_labels()
-fig.legend(handles, labels, loc="lower center", ncol=2, fontsize=12,
-           frameon=False, bbox_to_anchor=(0.5, -0.06))
+# Boxed legend in the reserved top band, between suptitle and panels. Collect
+# handles across panels so the binary-task "chance" line is included.
+seen = {}
+for ax in fig.axes:
+    for h, l in zip(*ax.get_legend_handles_labels()):
+        seen.setdefault(l, h)
+fig.legend(seen.values(), seen.keys(), loc="center", ncol=len(seen),
+           frameon=True, fontsize=12, bbox_to_anchor=(0.5, 0.87))
 
 # Divider in the spacer gutter between the subtask block and the summary
 # column. constrained_layout finalizes positions only after a draw, so resolve
@@ -108,8 +130,9 @@ fig.add_artist(plt.Line2D([x_div, x_div], [y_bot, y_top],
                           transform=fig.transFigure))
 
 fig.suptitle(
-    "Byte vs BPE — CUTE learning curves, matched recipe (50% mix of ClimbMix and synthetic CUTE data, 300k words, LR0.05, WD0.28)\n"
+    "Byte vs BPE — CUTE learning curves, matched recipe "
+    "(50% mix of ClimbMix + synthetic CUTE, 300k words, LR 0.05, WD 0.28)\n"
     "On this data BPE tokens are 3.0x denser than bytes.",
-    fontsize=12)
+    fontsize=14, y=0.97)
 plt.savefig("/tmp/byte_vs_bpe_curve.png", dpi=130, bbox_inches="tight")
 print("saved /tmp/byte_vs_bpe_curve.png")
