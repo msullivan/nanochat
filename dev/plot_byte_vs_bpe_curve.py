@@ -3,12 +3,24 @@
 Matched recipe (mix50 @ 300k words, LR0.05, WD0.28); only the tokenizer
 differs. Run dev/fetch_curve_data.py first to (re)generate the CSV.
 One panel per CUTE subtask + the mean + CORE; x = finetune step (log).
+
+Usage:
+    python dev/plot_byte_vs_bpe_curve.py [--csv PATH] [--out PATH]
+Defaults: --csv dev/curve_data.csv, --out byte_vs_bpe_curve.png (cwd).
 """
+import argparse
 import csv
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
-CSV = "dev/curve_data.csv"
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--csv", default="dev/curve_data.csv",
+                    help="input CSV from fetch_curve_data.py (default: dev/curve_data.csv)")
+parser.add_argument("--out", default="byte_vs_bpe_curve.png",
+                    help="output image path (default: byte_vs_bpe_curve.png in cwd)")
+args = parser.parse_args()
+
+CSV = args.csv
 # Match the styling in plot_cute_sweep.py ("CUTE accuracy by subtask × dataset
 # size × model") so colors/markers/labels are consistent across CUTE figures:
 #   d24-byte-l-ext: dark blue  #08306b, triangle "^"  -> "d24-byte-l-ext"
@@ -134,5 +146,5 @@ fig.suptitle(
     "(50% mix of ClimbMix + synthetic CUTE, 300k words, LR 0.05, WD 0.28)\n"
     "On this data BPE tokens are 3.0x denser than bytes.",
     fontsize=14, y=0.97)
-plt.savefig("/tmp/byte_vs_bpe_curve.png", dpi=130, bbox_inches="tight")
-print("saved /tmp/byte_vs_bpe_curve.png")
+plt.savefig(args.out, dpi=130, bbox_inches="tight")
+print(f"saved {args.out}")
