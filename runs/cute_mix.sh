@@ -118,13 +118,18 @@ else
 fi
 
 if [ "$LOG_EVALS" = "1" ]; then
-    # Offsets 1,2,4,8,... up to FT_STEPS, plus the final step; absolute = SEED+offset.
+    # Backbone: offsets 1,2,4,8,... up to FT_STEPS + final (clean 2x log spacing,
+    # overlayable across curves). EXTRA_OFFSETS adds ad-hoc infill offsets (e.g.
+    # 1.4x points in a rise band) -- comma-separated finetune-step offsets,
+    # merged + deduped. absolute step = SEED_STEP + offset.
     LOG_STEPS=$(.venv/bin/python -c "
 seed, ft = $SEED_STEP, $FT_STEPS
 offs, k = [], 1
 while k < ft:
     offs.append(k); k *= 2
 offs.append(ft)
+extra = [int(x) for x in '${EXTRA_OFFSETS:-}'.split(',') if x.strip()]
+offs = sorted(set(offs + [e for e in extra if 0 < e <= ft]))
 print(','.join(str(seed + o) for o in offs))
 ")
     CUTE_AT_STEPS="$LOG_STEPS"
