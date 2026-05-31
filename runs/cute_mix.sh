@@ -95,6 +95,12 @@ CORE_MAX_PER_TASK="${CORE_MAX_PER_TASK:-500}"
 LOG_EVALS="${LOG_EVALS:-0}"
 CUTE_AT_STEPS=""
 CORE_AT_STEPS=""
+# SAVE_AT_EVALS=1 also writes a checkpoint at every eval step, so each
+# learning-curve point is reproducible (re-eval / debug a specific point)
+# without dense --save-every. Pairs with LOG_EVALS.
+SAVE_AT_EVALS="${SAVE_AT_EVALS:-0}"
+SAVE_AT_EVALS_ARG=""
+[ "$SAVE_AT_EVALS" = "1" ] && SAVE_AT_EVALS_ARG="--save-at-evals"
 CKPT_SUBDIR=cute_mix_checkpoints
 export NANOCHAT_REPORT_TAG="$MODEL_TAG"
 
@@ -168,5 +174,6 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train -- \
     --cute-at-steps="$CUTE_AT_STEPS" \
     --core-at-steps="$CORE_AT_STEPS" \
     --log-step-offset="$SEED_STEP" \
+    $SAVE_AT_EVALS_ARG \
     --fp8 \
     --run="$MODEL_TAG"

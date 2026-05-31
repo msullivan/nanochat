@@ -92,6 +92,7 @@ parser.add_argument("--cute-max-problems", type=int, default=20, help="problems 
 parser.add_argument("--cute-at-steps", type=str, default="", help="comma-separated ABSOLUTE step numbers at which to fire the CUTE eval, in addition to (or instead of) --cute-every. Use for log-spaced evals on a learning curve, e.g. dense early then sparse. Fires when the global step is in this set.")
 parser.add_argument("--core-at-steps", type=str, default="", help="comma-separated ABSOLUTE step numbers at which to fire the CORE eval, in addition to --core-metric-every. Same purpose as --cute-at-steps for log-spaced CORE.")
 parser.add_argument("--log-step-offset", type=int, default=0, help="subtract this from the global step when logging ft_step to wandb. Set to the resumed seed step so finetune learning curves plot from ft_step=1 (needed for a sensible log-scale x-axis; the absolute step starts at the large seed value on resume).")
+parser.add_argument("--save-at-evals", action="store_true", help="also save a checkpoint at every in-training eval step (--cute-at-steps / --core-at-steps). Makes each learning-curve point reproducible after the fact (e.g. to re-eval or debug a specific point) without dense --save-every. Off by default.")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
@@ -687,7 +688,10 @@ while True:
     # immediately, even if a long CORE eval is scheduled at this same step.
     warmdown_start = num_iterations - round(args.warmdown_ratio * num_iterations)
     is_pre_warmdown = step == warmdown_start and step > 0 and step != num_iterations
-    if last_step or is_pre_warmdown or signal_save_requested or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
+    # Save at eval steps too, if requested, so every learning-curve point has a
+    # matching checkpoint (reproducible re-eval / debug of any point).
+    is_eval_step = args.save_at_evals and step != args.resume_from_step and (step in cute_at_steps or step in core_at_steps)
+    if last_step or is_pre_warmdown or signal_save_requested or is_eval_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
         save_checkpoint(
             checkpoint_dir,
             step,
