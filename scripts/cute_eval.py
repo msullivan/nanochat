@@ -60,7 +60,12 @@ def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problem
 
         if debug_n > 0 and i < debug_n and ddp_rank == 0:
             pred = extract_cute_answer(completion, prefilled=task_object.prefill)
+            prompt_text = conversation.get("prompt_text")
+            if prompt_text is None and "messages" in conversation:
+                # chat mode: reconstruct the user-turn text
+                prompt_text = conversation["messages"][0].get("content")
             print(f"\n[debug {task_object.subtask} #{i}] gold={conversation['answer']!r} pred={pred!r} ok={outcome}")
+            print(f"  prompt: {prompt_text!r}")
             print(f"  raw completion (first 120 chars): {completion[:120]!r}")
 
         print(f"\r\033[KRank {ddp_rank} | {task_object.subtask} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end="", flush=True)

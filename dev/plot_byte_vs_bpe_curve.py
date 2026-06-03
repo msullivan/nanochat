@@ -19,6 +19,8 @@ parser.add_argument("--csv", default="dev/curve_data.csv",
 parser.add_argument("--out", nargs="+", default=["byte_vs_bpe_curve.png", "byte_vs_bpe_curve.svg"],
                     help="output image path(s); format inferred from each extension "
                          "(default: byte_vs_bpe_curve.png + .svg in cwd)")
+parser.add_argument("--xscale", default="log", choices=["log", "linear"],
+                    help="x-axis (finetune tokens) scale (default: log)")
 args = parser.parse_args()
 
 CSV = args.csv
@@ -26,16 +28,19 @@ CSV = args.csv
 # size × model") so colors/markers/labels are consistent across CUTE figures:
 #   d24-byte-l-ext: dark blue  #08306b, triangle "^"  -> "d24-byte-l-ext"
 #   d24 (BPE stock): Wong orange #e69f00, diamond "D" -> "d24-bpe"
+# Blue ramp for byte variants (dark=more pretrained), Wong orange for BPE,
+# matching plot_cute_sweep.py. Plot order controls legend + z-order.
 MODEL_STYLE = {
-    "byte": dict(color="#08306b", marker="^", label="d24-byte-l-ext"),
-    "bpe":  dict(color="#e69f00", marker="D", label="d24-bpe"),
+    "byte":       dict(color="#08306b", marker="^", label="d24-byte-l-ext"),
+    "byte-early": dict(color="#6baed6", marker="o", label="d24-byte-l-early"),
+    "bpe":        dict(color="#e69f00", marker="D", label="d24-bpe"),
 }
 # Both curve runs used total_batch_size = 1,048,576 tokens/step (confirmed in
 # the training logs). x-axis is finetune tokens = ft_step * this. Equal token
-# budget for both; on this CUTE data BPE tokens are ~3.0x denser than bytes
-# (2.97 vs 1.00 chars/token, measured on 500 docs of shard 0 of
-# cute_pt_data_nodemos_300000), so at matched tokens the byte run saw ~3x
-# fewer underlying characters.
+# budget for both; on this CUTE data BPE tokens are ~3x denser than bytes
+# (2.9627 vs 1.0000 chars/token, measured over the full
+# cute_pt_data_nodemos_300000 corpus = 2.4M docs), so at matched tokens the
+# byte run saw ~3x fewer underlying characters.
 TOKENS_PER_STEP = 1_048_576
 
 # Layout: 2x5 grid filled row-major. The 8 subtasks fill the left 4 columns
@@ -86,14 +91,14 @@ slots[(1, SUMMARY_COL)] = ("core_metric", "CORE (in-train, 100/task)")
 mean_ax = None
 for (row, col), (metric, title) in slots.items():
     ax = fig.add_subplot(gs[row, col])
-    for model in ("byte", "bpe"):
+    for model in MODEL_STYLE:
         st = MODEL_STYLE[model]
         pts = data[model].get(metric, [])
         if not pts:
             continue
         xs, ys = zip(*pts)
         ax.plot(xs, ys, marker=st["marker"], color=st["color"], lw=2, ms=7, label=st["label"])
-    ax.set_xscale("log")
+    ax.set_xscale(args.xscale)
     ax.set_title(title, fontsize=12)
     ax.set_ylim(-0.05, 1.05)
     ax.grid(True, alpha=0.3)
@@ -108,7 +113,7 @@ for (row, col), (metric, title) in slots.items():
     is_left_edge = (col == 0) or is_summary
     is_bottom = (row == 1)
     if is_bottom:
-        ax.set_xlabel("finetune tokens (log)")
+        ax.set_xlabel(f"finetune tokens ({args.xscale})")
     else:
         ax.tick_params(labelbottom=False)
     if is_left_edge:
@@ -145,7 +150,7 @@ fig.add_artist(plt.Line2D([x_div, x_div], [y_bot, y_top],
 fig.suptitle(
     "Byte vs BPE — CUTE learning curves, matched recipe "
     "(50% mix of ClimbMix + synthetic CUTE, 300k words, LR 0.05, WD 0.28)\n"
-    "On this data BPE tokens are 3.0x denser than bytes.",
+    "On this data BPE tokens are ~3x denser than bytes.",
     fontsize=14, y=0.97)
 for path in args.out:
     plt.savefig(path, dpi=130, bbox_inches="tight")

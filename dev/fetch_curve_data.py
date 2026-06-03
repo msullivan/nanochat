@@ -13,8 +13,9 @@ import wandb
 
 PROJECT = "msullivan-emarhavil-heavy-industries/nanochat-cute-mix"
 RUNS = {
-    "bpe":  "d24-mix50-300000w-curve",
-    "byte": "d24-byte-l-ext-mix50-300000w-curve",
+    "bpe":        "d24-mix50-300000w-curve",
+    "byte":       "d24-byte-l-ext-mix50-300000w-curve",
+    "byte-early": "d24-byte-l-early-mix50-300000w-curve",
 }
 SUBTASKS = ["spell", "spell_inverse", "contains_char", "orth",
             "ins_char", "del_char", "sub_char", "swap_char"]
