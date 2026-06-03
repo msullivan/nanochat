@@ -1,9 +1,18 @@
+"""spell_inverse transient-dip figure: dense dip-probe run overlaid on the
+byte-l-early curve run. Pulls both from wandb live.
+  --outdir DIR   writes <DIR>/{png,svg}/dip_curve.* (default: /tmp)"""
+import os
 import csv, json
+import argparse
 import wandb
 import matplotlib.pyplot as plt
+from plotsave import save_fig
 
 ENT = "msullivan-emarhavil-heavy-industries/nanochat-cute-mix"
 TPS = 1_048_576
+_ap = argparse.ArgumentParser(description=__doc__)
+_ap.add_argument("--outdir", default="/tmp")
+OUTDIR = _ap.parse_args().outdir
 
 def pull(name, metrics):
     api = wandb.Api()
@@ -44,6 +53,4 @@ axes[0].legend(loc="upper left", fontsize=9)
 fig.suptitle("byte-l-early: spell_inverse transient dip, resolved by dense dip-probe\n"
              "(forward-spell's spaced-output reflex transiently contaminates inverse-spell; recovers by ~ft64)",
              fontsize=12)
-for out in ["/tmp/dip_curve.png", "/tmp/dip_curve.svg"]:
-    plt.savefig(out, dpi=130, bbox_inches="tight")
-    print("saved", out)
+save_fig(fig, OUTDIR, "dip_curve", dpi=130)

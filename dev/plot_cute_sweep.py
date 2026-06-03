@@ -19,6 +19,7 @@ import os
 import matplotlib.pyplot as plt
 import pandas as pd
 from matplotlib.ticker import NullFormatter, ScalarFormatter
+from plotsave import save_fig
 
 # Model order: most-pretrained byte -> least-pretrained byte -> BPE stock.
 # Palette is colorblind-friendly: a sequential blue ramp for the three byte
@@ -108,9 +109,7 @@ def main():
                loc="upper center", bbox_to_anchor=(0.5, 0.945),
                ncol=len(seen), frameon=True, fontsize=11)
     fig.tight_layout(rect=[0, 0, 1, 0.92])
-    per_subtask_path = os.path.join(args.outdir, f"{args.tag}_per_subtask.png")
-    plt.savefig(per_subtask_path, dpi=120, bbox_inches="tight")
-    print(f"saved {per_subtask_path}")
+    save_fig(fig, args.outdir, f"{args.tag}_per_subtask", dpi=120)
 
     # Figure 2: mean across char subtasks, one line per model.
     fig2, ax2 = plt.subplots(figsize=(8, 6), constrained_layout=True)
@@ -133,9 +132,7 @@ def main():
     ax2.xaxis.set_major_formatter(ScalarFormatter())
     ax2.xaxis.set_minor_formatter(NullFormatter())
     ax2.legend(loc="upper left")
-    mean_path = os.path.join(args.outdir, f"{args.tag}_mean.png")
-    plt.savefig(mean_path, dpi=120, bbox_inches="tight")
-    print(f"saved {mean_path}")
+    save_fig(fig2, args.outdir, f"{args.tag}_mean", dpi=120)
 
     print("\n=== mean per cell (char subtasks) ===")
     pivot = mean_by_cell.pivot(index="model", columns="size", values="accuracy")

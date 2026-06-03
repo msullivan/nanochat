@@ -1,8 +1,22 @@
-"""Compare d24-byte-l-ext at 30k CUTE words: cute_pt (sft-mask) vs cute_mix at three ratios."""
+"""Compare d24-byte-l-ext at 30k CUTE words: cute_pt (sft-mask) vs cute_mix at three ratios.
+
+  --input CSV   cute_pt results CSV (default: results_sft-mask.csv)
+  --outdir DIR  writes <DIR>/{png,svg}/mix_vs_cute_pt.* (default: /tmp)
+"""
+import os
 import csv
+import argparse
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
+from plotsave import save_fig
+
+_ap = argparse.ArgumentParser(description=__doc__)
+_ap.add_argument("--input", default="results_sft-mask.csv")
+_ap.add_argument("--outdir", default="/tmp")
+_args = _ap.parse_args()
+INPUT = _args.input
+OUTDIR = _args.outdir
 
 SUBTASKS = ["spell", "spell_inverse", "contains_char", "orth",
             "ins_char", "del_char", "sub_char", "swap_char"]
@@ -28,7 +42,7 @@ def read_30k_row(path, model):
                 out[r["subtask"]] = float(r["accuracy"])
     return out
 
-cute_pt = read_30k_row("results_sft-mask.csv", "d24-byte-l-ext")
+cute_pt = read_30k_row(INPUT, "d24-byte-l-ext")
 
 recipes = [("cute_pt (sft-mask)", cute_pt, None),
            ("mix10 (10% CUTE)", CUTE_MIX["mix10"], CORES["mix10"]),
@@ -55,5 +69,4 @@ ax.set_title(f"d24-byte-l-ext @ 30k CUTE words: cute_pt vs cute_mix\n(base d24-b
 ax.legend(loc="lower left", fontsize=9)
 ax.grid(axis="y", alpha=0.3)
 
-plt.savefig("/tmp/mix_vs_cute_pt.png", dpi=140)
-print("saved /tmp/mix_vs_cute_pt.png")
+save_fig(fig, OUTDIR, "mix_vs_cute_pt", dpi=140)

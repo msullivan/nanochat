@@ -10,49 +10,70 @@ which we map back to model identity per Sully's tip:
   - 23900 -> byte-l-ext   (byte, extended)
 """
 import os
+import argparse
 import matplotlib.pyplot as plt
 import pandas as pd
+from plotsave import save_fig
 
 
-# Step count -> (display label, color, marker). Same palette as cute plots.
-STEP_TO_MODEL = {
-    5500:  ("d24-byte-l-early", "#6baed6", "o"),
-    10374: ("d24-byte-l",       "#2171b5", "s"),
-    23900: ("d24-byte-l-ext",   "#08306b", "^"),
-    5568:  ("d24-bpe",          "#e69f00", "D"),
+# Model identity now comes from the base_eval/<tag>/ subdir name (the model
+# tag), not a step-number lookup -- new runs write per-model subdirs. This maps
+# the on-disk tag dir -> (display label, color, marker). Note the BPE base's
+# dir is literally "d24"; we relabel it "d24-bpe" for the plot. Same palette as
+# the cute plots. Tags not listed here are skipped (e.g. cute/mix checkpoints).
+TAG_TO_STYLE = {
+    "d24-byte-l-early": ("d24-byte-l-early", "#6baed6", "o"),
+    "d24-byte-l":       ("d24-byte-l",       "#2171b5", "s"),
+    "d24-byte-l-ext":   ("d24-byte-l-ext",   "#08306b", "^"),
+    "d24":              ("d24-bpe",          "#e69f00", "D"),
 }
 
 # Order in which to display models in plots
 MODEL_ORDER = ["d24-byte-l-ext", "d24-byte-l", "d24-byte-l-early", "d24-bpe"]
 
 
+def _read_csv(path):
+    df = pd.read_csv(path, skipinitialspace=True,
+                     names=["task", "accuracy", "centered"], header=0)
+    df["task"] = df["task"].str.strip()
+    return df
+
+
 def load_all(csv_dir="/tmp"):
-    """Read all base_model_*.csv files and return per-model task DataFrames."""
-    by_model = {}  # label -> DataFrame(task, accuracy, centered)
-    for fname in sorted(os.listdir(csv_dir)):
-        if not (fname.startswith("base_model_") and fname.endswith(".csv")):
+    """Read base_eval results into per-model task DataFrames.
+
+    Preferred layout: csv_dir/<tag>/base_model_*.csv (one subdir per model,
+    tag = base_eval directory name). Falls back to the legacy flat layout
+    csv_dir/base_model_<step>.csv via STEP fallback if no subdirs match.
+    """
+    by_model = {}  # display label -> DataFrame
+    for tag in sorted(os.listdir(csv_dir)):
+        tag_path = os.path.join(csv_dir, tag)
+        if not os.path.isdir(tag_path) or tag not in TAG_TO_STYLE:
             continue
-        step = int(fname[len("base_model_"):-len(".csv")])
-        if step not in STEP_TO_MODEL:
-            print(f"  skipping {fname}: unknown step {step}")
+        csvs = sorted(f for f in os.listdir(tag_path)
+                      if f.startswith("base_model_") and f.endswith(".csv"))
+        if not csvs:
             continue
-        label, _, _ = STEP_TO_MODEL[step]
-        df = pd.read_csv(
-            os.path.join(csv_dir, fname),
-            skipinitialspace=True,
-            names=["task", "accuracy", "centered"],
-            header=0,
-        )
-        # Clean whitespace
-        df["task"] = df["task"].str.strip()
-        by_model[label] = df
+        label, _, _ = TAG_TO_STYLE[tag]
+        # if multiple steps present, take the latest
+        by_model[label] = _read_csv(os.path.join(tag_path, csvs[-1]))
     return by_model
 
 
 def main():
-    by_model = load_all("/tmp")
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--indir", default="/tmp",
+                    help="dir containing per-model base_eval subdirs "
+                         "(<indir>/<tag>/base_model_*.csv) (default: /tmp)")
+    ap.add_argument("--outdir", default="/tmp",
+                    help="dir to write core_summary.png / core_per_task.png (default: /tmp)")
+    args = ap.parse_args()
+
+    by_model = load_all(args.indir)
     if not by_model:
-        raise RuntimeError("no CSVs found in /tmp/base_model_*.csv")
+        raise RuntimeError(f"no base_model_*.csv found in {args.indir}")
 
     print(f"loaded {len(by_model)} models: {sorted(by_model.keys())}")
 
@@ -65,10 +86,8 @@ def main():
     fig, ax = plt.subplots(figsize=(7, 4.5), constrained_layout=True)
     labels_ordered = [m for m in MODEL_ORDER if m in by_model]
     cores = [dict(core_rows)[m] for m in labels_ordered]
-    colors = [STEP_TO_MODEL[step][1] for step in STEP_TO_MODEL
-              for _ in [None] if STEP_TO_MODEL[step][0] in labels_ordered]
-    # Sort colors to match labels_ordered
-    label_to_color = {STEP_TO_MODEL[s][0]: STEP_TO_MODEL[s][1] for s in STEP_TO_MODEL}
+    # label -> color, keyed by display label (TAG_TO_STYLE value[0])
+    label_to_color = {lbl: color for (lbl, color, _) in TAG_TO_STYLE.values()}
     colors = [label_to_color[m] for m in labels_ordered]
     bars = ax.bar(labels_ordered, cores, color=colors)
     for bar, v in zip(bars, cores):
@@ -78,8 +97,7 @@ def main():
     ax.set_title("CORE: base-eval across the four d24 base models")
     ax.set_ylim(0, max(cores) * 1.12)
     ax.grid(axis="y", alpha=0.3)
-    fig.savefig("/tmp/core_summary.png", dpi=120, bbox_inches="tight")
-    print("saved /tmp/core_summary.png")
+    save_fig(fig, args.outdir, "core_summary", dpi=120)
     print("\n=== CORE scores ===")
     for label in labels_ordered:
         print(f"  {label:20} {dict(core_rows)[label]:.4f}")
@@ -108,8 +126,7 @@ def main():
     ax.axvline(0, color="gray", linewidth=0.7, alpha=0.7)
     ax.grid(axis="x", alpha=0.3)
     ax.legend(loc="lower right", framealpha=0.95)
-    fig.savefig("/tmp/core_per_task.png", dpi=120, bbox_inches="tight")
-    print("saved /tmp/core_per_task.png")
+    save_fig(fig, args.outdir, "core_per_task", dpi=120)
 
 
 if __name__ == "__main__":
