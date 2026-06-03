@@ -19,3 +19,7 @@ tea_debug.log
 dev/graphs/png/
 dev/graphs/svg/
 dev/graphs/coredata/
+
+# Claude Code runtime/session state (machine-local, not project content)
+.claude/scheduled_tasks.lock
+.claude/*.lock
