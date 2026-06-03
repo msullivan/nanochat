@@ -4,6 +4,81 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-06-03: Matched byte-vs-BPE CUTE learning curves + WSD/LR ablation + dip
+
+Follow-on to the 2026-05-28 mix work. All runs are 50% mix of ClimbMix +
+synthetic CUTE (no-demos), 300k words, resumed from the respective base
+checkpoint, single RTX 6000 on genai. Figures + reproducible pipeline live in
+`dev/` (`make -f dev/graphs.mk`); numbers pulled from wandb, not hand-typed.
+
+### Headline: matched byte-vs-BPE learning curves (mix50, 300k, LR0.05, WD0.28)
+Identical recipe, only the base model differs. x-axis = finetune tokens (log),
+in-training full-char CUTE @100 + CORE@100/task, log-spaced eval points.
+Spell-task 50%-crossing (tokens to learn to spell):
+
+| model            | spell→50% | CUTE-mean endpoint | CORE (flat throughout) |
+|------------------|-----------|--------------------|------------------------|
+| d24-byte-l-ext   | ~ft14     | ~0.96              | ~0.25 (base 0.253)     |
+| d24-byte-l-early | ~ft21     | ~0.96              | ~0.16 (base 0.169)     |
+| d24-bpe (d24)    | ~ft127    | ~0.67 @ ft458      | ~0.29 (base 0.260)     |
+
+**Findings:**
+- Byte learns the char tasks ~**7-10x faster (in tokens)** than BPE, despite
+  byte-tokens being ~3x denser (so byte sees ~3x FEWER underlying chars at
+  matched tokens). Byte advantage ≫ amount-of-byte-pretraining: early vs ext
+  differ only ~1.5x, both ~order-of-magnitude ahead of BPE.
+- **CORE stays flat for all three** across the whole finetune (each at its own
+  base floor) — mixing preserves capability regardless of how much CUTE is
+  learned. No forgetting at LR0.05.
+- contains_char is the one task BPE keeps pace early on (binary yes/no, no char
+  decomposition needed) — confirms the byte edge is specifically char-access.
+
+### WSD / high-LR ablation (LR0.8, SFT-style, vs the LR0.05 default)
+Tested whether a hot stable LR (0.8, matching chat_sft) + short warmdown beats
+the gentle 0.05 "barely nudge". It does NOT, for capability:
+- bpe @ LR0.8: CUTE saturates fast but CORE settles **0.216** (vs LR0.05 mix50-e4
+  0.276) — warmdown did not recover it.
+- byte @ LR0.8: CORE dips to ~0.10 early, partially recovers to **~0.16** (base
+  0.253) — byte is ~2x more LR-fragile than bpe. CUTE saturated throughout.
+- Conclusion: **flat low LR (0.05) is on a strictly better CORE/CUTE frontier.**
+  High-LR WSD buys speed at a real, bounded CORE cost; not worth it here. The
+  anneal-from-checkpoint idea is undercut because hot-phase checkpoints are all
+  CORE-eroded — run the stable phase cool, don't rely on annealing to repair it.
+
+### spell_inverse transient dip (byte-l-early)
+Dense dip-probe (checkpoints every ~2 steps via `SAVE_AT_EVALS=1`) caught it:
+spell_inverse rises to ~0.27 (ft16), **craters to ~0.01 at ft24-28**, recovers
+to 0.91 by ft64. `--debug-n` on the trough checkpoint: the model passes its
+spaced input straight through unjoined (`" t h e "` → `t h e`) instead of
+joining it (→ `the`) — i.e. forward-spell's "emit spaced letters" output reflex
+transiently contaminates inverse-spell during the forward-spell rise. Real
+task-interference transient, recovers on its own; minor (spell_inverse is easy
+= "delete the spaces"), not a knowledge-loss finding.
+
+### Compute accounting (all nanochat* wandb projects, `dev/wandb_compute.py`)
+~268 wall-clock h / ~274 GPU-h across 100 runs. ~248 GPU-h on genai's RTX 6000
+(the friend's box — single GPU; metadata mislabels it "RTX 3090" because the
+box has both a 3090 and a 6000 and device 0 enumerates first). Base pretraining
+dominates (the two big d24 byte bases = ~143h). Real multi-GPU work was on
+Runpod: d24-stock BPE base pretrain (8xH100, ~978K tok/s, 59% MFU, 2.79e19
+FLOPs / ~28 EFLOP) + two SFT jobs, all in the nanochat-sft project. NOTE: the
+logged `total_training_flops` is a resume-cumulative counter — do NOT sum it
+across finetunes (double-counts base pretraining); only `_runtime` sums.
+
+### Tooling added this session
+- `cute_mix.sh`: `LOG_EVALS` (log-spaced 1,2,4,…), `EXTRA_OFFSETS` (1.4x
+  infill), `SAVE_AT_EVALS` (checkpoint at every eval point), `CORE_MAX_PER_TASK`.
+- `base_train.py`: `--cute-every`/`--cute-subtasks char` (in-training mini-CUTE
+  + cute/mean), `--cute-at-steps`/`--core-at-steps`, `--log-step-offset` (ft_step
+  axis for log plots), `--save-at-evals`.
+- `dev/graphs.mk` + `dev/plotsave.py`: one command regenerates all 7 figures
+  (png+svg) from data. plot_core now reads model identity from base_eval/<tag>/
+  subdirs (the base_eval migration) instead of a step-number lookup.
+- dataset.py: dropped the silent FineWeb-EDU fallback (was masking a
+  missing-CUTE-dir bug as "training fine").
+
+---
+
 ## 2026-05-28: CUTE experiment inventory + mixed-data capability preservation
 
 **Why this entry exists**: the CUTE work started as a clean grid and drifted
