@@ -18,7 +18,8 @@ tea_debug.log
 # generated plot outputs (regenerate with: make -f dev/graphs.mk)
 dev/graphs/png/
 dev/graphs/svg/
-dev/graphs/coredata/
+# note: dev/graphs/coredata/ IS committed — base_eval input CSVs synced from
+# genai, kept in-repo so `make -f dev/graphs.mk core` rebuilds offline.
 
 # Claude Code runtime/session state (machine-local, not project content)
 .claude/scheduled_tasks.lock

@@ -44,9 +44,9 @@ sweep: | $(OUT)
 mix: | $(OUT)
 	$(PY) dev/plot_mix_vs_cute_pt.py --input $(SFTMASK) --outdir $(OUT)
 
-# 5. CORE base-eval. Mirror genai's base_eval/<tag>/ layout into
-# $(OUT)/coredata/<tag>/ so plot_core derives model identity from the subdir
-# name (not a step-number lookup). -r preserves the per-model dirs.
+# 5. CORE base-eval. Reads the committed input CSVs in $(OUT)/coredata/<tag>/
+# (so it rebuilds offline). To refresh those from genai: `make -f dev/graphs.mk
+# coredata` (mirrors genai's base_eval/<tag>/ layout; -r keeps per-model dirs).
 coredata:
 	mkdir -p $(OUT)/coredata
 	scp -qr $(GENAI):'~/.cache/nanochat/base_eval/d24-byte-l-early' $(OUT)/coredata/
@@ -54,7 +54,7 @@ coredata:
 	scp -qr $(GENAI):'~/.cache/nanochat/base_eval/d24-byte-l-ext'   $(OUT)/coredata/
 	scp -qr $(GENAI):'~/.cache/nanochat/base_eval/d24'              $(OUT)/coredata/
 
-core: coredata | $(OUT)
+core: | $(OUT)
 	$(PY) dev/plot_core.py --indir $(OUT)/coredata --outdir $(OUT)
 
 clean:
