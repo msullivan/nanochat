@@ -105,7 +105,7 @@ def place_eval_bundle(file_path):
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1, task_names=None):
+def evaluate_core(model, tokenizer, device, max_per_task=-1, task_names=None, debug_n=0):
     """
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
@@ -151,6 +151,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, task_names=None):
         start_time = time.time()
         label = task['label']
         task_meta = {
+            'label': label,
             'task_type': task['icl_task_type'],
             'dataset_uri': task['dataset_uri'],
             'num_fewshot': task['num_fewshot'][0],
@@ -168,7 +169,7 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1, task_names=None):
         if max_per_task > 0:
             data = data[:max_per_task]
 
-        accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
+        accuracy = evaluate_task(model, tokenizer, data, device, task_meta, debug_n=debug_n)
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
@@ -196,6 +197,7 @@ def main():
     parser.add_argument('--step', type=int, default=None, help='Model step to load (default = last)')
     parser.add_argument('--max-per-task', type=int, default=-1, help='Max examples per CORE task (-1 = all)')
     parser.add_argument('-a', '--task-name', type=str, action='append', default=None, help="CORE task label to run (repeat for multiple). Default = all tasks. Note: core_metric will be averaged only over the tasks that ran.")
+    parser.add_argument('--debug-n', type=int, default=0, help="Dump rendered prompt / per-option losses / gold-vs-pred continuation for the first N examples of each CORE task. Run single-process (no torchrun) for clean output.")
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
@@ -300,7 +302,7 @@ def main():
         print0("\n" + "="*80)
         print0("CORE Evaluation")
         print0("="*80)
-        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, task_names=args.task_name)
+        core_results = evaluate_core(model, tokenizer, device, max_per_task=args.max_per_task, task_names=args.task_name, debug_n=args.debug_n)
 
         # Write CSV output. Drop in a per-model-tag subdirectory so concurrent
         # runs of different models don't collide (and so the files are

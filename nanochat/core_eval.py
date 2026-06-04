@@ -165,8 +165,13 @@ def forward_model(model, input_ids):
 
 
 @torch.no_grad()
-def evaluate_example(idx, model, tokenizer, data, device, task_meta):
-    """Evaluate a single example, return True if correct, False otherwise"""
+def evaluate_example(idx, model, tokenizer, data, device, task_meta, debug=False):
+    """Evaluate a single example, return True if correct, False otherwise.
+
+    If debug=True, also print the rendered prompt(s), the per-option losses
+    (MC/schema) or the gold-vs-predicted continuation (language_modeling),
+    and the verdict. Mirrors cute_eval's --debug-n dump for CORE tasks.
+    """
     item = data[idx]
     task_type = task_meta['task_type']
     num_fewshot = task_meta['num_fewshot']
@@ -228,7 +233,7 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
         # predictions[i] predict input_ids[i+1] autoregressively
         predicted_tokens = predictions[0, si-1:ei-1]
         actual_tokens = input_ids[0, si:ei]
-        is_correct = torch.all(predicted_tokens == actual_tokens).item()
+        is_correct = bool(torch.all(predicted_tokens == actual_tokens).item())
     elif task_type in ['multiple_choice', 'schema']:
         # For MC/schema: find the option with lowest average loss
         mean_losses = [losses[i, si-1:ei-1].mean().item()
@@ -238,20 +243,43 @@ def evaluate_example(idx, model, tokenizer, data, device, task_meta):
     else:
         raise ValueError(f"Unsupported task type: {task_type}")
 
+    if debug:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"\n\033[K[debug {task_meta.get('label', task_type)} #{idx}] (rank {rank}) ok={is_correct}")
+        if task_type == 'language_modeling':
+            gold_ids = actual_tokens.tolist()
+            pred_ids = predicted_tokens.tolist()
+            print(f"  prompt:     {prompts[0]!r}")
+            print(f"  gold cont:  {tokenizer.decode(gold_ids)!r}  ids={gold_ids}")
+            print(f"  pred cont:  {tokenizer.decode(pred_ids)!r}  ids={pred_ids}")
+            # first divergence position (greedy LM is correct only on exact match)
+            div = next((j for j, (g, p) in enumerate(zip(gold_ids, pred_ids)) if g != p), None)
+            if div is not None:
+                print(f"  diverges at continuation token {div}: gold {gold_ids[div]} ({tokenizer.decode([gold_ids[div]])!r}) vs pred {pred_ids[div]} ({tokenizer.decode([pred_ids[div]])!r})")
+        else:
+            gold = item['gold']
+            for i, (lo, p) in enumerate(zip(mean_losses, prompts)):
+                marks = ("G" if i == gold else " ") + ("P" if i == pred_idx else " ")
+                print(f"  [{marks}] loss={lo:.4f}  {p!r}")
+            print(f"  gold={gold} pred={pred_idx}")
+
     return is_correct
 
 
-def evaluate_task(model, tokenizer, data, device, task_meta):
+def evaluate_task(model, tokenizer, data, device, task_meta, debug_n=0):
     """
     This function is responsible for evaluating one task across many examples.
     It also handles dispatch to all processes if the script is run with torchrun.
+
+    debug_n: dump the rendered prompt / losses / verdict for the first N
+    examples (by global index) -- see evaluate_example(debug=...).
     """
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     correct = torch.zeros(len(data), dtype=torch.float32, device=device)
     # stride the examples to each rank
     for idx in range(rank, len(data), world_size):
-        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta)
+        is_correct = evaluate_example(idx, model, tokenizer, data, device, task_meta, debug=(idx < debug_n))
         correct[idx] = float(is_correct)
     # sync results across all the processes if running distributed
     if world_size > 1:
