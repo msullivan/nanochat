@@ -225,7 +225,7 @@ def main():
         model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
         if isinstance(tokenizer, ByteTokenizer):
-            token_bytes = get_byte_token_bytes(device=device)
+            token_bytes = get_byte_token_bytes(device=device, legacy_vocab=tokenizer.legacy_vocab)
         else:
             token_bytes = get_token_bytes(device=device)
         model_name = f"base_model (step {meta['step']})"
