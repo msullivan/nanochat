@@ -76,7 +76,7 @@ class CUTE(Task):
         super().__init__(**kwargs)
         assert subtask in CUTE_SUBTASKS, f"Unknown CUTE subtask: {subtask}"
         assert mode in ("completion", "chat"), f"mode must be completion|chat, got {mode}"
-        assert prompt_style in ("fewshot", "zero"), f"prompt_style must be fewshot|zero, got {prompt_style}"
+        assert prompt_style in ("fewshot", "zero", "bare"), f"prompt_style must be fewshot|zero|bare, got {prompt_style}"
         self.subtask = subtask
         self.mode = mode
         self.prefill = prefill
@@ -93,13 +93,17 @@ class CUTE(Task):
     def get_example(self, index):
         row = self.ds[index]
         prompt = row["prompt"]
-        if self.prompt_style == "zero":
+        if self.prompt_style in ("zero", "bare"):
             # The 4-shot demo block is fixed per subtask. Strip it: keep only
             # `Question: ...` onward. Pair with gen_cute_pt_data --no-demos
             # so the training surface form matches.
             idx = prompt.find("Question:")
             if idx >= 0:
                 prompt = prompt[idx:]
+            if self.prompt_style == "bare":
+                # Also drop the "Question:" label itself -- a chat user wouldn't
+                # type it. Matches CuteChat's canonical phrasings (no label).
+                prompt = prompt[len("Question:"):].lstrip()
         prompt = prompt + (ANSWER_PREFILL if self.prefill else "")
         answer = row["answer"]
 

@@ -42,9 +42,10 @@ DEMO_WORDS = {"alphabet", "hello", "zebra", "tongue", "bold", "cold", "brave",
 
 # -----------------------------------------------------------------------------
 # Question phrasings. Two banks per subtask:
-#  - CANONICAL: the exact leukas/cute eval surface form (zero-shot "Question: ..."
-#    with the field quoted as " value "). Included verbatim a fraction of the time
-#    (CANONICAL_FRACTION) so the training surface OVERLAPS what we're graded on.
+#  - CANONICAL: the leukas/cute eval phrasing with the field quoted as " value ",
+#    but WITHOUT the benchmark's "Question:" label (a chat user wouldn't type it;
+#    the chat eval strips it too via prompt_style="bare"). Used verbatim a fraction
+#    of the time (CANONICAL_FRACTION) so training overlaps what we're graded on.
 #  - TEMPLATES: a few natural chat phrasings (with light _wrap quote jitter) for
 #    generalization. Field placeholders per subtask:
 #      spell {word} | spell_inverse {spaced} | contains_char {letter}{word}
@@ -52,14 +53,14 @@ DEMO_WORDS = {"alphabet", "hello", "zebra", "tongue", "bold", "cold", "brave",
 CANONICAL_FRACTION = 0.5
 
 CANONICAL = {
-    "spell":         'Question: Spell out the word " {word} ".',
-    "spell_inverse": 'Question: Write the word " {spaced} ".',
-    "contains_char": 'Question: Is there a " {letter} " in " {word} "?',
-    "orth":          'Question: Closer in Levenshtein distance to " {word} ": " {a} ", " {b} ".',
-    "ins_char":      'Question: Add an " {x} " after every " {y} " in " {word} ".',
-    "del_char":      'Question: Delete every instance of " {letter} " in " {word} ".',
-    "sub_char":      'Question: Substitute " {x} " with " {y} " in " {word} ".',
-    "swap_char":     'Question: Swap " {x} " and " {y} " in " {word} ".',
+    "spell":         'Spell out the word " {word} ".',
+    "spell_inverse": 'Write the word " {spaced} ".',
+    "contains_char": 'Is there a " {letter} " in " {word} "?',
+    "orth":          'Closer in Levenshtein distance to " {word} ": " {a} ", " {b} ".',
+    "ins_char":      'Add an " {x} " after every " {y} " in " {word} ".',
+    "del_char":      'Delete every instance of " {letter} " in " {word} ".',
+    "sub_char":      'Substitute " {x} " with " {y} " in " {word} ".',
+    "swap_char":     'Swap " {x} " and " {y} " in " {word} ".',
 }
 
 TEMPLATES = {

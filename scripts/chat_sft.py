@@ -605,7 +605,7 @@ while True:
     if do_cute:
         cute_results = {}
         for subtask in CUTE_CHAR_LEVEL:
-            task = CUTE(subtask=subtask, mode="chat", prefill=False, prompt_style="zero")
+            task = CUTE(subtask=subtask, mode="chat", prefill=False, prompt_style="bare")
             num_passed, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64,
                                                  max_problems=args.cute_max_problems)
             acc = num_passed / total if total > 0 else 0.0

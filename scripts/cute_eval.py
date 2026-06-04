@@ -95,7 +95,7 @@ def main():
     parser.add_argument("-x", "--max-problems", type=int, default=None, help="Max problems per subtask")
     parser.add_argument("--debug-n", type=int, default=0, help="Print raw completion + parse for the first N examples per subtask")
     parser.add_argument("--no-prefill", action="store_true", help='Do not append \\n\\nAnswer: " to the prompt; let the model emit the answer turn itself')
-    parser.add_argument("--prompt-style", type=str, default="fewshot", choices=["fewshot", "zero"], help="fewshot: use the published 4-shot CUTE prompt (default). zero: strip the demo block, keep only Question: onward. Pair with gen_cute_pt_data --no-demos so train and eval surface forms match.")
+    parser.add_argument("--prompt-style", type=str, default="fewshot", choices=["fewshot", "zero", "bare"], help="fewshot: published 4-shot CUTE prompt (default). zero: strip demos, keep 'Question: ...' onward (for completion/cute_pt models). bare: also drop the 'Question:' label (for chat models trained on CuteChat).")
     parser.add_argument("--device-type", type=str, default="", choices=["", "cuda", "cpu", "mps"])
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile(model, mode='reduce-overhead'). With compile on (default), "

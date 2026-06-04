@@ -127,6 +127,6 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.chat_sft -- 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.chat_eval -- -i sft -g "$OUTPUT_TAG"
 
 torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.cute_eval -- \
-    -i sft -g "$OUTPUT_TAG" --mode chat --no-prefill --prompt-style zero --subtasks char
+    -i sft -g "$OUTPUT_TAG" --mode chat --no-prefill --prompt-style bare --subtasks char
 
 echo "=== done. SFT checkpoint: chatsft_checkpoints/$OUTPUT_TAG"
