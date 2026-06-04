@@ -13,7 +13,7 @@ import torch.distributed as dist
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.tokenizer import get_tokenizer
-from nanochat.byte_tokenizer import ByteTokenizer
+from nanochat.byte_tokenizer import ByteTokenizer, VOCAB_SIZE
 from nanochat.common import setup_default_logging
 
 # Set up logging
@@ -169,7 +169,12 @@ def build_model(checkpoint_dir, step, device, phase):
         model.train()
     # Load the Tokenizer (byte tokenizer if the model was trained with it)
     if meta_data.get("byte_tokenizer", False):
-        tokenizer = ByteTokenizer()
+        # Old byte checkpoints have vocab_size=256 (pre-escape-drop). Load them
+        # in legacy mode so the new tokenizer impersonates the 256-wide space
+        # (BOS 256->0) -- the (256, D) weights then load unconverted.
+        model_vocab = model_config_kwargs["vocab_size"]
+        legacy_vocab = None if model_vocab >= VOCAB_SIZE else model_vocab
+        tokenizer = ByteTokenizer(legacy_vocab=legacy_vocab)
     else:
         tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer

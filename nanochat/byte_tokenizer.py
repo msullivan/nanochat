@@ -3,6 +3,18 @@ Byte-level tokenizer: vocab size 265 (= 256 raw bytes + 9 specials).
 
 Bytes 0x00..0xff occupy IDs 0..255 untouched. Specials get dedicated IDs
 above the byte range, so no escaping is needed on encode/decode.
+
+Legacy compatibility (legacy_vocab=256):
+    Old byte checkpoints were trained with a 256-wide vocab where BOS lived at
+    row 0 (and the other specials were 2-byte escape sequences that base models
+    never used). Such models only ever consume raw bytes + <|bos|>. Passing
+    legacy_vocab=256 makes this class *present* that old 256-wide ID space at
+    its boundaries: BOS is remapped 256 -> 0 (256 % 256 == 0), raw bytes are
+    identity, get_vocab_size()/get_bos_token_id() report the old values, and
+    decode/byte-counts use the old space. This lets an unmodified old (256, D)
+    checkpoint load and eval bit-for-bit -- no weight conversion needed. It is
+    base-model only: the chat specials (257..264) have no home in 256 and raise
+    if requested, so chat checkpoints must use the conversion script instead.
 """
 
 import copy
@@ -30,17 +42,36 @@ BOS = SPECIAL_TOKENS["<|bos|>"]
 
 class ByteTokenizer:
 
+    def __init__(self, legacy_vocab=None):
+        # legacy_vocab=256 -> impersonate the old 256-wide scheme (base only).
+        # None -> canonical 265/320 scheme.
+        assert legacy_vocab is None or legacy_vocab == 256, \
+            f"legacy_vocab must be None or 256, got {legacy_vocab}"
+        self.legacy_vocab = legacy_vocab
+
     def get_vocab_size(self):
-        return VOCAB_SIZE
+        return self.legacy_vocab if self.legacy_vocab is not None else VOCAB_SIZE
 
     def get_bos_token_id(self):
-        return BOS
+        # 256 % 256 == 0: old BOS lived at row 0.
+        return BOS % self.legacy_vocab if self.legacy_vocab is not None else BOS
 
     def get_special_tokens(self):
         return set(SPECIAL_TOKENS.keys())
 
     def encode_special(self, text):
-        return SPECIAL_TOKENS[text]
+        tid = SPECIAL_TOKENS[text]
+        if self.legacy_vocab is not None:
+            # Base models only ever use <|bos|>; the chat specials have no slot
+            # in the 256-wide vocab. Fail loud rather than silently mod a chat
+            # special down into a junk byte ID.
+            if text != "<|bos|>":
+                raise ValueError(
+                    f"legacy_vocab byte tokenizer supports only <|bos|> among specials, "
+                    f"got {text!r}. Legacy mode is base-model only; convert chat checkpoints."
+                )
+            return tid % self.legacy_vocab  # 256 -> 0
+        return tid
 
     def encode(self, text, prepend=None, append=None, num_threads=None):
         if isinstance(text, list):
@@ -59,6 +90,15 @@ class ByteTokenizer:
 
     def decode(self, ids):
         out = bytearray()
+        if self.legacy_vocab is not None:
+            # Old space: id 0 = BOS, ids 1..255 = raw bytes. (Literal NUL bytes
+            # never occur in base text, so the 0/BOS overlap is moot.)
+            for i in ids:
+                if i == 0:
+                    out.extend(b"<|bos|>")
+                elif i < 256:
+                    out.append(i)
+            return out.decode("utf-8", errors="replace")
         for i in ids:
             if i < 256:
                 out.append(i)
@@ -68,6 +108,10 @@ class ByteTokenizer:
         return out.decode("utf-8", errors="replace")
 
     def id_to_token(self, id):
+        if self.legacy_vocab is not None:
+            if id == 0:
+                return "<|bos|>"
+            return chr(id) if 32 <= id < 127 else f"<0x{id:02X}>"
         if id in ID_TO_SPECIAL:
             return ID_TO_SPECIAL[id]
         if id < 256:
@@ -75,6 +119,8 @@ class ByteTokenizer:
         return f"<id_{id}>"
 
     def render_conversation(self, conversation, max_tokens=2048):
+        assert self.legacy_vocab is None, \
+            "render_conversation needs the chat specials; legacy_vocab mode is base-model only"
         ids, mask = [], []
 
         def add(toks, m):
@@ -143,9 +189,17 @@ class ByteTokenizer:
         return cls()
 
 
-def get_byte_token_bytes(device="cpu"):
-    """Token byte counts for BPB calculation. 1 for raw-byte IDs (0..255),
-    0 for the special-token IDs above. Length matches vocab_size."""
+def get_byte_token_bytes(device="cpu", legacy_vocab=None):
+    """Token byte counts for BPB calculation. 1 for raw-byte IDs, 0 for
+    special-token IDs. Length matches the tokenizer's vocab size.
+
+    legacy_vocab=256 returns the old-space vector: id 0 = BOS (0 bytes),
+    ids 1..255 = 1 byte each.
+    """
+    if legacy_vocab is not None:
+        tb = torch.ones(legacy_vocab, dtype=torch.int32, device=device)
+        tb[0] = 0  # id 0 = BOS in the legacy scheme
+        return tb
     tb = torch.zeros(VOCAB_SIZE, dtype=torch.int32, device=device)
     tb[:256] = 1
     return tb
