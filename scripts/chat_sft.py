@@ -26,15 +26,16 @@ import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
 from nanochat.engine import Engine
 from scripts.chat_eval import run_chat_eval
+from scripts.cute_eval import run_cute_subtask
 
 from tasks.common import TaskMixture
 from tasks.gsm8k import GSM8K
 from tasks.mmlu import MMLU
 from tasks.smoltalk import SmolTalk
 from tasks.customjson import CustomJSON
-from tasks.spellingbee import SimpleSpelling, SpellingBee
+from tasks.spellingbee import SpellingBee
 from tasks.arithmetic import Addition, Multiplication
-from tasks.cute import CUTE_CHAR_LEVEL
+from tasks.cute import CUTE, CUTE_CHAR_LEVEL
 from tasks.cute_chat import CuteChat
 
 # -----------------------------------------------------------------------------
@@ -69,6 +70,8 @@ parser.add_argument("--eval-tokens", type=int, default=40*524288, help="number o
 parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
 parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
+parser.add_argument("--cute-every", type=int, default=200, help="evaluate CUTE char-level accuracy (chat mode, held-out leukas/cute) every N steps (-1 = disable). Logged separately as cute/* -- NOT folded into chatcore_metric.")
+parser.add_argument("--cute-max-problems", type=int, default=32, help="max problems per CUTE subtask in the in-training eval")
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
@@ -239,7 +242,7 @@ train_tasks = [
     *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
 
-    SimpleSpelling(size=1000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
+    # SimpleSpelling dropped -- superseded by CuteChat's 'spell' subtask below.
     SpellingBee(size=1000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
     Addition(size=1000, split="train"), # 150K rows of Addition (mostly 2-term, some 3/4/5-term)
     Multiplication(size=1000, split="train"), # 50K rows of Multiplication (small direct, larger by partial products)
@@ -553,12 +556,19 @@ while True:
         })
         model.train()
 
-    # once in a while: estimate the ChatCORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    chatcore_results = {}
-    if args.chatcore_every > 0 and step != args.resume_from_step and (last_step or (step > 0 and step % args.chatcore_every == 0)):
+    # once in a while: generative evals (all ranks participate). Use the original
+    # uncompiled model because the inputs keep changing shape. ChatCORE and CUTE
+    # share one Engine so the decode cudagraph is only captured once per eval.
+    def _eval_due(every):
+        return every > 0 and step != args.resume_from_step and (last_step or (step > 0 and step % every == 0))
+    do_chatcore = _eval_due(args.chatcore_every)
+    do_cute = _eval_due(args.cute_every)
+    if do_chatcore or do_cute:
         model.eval()
         engine = Engine(orig_model, tokenizer)
+
+    chatcore_results = {}
+    if do_chatcore:
         all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval', 'SpellingBee']
         categorical_tasks = {'ARC-Easy', 'ARC-Challenge', 'MMLU'}
         baseline_accuracies = {
@@ -586,6 +596,30 @@ while True:
             "chatcore_cat": chatcore_cat,
             **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
         })
+
+    # CUTE char-level accuracy on the held-out leukas/cute set, chat mode. Logged
+    # under cute/* and deliberately kept OUT of chatcore_metric (it would swamp
+    # the 6-task average and break comparability with the standard metric).
+    # Zero-shot and NO prefill: a chat-tuned model answers the user turn directly,
+    # so we don't carry the paper's 4-shot demos or jam `Answer: "` into the prompt.
+    if do_cute:
+        cute_results = {}
+        for subtask in CUTE_CHAR_LEVEL:
+            task = CUTE(subtask=subtask, mode="chat", prefill=False, prompt_style="zero")
+            num_passed, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64,
+                                                 max_problems=args.cute_max_problems)
+            acc = num_passed / total if total > 0 else 0.0
+            cute_results[subtask] = acc
+            print0(f"  CUTE/{subtask}: {100*acc:.2f}%")
+        cute_mean = sum(cute_results.values()) / len(cute_results)
+        print0(f"Step {step:05d} | CUTE mean (chat): {100*cute_mean:.2f}%")
+        wandb_run.log({
+            "step": step,
+            "cute/mean": cute_mean,
+            **{f"cute/{subtask}": acc for subtask, acc in cute_results.items()},
+        })
+
+    if do_chatcore or do_cute:
         model.train()
 
     if last_step:
