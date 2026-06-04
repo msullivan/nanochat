@@ -37,9 +37,9 @@ set -ex
 #   CUTE_SIZE         CuteChat examples per subtask in the SFT mix (default chat_sft's 2000)
 #   CUTE_EVERY        steps between in-training CUTE evals (default chat_sft's 200)
 #   CUTE_MAX_PROBLEMS problems per CUTE subtask in the eval (default chat_sft's 32)
-#   IDENTITY_FILE     path to byte identity .jsonl to use as identity_conversations.jsonl
-#                     (default: the generic S3 file, which describes BPE-nanochat -- WRONG
-#                     for this model; generate one with dev/gen_identity_data.py and pass it)
+#   IDENTITY_FILE     path to identity .jsonl (copied into identity_conversations.jsonl).
+#                     Default: the committed nanochat-byte identity. Falls back to the
+#                     generic S3 file (BPE-nanochat -- wrong here) only if neither exists.
 
 cd "$(dirname "$0")/.."
 
@@ -84,13 +84,16 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# 2. Identity data. chat_sft reads $NANOCHAT_BASE_DIR/identity_conversations.jsonl.
+# 2. Identity data. chat_sft reads $NANOCHAT_BASE_DIR/identity_conversations.jsonl,
+# so we copy the byte identity (committed in the repo) into that path. Default is
+# the generated nanochat-byte identity; override IDENTITY_FILE to use another.
 IDENTITY_DST="$NANOCHAT_BASE_DIR/identity_conversations.jsonl"
-if [ -n "$IDENTITY_FILE" ]; then
+IDENTITY_FILE="${IDENTITY_FILE:-$(pwd)/nanochat_byte_identity__google_gemini-3-flash-preview.jsonl}"
+if [ -f "$IDENTITY_FILE" ]; then
     echo "=== using identity data $IDENTITY_FILE"
     cp "$IDENTITY_FILE" "$IDENTITY_DST"
 elif [ ! -f "$IDENTITY_DST" ]; then
-    echo "!! WARNING: no IDENTITY_FILE given and no $IDENTITY_DST present."
+    echo "!! WARNING: IDENTITY_FILE $IDENTITY_FILE not found and no $IDENTITY_DST present."
     echo "!! Downloading the generic identity_conversations.jsonl -- it describes the"
     echo "!! BPE nanochat and is WRONG for the byte model. Generate a byte identity with"
     echo "!!   python dev/gen_identity_data.py --gateway-url ... --num 1000"
