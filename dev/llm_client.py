@@ -1,7 +1,10 @@
 """Chat completion client with swappable backends.
 
 Backends:
-- "gateway": Vercel AI Gateway (OpenAI-compatible). Requires AI_GATEWAY_API_KEY.
+- "gateway": any OpenAI-compatible chat-completions endpoint. Defaults to the
+             Vercel AI Gateway, but the URL is overridable via the AI_GATEWAY_URL
+             env var or a `base_url` argument, so it also targets local servers
+             (Open WebUI / llama.cpp / vLLM). Requires AI_GATEWAY_API_KEY.
 - "claude":  invokes the local `claude -p` CLI (Claude Code in headless mode).
              Uses whatever auth `claude` is already configured with.
 
@@ -29,7 +32,9 @@ try:
 except ImportError:
     pass
 
-AI_GATEWAY_URL = "https://ai-gateway.vercel.sh/v1/chat/completions"
+# Default OpenAI-compatible endpoint; override via AI_GATEWAY_URL env or a
+# base_url argument to point at a local server instead.
+AI_GATEWAY_URL = os.environ.get("AI_GATEWAY_URL", "https://ai-gateway.vercel.sh/v1/chat/completions")
 
 # Spawn `claude` from a directory with no CLAUDE.md / project memory so the
 # caller's system prompt is evaluated in isolation. Without this, project memory
@@ -48,6 +53,7 @@ def chat_completion(
     example_output=None,
     temperature=1.0,
     backend="gateway",
+    base_url=None,
 ):
     """Dispatch a chat completion to the chosen backend.
 
@@ -59,6 +65,9 @@ def chat_completion(
         example_output: claude-only. A JSON string shown to the model as a shape example.
         temperature: sampling temperature (gateway only; claude uses its own default).
         backend: "gateway" or "claude".
+        base_url: gateway-only. Override the endpoint URL (else AI_GATEWAY_URL env
+            or the Vercel default). Lets the gateway backend target a local
+            OpenAI-compatible server.
 
     Returns:
         {"choices": [{"message": {"content": <string>}}]}
@@ -69,6 +78,7 @@ def chat_completion(
             model=model,
             response_format=response_format,
             temperature=temperature,
+            base_url=base_url,
         )
     elif backend == "claude":
         return _claude_completion(
@@ -80,10 +90,11 @@ def chat_completion(
         raise ValueError(f"Unknown backend: {backend!r}")
 
 
-def _gateway_completion(messages, *, model, response_format=None, temperature=1.0):
+def _gateway_completion(messages, *, model, response_format=None, temperature=1.0, base_url=None, timeout=600):
     api_key = os.environ.get("AI_GATEWAY_API_KEY")
     if not api_key:
         raise RuntimeError("AI_GATEWAY_API_KEY not set (check .env or environment)")
+    url = base_url or AI_GATEWAY_URL
 
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -98,10 +109,18 @@ def _gateway_completion(messages, *, model, response_format=None, temperature=1.
     if response_format is not None:
         payload["response_format"] = response_format
 
-    response = requests.post(AI_GATEWAY_URL, headers=headers, json=payload)
-    result = response.json()
-    if "error" in result:
-        raise RuntimeError(f"AI Gateway error: {result['error']}")
+    # Generous timeout: a local server may cold-load / swap a model on first hit.
+    response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    try:
+        result = response.json()
+    except ValueError:
+        raise RuntimeError(
+            f"gateway: non-JSON response from {url} (HTTP {response.status_code}): {response.text[:200]!r}"
+        )
+    if isinstance(result, dict) and result.get("error"):
+        raise RuntimeError(f"gateway error: {result['error']}")
+    if "choices" not in result:
+        raise RuntimeError(f"gateway: unexpected response from {url}: {str(result)[:200]!r}")
     return result
 
 

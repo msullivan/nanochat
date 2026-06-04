@@ -286,6 +286,7 @@ response_format = {
 
 GATEWAY_MODEL = "google/gemini-3-flash-preview"
 CLAUDE_MODEL = "haiku"  # cheap + fast for bulk generation
+DEFAULT_MODELS = {"gateway": GATEWAY_MODEL, "claude": CLAUDE_MODEL}
 TEMPERATURE = 1.0
 
 # Shape example for the Claude backend (which doesn't enforce json_schema).
@@ -329,7 +330,7 @@ def sample_diversity_elements(rng):
     }
 
 
-def generate_conversation(idx: int, backend: str = "gateway", model: str = None, seed_offset: int = 0):
+def generate_conversation(idx: int, backend: str = "gateway", model: str = None, seed_offset: int = 0, base_url: str = None):
     """
     Generate a single conversation via the chosen backend.
     Returns a list of message dicts with 'role' and 'content' keys.
@@ -354,7 +355,7 @@ def generate_conversation(idx: int, backend: str = "gateway", model: str = None,
     ]
 
     if model is None:
-        model = GATEWAY_MODEL if backend == "gateway" else CLAUDE_MODEL
+        model = DEFAULT_MODELS[backend]
     result = chat_completion(
         messages,
         model=model,
@@ -362,6 +363,7 @@ def generate_conversation(idx: int, backend: str = "gateway", model: str = None,
         example_output=EXAMPLE_OUTPUT,
         temperature=TEMPERATURE,
         backend=backend,
+        base_url=base_url,
     )
 
     content = result['choices'][0]['message']['content']
@@ -409,11 +411,16 @@ if __name__ == "__main__":
     parser.add_argument("--append", action="store_true", help="Append to existing file instead of overwriting")
     parser.add_argument("--save-metadata", action="store_true", help="Save metadata alongside messages")
     parser.add_argument("--backend", choices=["gateway", "claude"], default="gateway",
-                        help="'gateway' = Vercel AI Gateway; 'claude' = local `claude -p` CLI")
+                        help="'gateway' = any OpenAI-compatible endpoint (see --gateway-url); "
+                             "'claude' = local `claude -p` CLI")
     parser.add_argument("--model", type=str, default=None,
                         help=f"Model id. Defaults: gateway={GATEWAY_MODEL!r}, claude={CLAUDE_MODEL!r}. "
-                             "Examples: 'openai/gpt-5-mini', 'anthropic/claude-haiku-4.5', "
-                             "'google/gemini-3-flash-preview' (gateway); 'sonnet', 'haiku' (claude).")
+                             "Examples: 'openai/gpt-5-mini' (Vercel gateway); 'sonnet'/'haiku' (claude); "
+                             "'unsloth/gemma-4-31B-it-GGUF:Q6_K' (a local server via --gateway-url).")
+    parser.add_argument("--gateway-url", type=str, default=None,
+                        help="Override the gateway endpoint URL (else AI_GATEWAY_URL env, else the Vercel "
+                             "default). Point at a local OpenAI-compatible server, e.g. "
+                             "https://red.msully.net/api/chat/completions. Set AI_GATEWAY_API_KEY to its key.")
     parser.add_argument("--seed-offset", type=int, default=0,
                         help="Added to idx when seeding the RNG. Use distinct offsets (e.g. 0, 500, 1000) "
                              "across runs so their topic/persona samples don't overlap.")
@@ -434,7 +441,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # Set output file
-    effective_model = args.model or (GATEWAY_MODEL if args.backend == "gateway" else CLAUDE_MODEL)
+    effective_model = args.model or DEFAULT_MODELS[args.backend]
     if args.output:
         output_file = args.output
     else:
@@ -458,7 +465,7 @@ if __name__ == "__main__":
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         # Submit all tasks
-        futures = {executor.submit(generate_conversation, idx, args.backend, args.model, args.seed_offset): idx
+        futures = {executor.submit(generate_conversation, idx, args.backend, args.model, args.seed_offset, args.gateway_url): idx
                    for idx in range(args.num)}
 
         # Process results as they complete
