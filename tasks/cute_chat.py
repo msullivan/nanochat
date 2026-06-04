@@ -41,91 +41,77 @@ DEMO_WORDS = {"alphabet", "hello", "zebra", "tongue", "bold", "cold", "brave",
               "the", "and", "cat", "dog"}
 
 # -----------------------------------------------------------------------------
-# Question template banks -- ONE mixed bank per subtask. This is the knob for
-# experimenting with how questions are phrased: just edit/add entries. Field
-# placeholders per subtask:
-#   spell:          {word}
-#   spell_inverse:  {spaced}              (space-separated letters; answer=word)
-#   contains_char:  {letter} {word}
-#   orth:           {word} {a} {b}        (a,b candidates in randomized order)
-#   ins_char:       {x} {y} {word}        (insert x after every y)
-#   del_char:       {letter} {word}
-#   sub_char:       {x} {y} {word}        (replace every x with y)
-#   swap_char:      {x} {y} {word}
+# Question phrasings. Two banks per subtask:
+#  - CANONICAL: the exact leukas/cute eval surface form (zero-shot "Question: ..."
+#    with the field quoted as " value "). Included verbatim a fraction of the time
+#    (CANONICAL_FRACTION) so the training surface OVERLAPS what we're graded on.
+#  - TEMPLATES: a few natural chat phrasings (with light _wrap quote jitter) for
+#    generalization. Field placeholders per subtask:
+#      spell {word} | spell_inverse {spaced} | contains_char {letter}{word}
+#      orth {word}{a}{b} | ins_char/sub_char/swap_char {x}{y}{word} | del_char {letter}{word}
+CANONICAL_FRACTION = 0.5
+
+CANONICAL = {
+    "spell":         'Question: Spell out the word " {word} ".',
+    "spell_inverse": 'Question: Write the word " {spaced} ".',
+    "contains_char": 'Question: Is there a " {letter} " in " {word} "?',
+    "orth":          'Question: Closer in Levenshtein distance to " {word} ": " {a} ", " {b} ".',
+    "ins_char":      'Question: Add an " {x} " after every " {y} " in " {word} ".',
+    "del_char":      'Question: Delete every instance of " {letter} " in " {word} ".',
+    "sub_char":      'Question: Substitute " {x} " with " {y} " in " {word} ".',
+    "swap_char":     'Question: Swap " {x} " and " {y} " in " {word} ".',
+}
+
 TEMPLATES = {
     "spell": [
-        "Spell out the word {word}",
+        "Spell out {word}",
         "How do you spell {word}",
         "Spell {word} letter by letter",
-        "Write {word} one letter at a time",
-        "Give me the letters of {word}",
         "What are the letters in {word}",
-        "Spell {word} out with spaces between the letters",
-        "Break {word} into individual letters",
-        "List the letters of {word} in order",
         "Spell the word {word}",
     ],
     "spell_inverse": [
         "What word is spelled by {spaced}",
         "Combine these letters into a word: {spaced}",
-        "Read this spelled-out word: {spaced}",
         "{spaced} spells what word",
-        "Join these letters into a single word: {spaced}",
-        "Which word do the letters {spaced} make",
         "Unspell {spaced}",
-        "Write {spaced} as one word with no spaces",
         "What word is this: {spaced}",
     ],
     "contains_char": [
         "Is there a {letter} in {word}",
         "Does {word} contain the letter {letter}",
         "Is {letter} in {word}",
-        "Does the word {word} have a {letter} in it",
-        "Can you find a {letter} in {word}",
-        "Is the letter {letter} present in {word}",
         "Does {word} include {letter}",
-        "Tell me whether {word} contains {letter}",
-        "Is there any {letter} in the word {word}",
+        "Is the letter {letter} present in {word}",
     ],
     "orth": [
         "Which is closer to {word}: {a} or {b}",
         "Between {a} and {b}, which is more similar to {word}",
         "Which of {a} or {b} is a smaller edit from {word}",
-        "Which word is more like {word}, {a} or {b}",
         "Closer in spelling to {word}: {a} or {b}",
-        "Which one is nearer to {word} by edit distance, {a} or {b}",
-        "{a} or {b} -- which more closely resembles {word}",
     ],
     "ins_char": [
         "Add a {x} after every {y} in {word}",
         "Insert {x} following each {y} in {word}",
         "Put a {x} after each {y} in {word}",
-        "In {word}, place a {x} after every {y}",
-        "Append {x} after every occurrence of {y} in {word}",
         "After each {y} in {word}, add a {x}",
     ],
     "del_char": [
         "Delete every {letter} from {word}",
         "Remove all the {letter} in {word}",
         "Take out every {letter} in {word}",
-        "Drop all {letter} from {word}",
-        "Erase every {letter} in {word}",
         "What is {word} with all the {letter} removed",
-        "Strip the {letter} out of {word}",
     ],
     "sub_char": [
         "Replace every {x} with {y} in {word}",
-        "Substitute {y} for every {x} in {word}",
         "Change all {x} to {y} in {word}",
-        "Swap out every {x} for a {y} in {word}",
+        "Substitute {y} for every {x} in {word}",
         "In {word}, turn every {x} into a {y}",
-        "Replace each {x} in {word} with {y}",
     ],
     "swap_char": [
         "Swap every {x} and {y} in {word}",
         "Exchange the {x} and {y} in {word}",
         "In {word}, switch every {x} with {y} and vice versa",
-        "Trade every {x} for {y} and every {y} for {x} in {word}",
         "Swap the letters {x} and {y} throughout {word}",
     ],
 }
@@ -264,8 +250,8 @@ def _excluded_words():
 
 
 def _wrap(s, rng):
-    """Randomly quote a value (none / ' / ") for surface-form variety."""
-    q = rng.choice(["", "'", '"'])
+    """Randomly quote a value (none / ") for light surface-form variety."""
+    q = rng.choice(["", '"'])
     return f"{q}{s}{q}"
 
 
@@ -303,14 +289,19 @@ class CuteChat(Task):
         assert result is not None, f"could not build a {self.subtask} example"
         fields, answer = result
 
-        # Phrase the question: pick a template, wrap values, jitter case/punct.
-        template = rng.choice(TEMPLATES[self.subtask])
-        if rng.random() < 0.3:
-            template = template.lower()
-        wrapped = {k: _wrap(v, rng) for k, v in fields.items()}
-        user_msg = template.format(**wrapped)
-        if rng.random() < 0.5:
-            user_msg += "?"
+        # Phrase the question. CANONICAL_FRACTION of the time use the exact CUTE
+        # eval surface form verbatim (so train overlaps the benchmark); otherwise
+        # a natural chat phrasing with light quote/case/punct jitter.
+        if rng.random() < CANONICAL_FRACTION:
+            user_msg = CANONICAL[self.subtask].format(**fields)
+        else:
+            template = rng.choice(TEMPLATES[self.subtask])
+            if rng.random() < 0.3:
+                template = template.lower()
+            wrapped = {k: _wrap(v, rng) for k, v in fields.items()}
+            user_msg = template.format(**wrapped)
+            if rng.random() < 0.5:
+                user_msg += "?"
 
         # Terse assistant turn: the quoted answer in CUTE surface form.
         assistant_msg = f'"{answer}"'
