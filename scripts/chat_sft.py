@@ -75,7 +75,7 @@ parser.add_argument("--cute-max-problems", type=int, default=32, help="max probl
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
-parser.add_argument("--cute-size", type=int, default=2000, help="examples per CUTE char-level subtask in the mixture (x8 subtasks). Synthetic chat-style char ops; eval words excluded. 0 disables.")
+parser.add_argument("--cute-size", type=int, default=4000, help="examples per CUTE char-level subtask in the mixture (x8 subtasks). Synthetic chat-style char ops; eval words excluded. 0 disables.")
 # Save / resume (mirrors base_train.py's pattern)
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 parser.add_argument("--resume-from-step", type=str, default="-1", help="resume SFT from this step (-1 = disable, 'latest' = highest step in resume dir)")
@@ -243,9 +243,9 @@ train_tasks = [
     *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
 
     # SimpleSpelling dropped -- superseded by CuteChat's 'spell' subtask below.
-    SpellingBee(size=1000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
-    Addition(size=1000, split="train"), # 150K rows of Addition (mostly 2-term, some 3/4/5-term)
-    Multiplication(size=1000, split="train"), # 50K rows of Multiplication (small direct, larger by partial products)
+    SpellingBee(size=5000, split="train"), # 5K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    Addition(size=10000, split="train"), # 10K rows of Addition (mostly 2-term, some 3/4/5-term)
+    Multiplication(size=10000, split="train"), # 10K rows of Multiplication (small direct, larger by partial products)
 
     # Chat-style CUTE char-level tasks (synthetic; eval words excluded). One per
     # subtask so each can be sized/weighted independently. Terse quoted answers,
