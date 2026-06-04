@@ -38,8 +38,8 @@ set -ex
 #   CUTE_EVERY        steps between in-training CUTE evals (default chat_sft's 200)
 #   CUTE_MAX_PROBLEMS problems per CUTE subtask in the eval (default chat_sft's 32)
 #   IDENTITY_FILE     path to identity .jsonl (copied into identity_conversations.jsonl).
-#                     Default: the committed nanochat-byte identity. Falls back to the
-#                     generic S3 file (BPE-nanochat -- wrong here) only if neither exists.
+#                     Default: the committed nanochat-byte identity. Errors out if the
+#                     file is missing (no silent fallback).
 
 cd "$(dirname "$0")/.."
 
@@ -89,18 +89,13 @@ fi
 # the generated nanochat-byte identity; override IDENTITY_FILE to use another.
 IDENTITY_DST="$NANOCHAT_BASE_DIR/identity_conversations.jsonl"
 IDENTITY_FILE="${IDENTITY_FILE:-$(pwd)/nanochat_byte_identity__google_gemini-3-flash-preview.jsonl}"
-if [ -f "$IDENTITY_FILE" ]; then
-    echo "=== using identity data $IDENTITY_FILE"
-    cp "$IDENTITY_FILE" "$IDENTITY_DST"
-elif [ ! -f "$IDENTITY_DST" ]; then
-    echo "!! WARNING: IDENTITY_FILE $IDENTITY_FILE not found and no $IDENTITY_DST present."
-    echo "!! Downloading the generic identity_conversations.jsonl -- it describes the"
-    echo "!! BPE nanochat and is WRONG for the byte model. Generate a byte identity with"
-    echo "!!   python dev/gen_identity_data.py --gateway-url ... --num 1000"
-    echo "!! and re-run with IDENTITY_FILE=<that file>."
-    curl -L -o "$IDENTITY_DST" \
-        https://karpathy-public.s3.us-west-2.amazonaws.com/identity_conversations.jsonl
+if [ ! -f "$IDENTITY_FILE" ]; then
+    echo "ERROR: identity file not found: $IDENTITY_FILE" >&2
+    echo "       Generate one with dev/gen_identity_data.py and pass IDENTITY_FILE=<path>." >&2
+    exit 1
 fi
+echo "=== using identity data $IDENTITY_FILE"
+cp "$IDENTITY_FILE" "$IDENTITY_DST"
 
 # -----------------------------------------------------------------------------
 # 3. Optional passthrough flags
