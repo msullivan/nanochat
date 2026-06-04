@@ -65,13 +65,13 @@ parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of it
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
 # Evaluation
-parser.add_argument("--eval-every", type=int, default=200, help="evaluate val bpb every N steps (-1 = disable)")
+parser.add_argument("--eval-every", type=int, default=100, help="evaluate val bpb every N steps (-1 = disable)")
 parser.add_argument("--eval-tokens", type=int, default=2*524288, help="number of tokens to evaluate val loss on (2*524288 = 1.05M, matching the cute_* finetune runs)")
-parser.add_argument("--chatcore-every", type=int, default=200, help="evaluate ChatCORE metric every N steps (-1 = disable)")
+parser.add_argument("--chatcore-every", type=int, default=100, help="evaluate ChatCORE metric every N steps (-1 = disable)")
 parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max problems per categorical task for ChatCORE")
 parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
-parser.add_argument("--cute-every", type=int, default=200, help="evaluate CUTE char-level accuracy (chat mode, held-out leukas/cute) every N steps (-1 = disable). Logged separately as cute/* -- NOT folded into chatcore_metric.")
-parser.add_argument("--cute-max-problems", type=int, default=32, help="max problems per CUTE subtask in the in-training eval")
+parser.add_argument("--cute-every", type=int, default=100, help="evaluate CUTE char-level accuracy (chat mode, held-out leukas/cute) every N steps (-1 = disable). Logged separately as cute/* -- NOT folded into chatcore_metric.")
+parser.add_argument("--cute-max-problems", type=int, default=100, help="max problems per CUTE subtask in the in-training eval")
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
