@@ -34,6 +34,8 @@ set -ex
 #   MAX_SEQ_LEN       cap context (default: inherit pretrain 8192; try 2048-4096 if OOM)
 #   NUM_ITERATIONS    steps (default -1 = one full epoch over the mixture)
 #   LOAD_OPTIMIZER    warm-start optim from the converted base (default 1; set 0 for multi-GPU)
+#   SAVE_EVERY        save a checkpoint every N steps (default 100 = the eval
+#                     cadence, so every measured step is branchable for anneal).
 #   CUTE_SIZE         CuteChat examples per subtask in the SFT mix (default chat_sft's 2000)
 #   CUTE_EVERY        steps between in-training CUTE evals (default chat_sft's 200)
 #   CUTE_MAX_PROBLEMS problems per CUTE subtask in the eval (default chat_sft's 32)
@@ -55,6 +57,9 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
 NUM_ITERATIONS="${NUM_ITERATIONS:--1}"
 LOAD_OPTIMIZER="${LOAD_OPTIMIZER:-1}"
+# Save a checkpoint at every eval step (cadence matches eval-every/cute-every=100)
+# so every measured point is branchable -- anneal/resume from any evaluated step.
+SAVE_EVERY="${SAVE_EVERY:-100}"
 export NANOCHAT_REPORT_TAG="$OUTPUT_TAG"
 
 source .venv/bin/activate
@@ -118,6 +123,7 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.chat_sft -- 
     --output-tag="$OUTPUT_TAG" \
     --device-batch-size="$DEVICE_BATCH_SIZE" \
     --load-optimizer="$LOAD_OPTIMIZER" \
+    --save-every="$SAVE_EVERY" \
     "${SFT_ARGS[@]}" \
     --run="$WANDB_RUN"
 
