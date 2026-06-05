@@ -76,10 +76,12 @@ parser.add_argument("--cute-max-problems", type=int, default=100, help="max prob
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
 parser.add_argument("--cute-size", type=int, default=4000, help="examples per CUTE char-level subtask in the mixture (x8 subtasks). Synthetic chat-style char ops; eval words excluded. 0 disables.")
+parser.add_argument("--cute-fraction", type=float, default=None, help="if set (0,1), auto-size CuteChat so CUTE is this fraction of the whole mixture (overrides --cute-size). Used for the anneal phase, e.g. 0.5.")
 # Save / resume (mirrors base_train.py's pattern)
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 parser.add_argument("--resume-from-step", type=str, default="-1", help="resume SFT from this step (-1 = disable, 'latest' = highest step in resume dir)")
 parser.add_argument("--resume-from-tag", type=str, default=None, help="SFT tag to resume from (default: same as --output-tag); use this to resume one run into a fresh output dir")
+parser.add_argument("--anneal", action="store_true", help="anneal/consolidation phase: load WEIGHTS (and optim momentum) from the --resume-from-* checkpoint but start a FRESH LR schedule + dataloader at step 0 (instead of continuing). Lets you re-warm the LR and anneal back down on a CUTE-heavy mix. Pair with --cute-fraction, a short --num-iterations, a modest --init-lr-frac, --warmdown-ratio=1.0, --final-lr-frac=0.")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -116,6 +118,12 @@ if not HAS_FA3:
 # architecture and tokenizer; if resuming, we then overwrite the model weights
 # (and optimizer + loop state below) with the in-progress SFT checkpoint.
 resuming = args.resume_from_step != "-1"
+# Anneal mode reuses the resume path to load WEIGHTS+optim from an SFT checkpoint,
+# but starts a FRESH schedule (step 0, fresh dataloader) so we can re-warm the LR
+# and anneal down on a CUTE-heavy mix. Loop/dataloader state is NOT restored.
+if args.anneal:
+    assert resuming, "--anneal requires --resume-from-step (and usually --resume-from-tag) to load weights from"
+restore_loop_state = resuming and not args.anneal
 
 # Load the model and tokenizer (from base; SFT weights applied later if resuming)
 model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
@@ -231,7 +239,7 @@ qamis_files = [
 ]
 qamis_filepaths = [os.path.join(repo_root, f) for f in qamis_files]
 pep827_filepath = os.path.join(repo_root, "pep827_conversations.jsonl")  # 952 rows
-train_tasks = [
+non_cute_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
     CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
     CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
@@ -246,19 +254,27 @@ train_tasks = [
     SpellingBee(size=5000, split="train"), # 5K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
     Addition(size=10000, split="train"), # 10K rows of Addition (mostly 2-term, some 3/4/5-term)
     Multiplication(size=10000, split="train"), # 10K rows of Multiplication (small direct, larger by partial products)
-
-    # Chat-style CUTE char-level tasks (synthetic; eval words excluded). One per
-    # subtask so each can be sized/weighted independently. Terse quoted answers,
-    # mixed phrasing bank (edit tasks/cute_chat.TEMPLATES to vary phrasing).
-    *([CuteChat(subtask=st, size=args.cute_size, split="train") for st in CUTE_CHAR_LEVEL] if args.cute_size > 0 else []),
-
-    # SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
-    # SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
-    # Addition(size=150000, split="train"), # 150K rows of Addition (mostly 2-term, some 3/4/5-term)
-    # Multiplication(size=50000, split="train"), # 50K rows of Multiplication (small direct, larger by partial products)
 ]
+
+# Chat-style CUTE char-level tasks (synthetic; eval words excluded). One per
+# subtask so each can be sized/weighted independently. Terse quoted answers,
+# mixed phrasing bank (edit tasks/cute_chat.TEMPLATES). Size is either a fixed
+# per-subtask --cute-size, or auto-computed from --cute-fraction to make CUTE
+# that fraction of the whole mixture (the anneal phase uses ~0.5).
+if args.cute_fraction is not None:
+    assert 0.0 < args.cute_fraction < 1.0, "--cute-fraction must be in (0, 1)"
+    general_len = sum(len(t) for t in non_cute_tasks)
+    cute_total = round(general_len * args.cute_fraction / (1.0 - args.cute_fraction))
+    cute_per_subtask = max(1, cute_total // len(CUTE_CHAR_LEVEL))
+    print0(f"--cute-fraction={args.cute_fraction}: general={general_len:,} rows -> CuteChat {cute_per_subtask:,}/subtask x{len(CUTE_CHAR_LEVEL)} = {cute_per_subtask*len(CUTE_CHAR_LEVEL):,} CUTE rows")
+else:
+    cute_per_subtask = args.cute_size
+cute_tasks = ([CuteChat(subtask=st, size=cute_per_subtask, split="train") for st in CUTE_CHAR_LEVEL]
+              if cute_per_subtask > 0 else [])
+
+train_tasks = non_cute_tasks + cute_tasks
 train_dataset = TaskMixture(train_tasks)
-print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
+print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs}, CUTE {cute_per_subtask*len(CUTE_CHAR_LEVEL) if cute_tasks else 0:,})")
 val_dataset = TaskMixture([
     SmolTalk(split="test"), # 24K rows in test set
     MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
@@ -406,9 +422,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
 
         yield inputs, targets
 
-# Restore dataloader state if resuming. Captured snapshot from the saved meta;
-# the generator reads these on its first iteration.
-if resuming and sft_meta_data is not None:
+# Restore dataloader state if resuming (but NOT when annealing -- fresh schedule).
+# Captured snapshot from the saved meta; the generator reads these on its first iteration.
+if restore_loop_state and sft_meta_data is not None:
     saved_dl = sft_meta_data.get("dataloader_state", None)
     if saved_dl is not None:
         dataloader_state.update(saved_dl)
@@ -441,7 +457,7 @@ def get_muon_momentum(it):
 x, y = next(train_loader) # prefetch the very first batch of data
 ema_beta = 0.9 # EMA decay factor
 val_bpb = None
-if resuming and sft_meta_data is not None:
+if restore_loop_state and sft_meta_data is not None:
     step = sft_meta_data["step"]
     val_bpb = sft_meta_data.get("val_bpb")
     loop_state = sft_meta_data.get("loop_state", {})
