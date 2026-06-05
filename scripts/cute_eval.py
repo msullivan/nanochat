@@ -18,10 +18,11 @@ Examples:
 """
 
 import argparse
+import os
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type, get_base_dir
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -130,6 +131,27 @@ def main():
     print0(f"CUTE eval | source={args.source} | mode={args.mode} | model={args.model_tag or 'default'} step={meta.get('step', '?')}")
     print0(f"Subtasks: {subtasks}")
 
+    # CSV output (rank 0), rewritten after EACH subtask so it's monitorable
+    # mid-run. Lands under cute_eval/<tag>/, mirroring base_eval's layout.
+    csv_path = None
+    if ddp_rank == 0:
+        tag_dir = args.model_tag or "default"
+        step = meta.get("step", "unknown")
+        csv_dir = os.path.join(get_base_dir(), "cute_eval", tag_dir)
+        os.makedirs(csv_dir, exist_ok=True)
+        csv_path = os.path.join(csv_dir, f"{args.source}_{args.mode}_{args.prompt_style}_{step}.csv")
+        print0(f"Writing CSV to {csv_path}")
+
+    def write_csv(results, mean=None):
+        if csv_path is None:
+            return
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            f.write(f"{'subtask':<20}, {'accuracy':<10}\n")
+            for st, a in results.items():
+                f.write(f"{st:<20}, {a:<10.6f}\n")
+            if mean is not None:
+                f.write(f"{'mean':<20}, {mean:<10.6f}\n")
+
     results = {}
     for subtask in subtasks:
         task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill, prompt_style=args.prompt_style)
@@ -138,6 +160,7 @@ def main():
         acc = num_passed / total if total > 0 else 0.0
         results[subtask] = acc
         print0(f"{subtask}: {num_passed}/{total} ({100*acc:.2f}%)")
+        write_csv(results)  # incremental: update after each subtask
 
     print0("=" * 60)
     print0(f"{'subtask':<20} {'accuracy':>10}")
@@ -147,6 +170,7 @@ def main():
     avg = sum(results.values()) / len(results)
     print0("-" * 60)
     print0(f"{'mean':<20} {100*avg:>9.2f}%")
+    write_csv(results, mean=avg)  # final: include the mean row
 
     from nanochat.report import get_report
     get_report().log(section=f"CUTE eval {args.source} {args.mode}", data=[
