@@ -29,7 +29,9 @@ set -ex
 #                  general, too low won't consolidate CUTE).
 #   WARMUP_RATIO   fraction of steps to ramp up to peak (default 0.05)
 #   WARMDOWN_RATIO fraction of steps to anneal down (default 0.95 -> ends at 0)
-#   SAVE_EVERY     checkpoint cadence (default 100 = eval cadence)
+#   SAVE_EVERY / EVAL_EVERY / CHATCORE_EVERY / CUTE_EVERY  cadence (default 30 each)
+#   CUTE_MAX_PROBLEMS (50) / CHATCORE_MAX_CAT (200) / CHATCORE_MAX_SAMPLE (24)
+#                  smaller-than-default eval sizes so frequent evals stay cheap
 #   WANDB_RUN      wandb run name ("dummy" disables; default dummy)
 #   NPROC_PER_NODE / DEVICE_BATCH_SIZE  (default 1 / 4; bf16 SFT/anneal OOMs at 8)
 #   IDENTITY_FILE  identity .jsonl to stage (default committed byte identity)
@@ -47,7 +49,15 @@ ANNEAL_STEPS="${ANNEAL_STEPS:-300}"
 INIT_LR_FRAC="${INIT_LR_FRAC:-0.3}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 WARMDOWN_RATIO="${WARMDOWN_RATIO:-0.95}"
-SAVE_EVERY="${SAVE_EVERY:-100}"
+SAVE_EVERY="${SAVE_EVERY:-30}"
+# Frequent but SMALL evals (the anneal is short; we want fine-grained curves
+# without each eval dominating). EVERY=30 -> ~10 points over 300 steps.
+EVAL_EVERY="${EVAL_EVERY:-30}"
+CHATCORE_EVERY="${CHATCORE_EVERY:-30}"
+CUTE_EVERY="${CUTE_EVERY:-30}"
+CUTE_MAX_PROBLEMS="${CUTE_MAX_PROBLEMS:-50}"      # per CUTE subtask (was 100)
+CHATCORE_MAX_CAT="${CHATCORE_MAX_CAT:-200}"       # cap MMLU/ARC categorical (was -1 = full 14k)
+CHATCORE_MAX_SAMPLE="${CHATCORE_MAX_SAMPLE:-24}"  # per generative ChatCORE task
 WANDB_RUN="${WANDB_RUN:-dummy}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-4}"
@@ -89,6 +99,12 @@ torchrun --standalone --nproc_per_node="$NPROC_PER_NODE" -m scripts.chat_sft -- 
     --final-lr-frac=0.0 \
     --device-batch-size="$DEVICE_BATCH_SIZE" \
     --save-every="$SAVE_EVERY" \
+    --eval-every="$EVAL_EVERY" \
+    --chatcore-every="$CHATCORE_EVERY" \
+    --cute-every="$CUTE_EVERY" \
+    --cute-max-problems="$CUTE_MAX_PROBLEMS" \
+    --chatcore-max-cat="$CHATCORE_MAX_CAT" \
+    --chatcore-max-sample="$CHATCORE_MAX_SAMPLE" \
     --run="$WANDB_RUN"
 
 # Final evals on the annealed model.
