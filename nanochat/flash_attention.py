@@ -208,7 +208,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), key_padding_mask=None):
     """
     Flash Attention for training (no KV cache).
 
@@ -216,11 +216,16 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        key_padding_mask: optional (B, T) mask, True/1 for real key positions and
+            False/0 for padding. Used for LEFT-PADDED batched inference. When set,
+            we route through SDPA with an explicit (causal [& window] & key-valid)
+            mask -- the fast fa3/flex paths don't take a per-row padding mask. None
+            (training) keeps the original backend dispatch unchanged.
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if BACKEND == 'fa3':
+    if key_padding_mask is None and BACKEND == 'fa3':
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # Both flex and SDPA paths use (B, H, T, D)
@@ -229,7 +234,20 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
 
-    if BACKEND == 'flex':
+    if key_padding_mask is not None:
+        # Build (B, 1, Tq, Tk) boolean mask: causal (+ window) AND key not padding.
+        B, _, Tq, _ = q.shape
+        Tk = k.size(2)
+        device = q.device
+        row = torch.arange(Tq, device=device).unsqueeze(1)
+        col = torch.arange(Tk, device=device).unsqueeze(0)
+        m = col <= row  # causal (Tq == Tk for prefill)
+        window = window_size[0]
+        if 0 <= window < Tk:
+            m = m & ((row - col) <= window)
+        mask = m.unsqueeze(0).unsqueeze(0) & key_padding_mask.bool().view(B, 1, 1, Tk)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+    elif BACKEND == 'flex':
         y = _flex_attention(q, k, v, window_size, enable_gqa)
     else:
         y = _sdpa_attention(q, k, v, window_size, enable_gqa)
@@ -238,7 +256,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
-                            causal=False, window_size=(-1, -1)):
+                            causal=False, window_size=(-1, -1), key_padding_mask=None):
     """
     Flash Attention with KV cache for inference.
 
@@ -250,6 +268,10 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
                    the cache, and which the resulting queries attend to causally.
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        key_padding_mask: optional (B, T_max) mask, True/1 for valid cache columns
+                   and False/0 for padding. Used for LEFT-PADDED batched decode so
+                   queries don't attend to the per-row prompt padding. None ->
+                   shared causal mask, behavior unchanged.
 
     Returns:
         Output tensor of shape (B, T_new, H, D)
@@ -268,6 +290,7 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
     cudagraph wins back far more.
     """
     if BACKEND == 'fa3':
+        assert key_padding_mask is None, "FA3 kv-cache path does not support a key_padding_mask (left-pad batched decode); use the SDPA backend"
         # FA3 wants cache_seqlens (per-batch position). Derive from input_pos[0]
         # broadcast across the batch dim -- our input_pos is shared across batch.
         B = q.shape[0]
@@ -292,10 +315,15 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
     # Shape is (T_new, T_max).
     key_positions = torch.arange(T_max, device=device)
     q_positions = input_pos  # (T_new,)
-    attn_mask = key_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # causal
+    attn_mask = key_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # causal (T_new, T_max)
     window = window_size[0]
     if 0 <= window < T_max:
         attn_mask = attn_mask & (key_positions.unsqueeze(0) >= (q_positions.unsqueeze(1) - window))
+
+    # Left-pad batched decode: also forbid attending to per-row pad columns.
+    # Broadcast (T_new, T_max) up to (B, 1, T_new, T_max) and AND with key validity.
+    if key_padding_mask is not None:
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.bool().view(B, 1, 1, T_max)
 
     # SDPA expects (B, H, T, D). attn_mask broadcasts (T_new, T_max) over (B, H).
     q_sdpa = q.transpose(1, 2)
@@ -311,8 +339,16 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
     # in dev/sdpa_bench.py). The context-manager has per-call Python overhead
     # (~140us); inside a captured cudagraph it's traced once and replayed
     # without that overhead, so the forcing is a net win for the graph path.
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+    # cuDNN is CUDA-only; on CPU (e.g. local testing) it has no backend, so fall
+    # back to default SDPA selection there.
+    if q_sdpa.is_cuda:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+            y_sdpa = F.scaled_dot_product_attention(
+                q_sdpa, k_sdpa, v_sdpa,
+                attn_mask=attn_mask, enable_gqa=enable_gqa,
+            )
+    else:
         y_sdpa = F.scaled_dot_product_attention(
             q_sdpa, k_sdpa, v_sdpa,
             attn_mask=attn_mask, enable_gqa=enable_gqa,
