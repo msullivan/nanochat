@@ -660,7 +660,14 @@ while True:
         else:
             loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        progress = max(progress, approx_progress) # only increase progress monotonically
+        # Progress for the LR schedule. With an explicit step budget, use the
+        # OPTIMIZER-step fraction (approx_progress from the loader is in microbatch
+        # units -- it/num_iterations overshoots by grad_accum_steps). Otherwise
+        # (full-epoch, num_iterations=-1) fall back to the data-consumed progress.
+        if args.num_iterations > 0:
+            progress = step / args.num_iterations
+        else:
+            progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
