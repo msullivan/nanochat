@@ -203,7 +203,12 @@ if resuming:
         args.resume_from_step = int(args.resume_from_step)
     print0(f"Resuming SFT from step {args.resume_from_step} (source: {resume_dir})")
     sft_model_data, sft_optim_data, sft_meta_data = load_checkpoint(resume_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
-    orig_model.load_state_dict(sft_model_data, strict=True, assign=True)
+    # assign=False (copy into existing params) is REQUIRED here: the optimizer was
+    # already built above referencing these Parameter objects. assign=True swaps in
+    # new Parameter objects, orphaning the optimizer -> grads land on the new params
+    # while the optimizer holds the old ones (grad=None at step). Same shapes/dtypes
+    # (same arch), so an in-place copy is safe.
+    orig_model.load_state_dict(sft_model_data, strict=True, assign=False)
     del sft_model_data
     if sft_optim_data is not None:
         # Save initial_lr from the freshly-built optimizer (set above by setup_optimizer)
