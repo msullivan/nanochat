@@ -374,11 +374,16 @@ class Engine:
 
         B = len(prompts)
         L = max(len(p) for p in prompts)
-        # Size the cache TIGHT (prompt + generation), not the full sequence_len.
-        # The kv-cache attention runs SDPA over the whole allocated cache each step;
-        # eager (no cudagraph) that makes an 8192-wide cache pathologically slow for
-        # short generations. A tight cache keeps the per-step attention small.
-        max_seq_length = min(L + max_tokens, self.model.config.sequence_len)
+        # Cache length: prompt + generation, but rounded UP to a coarse bucket so
+        # the compiled decode sees a STABLE kv-cache shape across batches. Without
+        # this, every batch with a different max prompt length is a new cache shape
+        # -> torch.compile recompiles (~20s each) every batch. Bucketing keeps most
+        # eval batches (e.g. all short CUTE prompts) on a single compiled graph.
+        # Still far smaller than sequence_len, so per-step attention stays cheap.
+        CACHE_BUCKET = 256
+        need = L + max_tokens
+        max_seq_length = min(((need + CACHE_BUCKET - 1) // CACHE_BUCKET) * CACHE_BUCKET,
+                             self.model.config.sequence_len)
         self.model.setup_caches(batch_size=B, max_seq_length=max_seq_length, dtype=dtype)
         self.model.kv_cache.reset()
 
