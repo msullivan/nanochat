@@ -455,7 +455,8 @@ class Engine:
         return graph, ids_buf, pos_buf, mask_buf, logits_buf
 
     @torch.inference_mode()
-    def generate_batched(self, prompts, max_tokens, temperature=0.0, top_k=None, seed=42):
+    def generate_batched(self, prompts, max_tokens, temperature=0.0, top_k=None, seed=42,
+                         use_cuda_graphs=False):
         """Batched generation over DISTINCT prompts via left-padding + KV cache.
 
         prompts: list[list[int]]. Returns list[list[int]] of generated tokens per
@@ -510,8 +511,10 @@ class Engine:
         logits = self.model.forward(ids, input_pos=input_pos, attention_mask=cache_valid)[:, -1, :]
 
         # Optional cudagraph for the decode step (replay instead of eager forward).
+        # Default OFF: the per-call capture (cache shape varies) only nets ~1.2x on
+        # long generations and is slower on short ones. Eager is the better default.
         cur = L
-        use_graph = self.use_cuda_graphs and device.type == "cuda"
+        use_graph = use_cuda_graphs and device.type == "cuda"
         if use_graph:
             graph, ids_buf, pos_buf, mask_buf, logits_buf = self._capture_batched_decode_graph(
                 B, max_seq_length, cache_valid, device, dtype)
