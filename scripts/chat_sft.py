@@ -629,9 +629,9 @@ while True:
         cute_results = {}
         for subtask in CUTE_CHAR_LEVEL:
             task = CUTE(subtask=subtask, mode="chat", prefill=False, prompt_style="bare")
-            num_passed, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64,
-                                                 max_problems=args.cute_max_problems)
-            acc = num_passed / total if total > 0 else 0.0
+            num_lenient, num_strict, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64,
+                                                              max_problems=args.cute_max_problems)
+            acc = num_lenient / total if total > 0 else 0.0  # in-training tracks lenient
             cute_results[subtask] = acc
             print0(f"  CUTE/{subtask}: {100*acc:.2f}%")
         cute_mean = sum(cute_results.values()) / len(cute_results)
