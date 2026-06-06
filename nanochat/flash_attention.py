@@ -208,7 +208,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), key_padding_mask=None):
     """
     Flash Attention for training (no KV cache).
 
@@ -216,11 +216,16 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
+        key_padding_mask: optional (B, T) mask, True/1 for real key positions and
+            False/0 for padding. Used for LEFT-PADDED batched inference. When set,
+            we route through SDPA with an explicit (causal [& window] & key-valid)
+            mask -- the fast fa3/flex paths don't take a per-row padding mask. None
+            (training) keeps the original backend dispatch unchanged.
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if BACKEND == 'fa3':
+    if key_padding_mask is None and BACKEND == 'fa3':
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # Both flex and SDPA paths use (B, H, T, D)
@@ -229,7 +234,20 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
 
-    if BACKEND == 'flex':
+    if key_padding_mask is not None:
+        # Build (B, 1, Tq, Tk) boolean mask: causal (+ window) AND key not padding.
+        B, _, Tq, _ = q.shape
+        Tk = k.size(2)
+        device = q.device
+        row = torch.arange(Tq, device=device).unsqueeze(1)
+        col = torch.arange(Tk, device=device).unsqueeze(0)
+        m = col <= row  # causal (Tq == Tk for prefill)
+        window = window_size[0]
+        if 0 <= window < Tk:
+            m = m & ((row - col) <= window)
+        mask = m.unsqueeze(0).unsqueeze(0) & key_padding_mask.bool().view(B, 1, 1, Tk)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+    elif BACKEND == 'flex':
         y = _flex_attention(q, k, v, window_size, enable_gqa)
     else:
         y = _sdpa_attention(q, k, v, window_size, enable_gqa)

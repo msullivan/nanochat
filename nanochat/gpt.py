@@ -129,7 +129,7 @@ class CausalSelfAttention(nn.Module):
         ve_layer = has_ve(layer_idx, config.n_layer) and not config.disable_value_embeds
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if ve_layer else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos, key_padding_mask=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -154,8 +154,11 @@ class CausalSelfAttention(nn.Module):
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
-            # Training: causal attention with optional sliding window
-            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+            # Training: causal attention with optional sliding window.
+            # key_padding_mask (B, T) marks valid (non-pad) key positions; only
+            # passed for left-padded batched inference, None for training.
+            y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size,
+                                           key_padding_mask=key_padding_mask)
         else:
             # Inference: use flash_attn_with_kvcache. input_pos tells the cache
             # where to insert these k,v and is consumed by the mask construction
@@ -194,8 +197,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, input_pos)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos, key_padding_mask=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, input_pos, key_padding_mask)
         x = x + self.mlp(norm(x))
         return x
 
@@ -527,7 +530,7 @@ class GPT(nn.Module):
             n_embd=c.n_embd,
         ).to(device)
 
-    def forward(self, idx, targets=None, input_pos=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, input_pos=None, loss_reduction='mean', attention_mask=None):
         """
         Args:
             idx: (B, T) token ids
@@ -535,6 +538,12 @@ class GPT(nn.Module):
             input_pos: (T,) absolute positions of the tokens in `idx`. Required
                        for inference (kv-cache present); ignored for training.
             loss_reduction: 'mean' or 'sum'
+            attention_mask: optional (B, T) mask, 1 for real tokens and 0 for
+                       padding. Only used on the no-cache path for LEFT-PADDED
+                       batched inference: it masks pad keys in attention AND
+                       suppresses the smear contribution at pad->real boundaries
+                       (so the first real token isn't smeared with pad). None for
+                       training / single-stream -> fully bit-identical fast path.
 
         For inference, the KV cache is read from self.kv_cache (attached via
         setup_caches). input_pos tells the cache where to write the new k,v
@@ -575,11 +584,18 @@ class GPT(nn.Module):
         # replay. Order matters: compute the smear contribution FIRST using the OLD
         # prev_embedding, THEN write the current pre-smear last position back into the
         # buffer, THEN apply the smear to x.
+        assert attention_mask is None or kv_cache is None, "attention_mask is only supported on the no-cache path"
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            smear_add = gate * x[:, :-1]
+            if attention_mask is not None:
+                # Left-pad boundary: zero the smear into a token whose predecessor
+                # is padding (so the first real token isn't smeared with pad). No-op
+                # path when attention_mask is None -> bit-identical to before.
+                smear_add = smear_add * attention_mask[:, :-1, None].to(x.dtype)
+            x = torch.cat([x[:, :1], x[:, 1:] + smear_add], dim=1)
         elif T > 1:
             # Prefill: smear within x like training; save last pre-smear position
             # for the next decode step's smear.
@@ -617,7 +633,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](ve_idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, input_pos)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, input_pos, attention_mask)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection
