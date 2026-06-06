@@ -516,10 +516,12 @@ class GPT(nn.Module):
         if (existing is not None
                 and existing.batch_size == batch_size
                 and existing.max_seq_len >= max_seq_length
-                and existing.k_cache.dtype == dtype):
+                and existing.dtype == dtype):
             existing.reset()
             return
-        # device is taken from an existing parameter (model already on the right device by now)
+        # device is taken from an existing parameter (model already on the right device by now).
+        # Allocate the cache buffers directly on device (no post-hoc .to(), which would
+        # replace the buffers and drop their mark_static_address pinning).
         device = self.lm_head.weight.device
         self.kv_cache = KVCache(
             batch_size=batch_size,
@@ -529,7 +531,8 @@ class GPT(nn.Module):
             num_layers=c.n_layer,
             dtype=dtype,
             n_embd=c.n_embd,
-        ).to(device)
+            device=device,
+        )
 
     def forward(self, idx, targets=None, input_pos=None, loss_reduction='mean', attention_mask=None):
         """

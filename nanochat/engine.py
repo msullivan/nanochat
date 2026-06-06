@@ -100,7 +100,7 @@ class KVCache(nn.Module):
     (B, T, H, D) per-layer slice that flash_attn_with_kvcache wants.
     """
 
-    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, dtype, n_embd):
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, dtype, n_embd, device=None):
         super().__init__()
         self.batch_size = batch_size
         self.max_seq_len = seq_len
@@ -108,39 +108,40 @@ class KVCache(nn.Module):
         self.n_heads = num_heads
         self.head_dim = head_dim
         self.n_embd = n_embd
-        # Register buffers so they're tracked as module state. Get device
-        # from the parent module's parameters at forward time (buffers
-        # auto-move when the module is .to(device)'d).
-        self.register_buffer("k_cache",
-            torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, dtype=dtype),
-            persistent=False)
-        self.register_buffer("v_cache",
-            torch.zeros(num_layers, batch_size, seq_len, num_heads, head_dim, dtype=dtype),
-            persistent=False)
-        # Smear's "prev embedding" (model-level state, not per-layer).
+        self.dtype = dtype
+        # PER-LAYER cache buffers, NOT one stacked (num_layers, ...) tensor. With a
+        # stacked cache, each layer's in-place slice-write gets functionalized by
+        # torch.compile into a FULL-cache copy every decode step (O(cache_size) ->
+        # ~6x slower at an 8192 cache; profiler shows cache-sized copy kernels
+        # dominating). Separate per-layer buffers let Inductor's reinplace pass keep
+        # the writes in place (no copy), so compiled (reduce-overhead) decode stays
+        # ~flat with cache size. mark_static_address pins their addresses for cudagraph.
+        for i in range(num_layers):
+            self.register_buffer(f"k_cache_{i}",
+                torch.zeros(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device), persistent=False)
+            self.register_buffer(f"v_cache_{i}",
+                torch.zeros(batch_size, seq_len, num_heads, head_dim, dtype=dtype, device=device), persistent=False)
+        # Smear's "prev embedding" and bigram-VE's "prev token id" (model-level state).
         self.register_buffer("prev_embedding",
-            torch.zeros(batch_size, 1, n_embd, dtype=dtype),
-            persistent=False)
-        # Bigram-VE's "prev token id" (model-level state).
+            torch.zeros(batch_size, 1, n_embd, dtype=dtype, device=device), persistent=False)
         self.register_buffer("prev_token_id",
-            torch.zeros(batch_size, dtype=torch.long),
-            persistent=False)
+            torch.zeros(batch_size, dtype=torch.long, device=device), persistent=False)
+        for b in self.buffers():
+            torch._dynamo.mark_static_address(b)
 
     def reset(self):
         """Reset transient state at the start of a new generation.
 
-        k_cache/v_cache don't need clearing -- they'll be overwritten by
-        prefill at positions [0, prompt_len). prev_embedding and prev_token_id
-        are read on the first forward before they're written by prefill,
-        so zero them defensively (prefill will overwrite the last-position
-        slot anyway).
+        k/v caches don't need clearing -- they'll be overwritten by prefill at
+        positions [0, prompt_len). prev_embedding/prev_token_id are read on the
+        first forward before prefill writes them, so zero them defensively.
         """
         self.prev_embedding.zero_()
         self.prev_token_id.zero_()
 
     def get_layer_cache(self, layer_idx):
-        """Return (k_cache, v_cache) views for a specific layer."""
-        return self.k_cache[layer_idx], self.v_cache[layer_idx]
+        """Return (k_cache, v_cache) for a specific layer (standalone buffers)."""
+        return getattr(self, f"k_cache_{layer_idx}"), getattr(self, f"v_cache_{layer_idx}")
 
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
