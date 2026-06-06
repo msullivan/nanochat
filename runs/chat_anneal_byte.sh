@@ -21,7 +21,8 @@ set -ex
 #   CHAT_BASE_TAG  converted 265-vocab base (for arch + LR inheritance);
 #                  default d24-byte-l-ext-chatbase
 #   SFT_TAG        SFT checkpoint to load weights from; default d24-byte-l-ext-chat
-#   OUTPUT_TAG     anneal output dir; default ${SFT_TAG}-anneal
+#   OUTPUT_TAG     anneal output dir; default ${SFT_TAG}-anneal-lr${INIT_LR_FRAC}
+#                  (encodes the swept knob so sweeps don't clobber each other)
 #   CUTE_FRACTION  CUTE share of the anneal mixture (default 0.5)
 #   ANNEAL_STEPS   length of the anneal phase (default 300)
 #   INIT_LR_FRAC   re-warm peak as a fraction of base LR (default 0.3; the SFT ran
@@ -43,10 +44,12 @@ export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 
 CHAT_BASE_TAG="${CHAT_BASE_TAG:-d24-byte-l-ext-chatbase}"
 SFT_TAG="${SFT_TAG:-d24-byte-l-ext-chat}"
-OUTPUT_TAG="${OUTPUT_TAG:-${SFT_TAG}-anneal}"
 CUTE_FRACTION="${CUTE_FRACTION:-0.5}"
 ANNEAL_STEPS="${ANNEAL_STEPS:-300}"
 INIT_LR_FRAC="${INIT_LR_FRAC:-0.3}"
+# Default output tag encodes the swept knob (init_lr_frac) so sweep runs land in
+# distinct checkpoint dirs instead of clobbering each other. Override to taste.
+OUTPUT_TAG="${OUTPUT_TAG:-${SFT_TAG}-anneal-lr${INIT_LR_FRAC}}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 WARMDOWN_RATIO="${WARMDOWN_RATIO:-0.95}"
 SAVE_EVERY="${SAVE_EVERY:-30}"
