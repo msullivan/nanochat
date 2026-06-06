@@ -18,7 +18,7 @@ import signal
 import warnings
 from contextlib import contextmanager
 from collections import deque
-from nanochat.common import compute_init, autodetect_device_type, print0
+from nanochat.common import compute_init, autodetect_device_type, print0, COMPUTE_DTYPE
 from nanochat.checkpoint_manager import load_model
 
 # -----------------------------------------------------------------------------
@@ -435,7 +435,7 @@ class Engine:
         """
         assert isinstance(prompts, list) and all(isinstance(p, list) for p in prompts)
         device = self.model.get_device()
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        dtype = COMPUTE_DTYPE  # honor NANOCHAT_DTYPE (cache must match activation dtype)
         rng = None
         if temperature > 0:
             rng = torch.Generator(device=device); rng.manual_seed(seed)
@@ -449,7 +449,11 @@ class Engine:
 
         B = len(prompts)
         L = max(len(p) for p in prompts)
-        max_seq_length = self.model.config.sequence_len
+        # Size the cache TIGHT (prompt + generation), not the full sequence_len.
+        # The kv-cache attention runs SDPA over the whole allocated cache each step;
+        # eager (no cudagraph) that makes an 8192-wide cache pathologically slow for
+        # short generations. A tight cache keeps the per-step attention small.
+        max_seq_length = min(L + max_tokens, self.model.config.sequence_len)
         self.model.setup_caches(batch_size=B, max_seq_length=max_seq_length, dtype=dtype)
         self.model.kv_cache.reset()
 
