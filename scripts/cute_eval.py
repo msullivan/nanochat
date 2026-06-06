@@ -28,47 +28,46 @@ from nanochat.engine import Engine
 from tasks.cute import CUTE, CUTE_SUBTASKS, CUTE_CHAR_LEVEL
 
 
-def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0):
+def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0, batch_size=64):
     from tasks.cute import extract_cute_answer
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = engine.model.get_device() if hasattr(engine, "model") else None
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
-    num_passed, total = 0, 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
+    # Encode this rank's prompts up front, then run them in FIXED-size batches via
+    # engine.generate_batched (left-padded, compiled decode). Fixed batch size keeps
+    # the compiled decode shape stable (no per-batch recompile); the last partial
+    # batch is padded with copies (extras ignored).
+    idxs = list(range(ddp_rank, num_problems, ddp_world_size))
+    prompts, convs = [], []
+    for i in idxs:
         conversation = task_object[i]
-
         if task_object.mode == "chat":
             encoded_prompt = tokenizer.render_for_completion(conversation)
         else:
             encoded_prompt = tokenizer.encode(conversation["prompt_text"], prepend="<|bos|>")
+        prompts.append(encoded_prompt)
+        convs.append(conversation)
 
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=1,
-            max_tokens=max_new_tokens,
-            temperature=0.0,
-            top_k=50,
-        )
-        prefix_length = len(encoded_prompt)
-        completion = tokenizer.decode(results[0][prefix_length:])
-
-        outcome = task_object.evaluate(conversation, completion)
-        total += 1
-        num_passed += int(outcome)
-
-        if debug_n > 0 and i < debug_n and ddp_rank == 0:
-            pred = extract_cute_answer(completion, prefilled=task_object.prefill)
-            prompt_text = conversation.get("prompt_text")
-            if prompt_text is None and "messages" in conversation:
-                # chat mode: reconstruct the user-turn text
-                prompt_text = conversation["messages"][0].get("content")
-            print(f"\n[debug {task_object.subtask} #{i}] gold={conversation['answer']!r} pred={pred!r} ok={outcome}")
-            print(f"  prompt: {prompt_text!r}")
-            print(f"  raw completion (first 120 chars): {completion[:120]!r}")
-
-        print(f"\r\033[KRank {ddp_rank} | {task_object.subtask} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end="", flush=True)
+    num_passed, total = 0, 0
+    for s in range(0, len(prompts), batch_size):
+        chunk = prompts[s:s + batch_size]
+        chunk_convs = convs[s:s + batch_size]
+        n_real = len(chunk)
+        if n_real < batch_size:
+            chunk = chunk + [chunk[-1]] * (batch_size - n_real)  # pad to fixed B; extras ignored
+        gens = engine.generate_batched(chunk, max_tokens=max_new_tokens, temperature=0.0, top_k=50)
+        for j in range(n_real):
+            completion = tokenizer.decode(gens[j])
+            outcome = task_object.evaluate(chunk_convs[j], completion)
+            total += 1
+            num_passed += int(outcome)
+            if debug_n > 0 and (s + j) < debug_n and ddp_rank == 0:
+                pred = extract_cute_answer(completion, prefilled=task_object.prefill)
+                print(f"\n[debug {task_object.subtask} #{s+j}] gold={chunk_convs[j]['answer']!r} pred={pred!r} ok={outcome}")
+                print(f"  raw completion (first 120 chars): {completion[:120]!r}")
+        print(f"\r\033[KRank {ddp_rank} | {task_object.subtask} | {num_passed}/{total} ({100*num_passed/max(total,1):.2f}%)", end="", flush=True)
 
     print()
 
@@ -101,6 +100,9 @@ def main():
                         help="Disable torch.compile(model, mode='reduce-overhead'). With compile on (default), "
                         "PyTorch wraps the decode forward in a cudagraph automatically -- big speedup at the "
                         "cost of ~30s first-shape compile + ~30s decode shape compile. Disable for debug.")
+    parser.add_argument("-b", "--batch-size", type=int, default=64,
+                        help="Problems generated together per batch (left-padded). Fixed size keeps the "
+                        "compiled decode shape stable.")
     args = parser.parse_args()
 
     if args.source in ("base", "cute", "scratch", "mix") and args.mode == "chat":
@@ -120,11 +122,9 @@ def main():
     ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
-    # Manual CUDA graph capture of the decode forward, owned by Engine.
-    # At d24 scale this beats torch.compile mode="reduce-overhead" by ~2x
-    # (the compile wrapper's per-call overhead exceeds savings on small
-    # per-op GPU work). Graphs are lazily captured on the first decode call
-    # and reused across all prompts.
+    # Engine compiles the decode step with torch.compile(mode="reduce-overhead"):
+    # Inductor fusion + cudagraph. With the per-layer KV cache it stays flat with
+    # cache size (the stacked cache used to force full-cache copies under compile).
     engine = Engine(model, tokenizer, use_cuda_graphs=(not args.no_compile))
 
     print0(f"CUTE eval | source={args.source} | mode={args.mode} | model={args.model_tag or 'default'} step={meta.get('step', '?')}")
@@ -134,7 +134,8 @@ def main():
     for subtask in subtasks:
         task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill, prompt_style=args.prompt_style)
         num_passed, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens,
-                                             max_problems=args.max_problems, debug_n=args.debug_n)
+                                             max_problems=args.max_problems, debug_n=args.debug_n,
+                                             batch_size=args.batch_size)
         acc = num_passed / total if total > 0 else 0.0
         results[subtask] = acc
         print0(f"{subtask}: {num_passed}/{total} ({100*acc:.2f}%)")
