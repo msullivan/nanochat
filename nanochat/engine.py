@@ -389,13 +389,18 @@ class Engine:
                              self.model.config.sequence_len)
         self.model.setup_caches(batch_size=B, max_seq_length=max_seq_length, dtype=dtype)
         self.model.kv_cache.reset()
+        # setup_caches reuses an existing LARGER cache (idempotent >=), so the actual
+        # cache width can exceed max_seq_length. The key-padding mask must match the
+        # ACTUAL cache width (it's applied over all cache columns), not our requested
+        # bucket -- else flash_attn_with_kvcache's view(B,1,1,T_max) mismatches.
+        cache_T = self.model.kv_cache.max_seq_len
 
-        # Left-pad prompts; build the full-cache validity mask (B, max_seq_length).
+        # Left-pad prompts; build the full-cache validity mask (B, cache_T).
         # Pad with BOS (id is harmless: those columns are masked out everywhere).
         pad_id = bos if isinstance(bos, int) else 0
         ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
         needs_mask = any(len(p) < L for p in prompts)
-        cache_valid = torch.ones(B, max_seq_length, dtype=torch.bool, device=device) if needs_mask else None
+        cache_valid = torch.ones(B, cache_T, dtype=torch.bool, device=device) if needs_mask else None
         for i, p in enumerate(prompts):
             ids[i, L - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
             if needs_mask and len(p) < L:
