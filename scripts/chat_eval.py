@@ -27,58 +27,76 @@ from tasks.arithmetic import Addition, Multiplication
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
-def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, print_completions=False):
+# Tasks whose assistant turns emit calculator tool calls (<|python_start|>...),
+# which require the per-problem tool-use state machine in Engine.generate. Only
+# these can't use the batched path (generate_batched has no tool machinery).
+TOOL_TASKS = {"GSM8K"}
+
+
+def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, print_completions=False, batched=False, batch_size=64):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
-
-    # Run the evaluation
     num_passed, total = 0, 0
-    for i in range(ddp_rank, num_problems, ddp_world_size):
-        conversation = task_object[i]
 
-        # Tokenize the prompt
-        encoded_prompt = tokenizer.render_for_completion(conversation)
-        # Get the completions
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=num_samples,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
-        # Decode the completions as text
-        prefix_length = len(encoded_prompt)
-        completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
-
-        # Evaluate success criteria
-        outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
-        passed = any(outcomes)
-
-        # Keep stats
-        total += 1
-        num_passed += int(passed)
-
-        if print_completions:
-            # Show prompt + every completion + per-sample outcome. Skip the in-place
-            # progress line in this mode (it would clobber the printed block).
-            prompt_text = tokenizer.decode(encoded_prompt)
-            verdict = "PASS" if passed else "FAIL"
-            print(f"\n--- [{verdict}] rank={ddp_rank} i={i} ({num_passed}/{total} so far) ---")
-            print(f"PROMPT:\n{prompt_text}")
-            for sidx, (comp, ok) in enumerate(zip(completions, outcomes)):
-                tag = f"sample {sidx}" if num_samples > 1 else "completion"
-                print(f"--- {tag} (score={ok}) ---\n{comp}")
-            print("---")
-        else:
-            # Logging (overwrite the same line in the console)
-            print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
-
-    # Finish the in-place progress line with a newline before final summary
-    if not print_completions:
-        print()
+    # Batched path: tool-free tasks at num_samples==1. Encode this rank's prompts and
+    # run them in fixed-size batches (left-padded) through engine.generate_batched.
+    if batched and num_samples == 1:
+        idxs = list(range(ddp_rank, num_problems, ddp_world_size))
+        convs = [task_object[i] for i in idxs]
+        prompts = [tokenizer.render_for_completion(c) for c in convs]
+        for s in range(0, len(prompts), batch_size):
+            chunk = prompts[s:s + batch_size]
+            chunk_convs = convs[s:s + batch_size]
+            n_real = len(chunk)
+            if n_real < batch_size:
+                chunk = chunk + [chunk[-1]] * (batch_size - n_real)  # pad to fixed B; extras ignored
+            gens = engine.generate_batched(chunk, max_tokens=max_new_tokens, temperature=temperature, top_k=top_k)
+            for j in range(n_real):
+                completion = tokenizer.decode(gens[j])  # generate_batched returns generated tokens only
+                passed = bool(task_object.evaluate(chunk_convs[j], completion))
+                total += 1
+                num_passed += int(passed)
+                if print_completions:
+                    print(f"\n--- [{'PASS' if passed else 'FAIL'}] rank={ddp_rank} i={idxs[s+j]} ({num_passed}/{total}) ---")
+                    print(f"--- completion (score={passed}) ---\n{completion}\n---")
+            if not print_completions:
+                print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/max(total,1):.2f}%)", end='', flush=True)
+        if not print_completions:
+            print()
+    else:
+        # Per-problem path (required for tool-use tasks and num_samples > 1).
+        for i in range(ddp_rank, num_problems, ddp_world_size):
+            conversation = task_object[i]
+            encoded_prompt = tokenizer.render_for_completion(conversation)
+            results, _ = engine.generate_batch(
+                encoded_prompt,
+                num_samples=num_samples,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+            prefix_length = len(encoded_prompt)
+            completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
+            outcomes = [task_object.evaluate(conversation, completion) for completion in completions]
+            passed = any(outcomes)
+            total += 1
+            num_passed += int(passed)
+            if print_completions:
+                prompt_text = tokenizer.decode(encoded_prompt)
+                verdict = "PASS" if passed else "FAIL"
+                print(f"\n--- [{verdict}] rank={ddp_rank} i={i} ({num_passed}/{total} so far) ---")
+                print(f"PROMPT:\n{prompt_text}")
+                for sidx, (comp, ok) in enumerate(zip(completions, outcomes)):
+                    tag = f"sample {sidx}" if num_samples > 1 else "completion"
+                    print(f"--- {tag} (score={ok}) ---\n{comp}")
+                print("---")
+            else:
+                print(f"\r\033[KRank {ddp_rank} | {num_passed}/{total} ({100*num_passed/total:.2f}%)", end='', flush=True)
+        if not print_completions:
+            print()
 
     # Aggregate results across all ranks
     if ddp:
@@ -187,7 +205,10 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     task_object = task_module()
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, print_completions=print_completions)
+        # Tool-free tasks batch through generate_batched; GSM8K (calculator tool)
+        # needs the per-problem tool-use state machine.
+        batched = task_name not in TOOL_TASKS
+        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, print_completions=print_completions, batched=batched, batch_size=batch_size)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
     else:
