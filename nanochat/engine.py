@@ -417,6 +417,80 @@ class Engine:
                 break
         return results, masks
 
+    @torch.inference_mode()
+    def generate_batched(self, prompts, max_tokens, temperature=0.0, top_k=None, seed=42):
+        """Batched generation over DISTINCT prompts via left-padding + KV cache.
+
+        prompts: list[list[int]]. Returns list[list[int]] of generated tokens per
+        prompt (prompt and the terminal eos token excluded).
+
+        Prompts are left-padded to a common length so every row's next-token
+        position lines up; a per-row key-padding mask (passed to the model as
+        attention_mask) stops queries from attending to the pad columns, and the
+        smear boundary is handled inside GPT.forward. Decoding is batched: one
+        forward per step over all rows, with per-row EOS stopping.
+
+        Eval-oriented: no tool-use / forced-token state machine (use generate()
+        for that). Eager forward per step (no cudagraph) for now.
+        """
+        assert isinstance(prompts, list) and all(isinstance(p, list) for p in prompts)
+        device = self.model.get_device()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=device); rng.manual_seed(seed)
+
+        # assistant_end may be a single id (unescaped tokenizer) or a multi-token
+        # escape sequence (legacy tokenizer) -> tail-match like generate_batch.
+        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+        ae_list = [assistant_end] if isinstance(assistant_end, int) else list(assistant_end)
+        ae_len = len(ae_list)
+        bos = self.tokenizer.get_bos_token_id()
+
+        B = len(prompts)
+        L = max(len(p) for p in prompts)
+        max_seq_length = self.model.config.sequence_len
+        self.model.setup_caches(batch_size=B, max_seq_length=max_seq_length, dtype=dtype)
+        self.model.kv_cache.reset()
+
+        # Left-pad prompts; build the full-cache validity mask (B, max_seq_length).
+        # Pad with BOS (id is harmless: those columns are masked out everywhere).
+        pad_id = bos if isinstance(bos, int) else 0
+        ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
+        needs_mask = any(len(p) < L for p in prompts)
+        cache_valid = torch.ones(B, max_seq_length, dtype=torch.bool, device=device) if needs_mask else None
+        for i, p in enumerate(prompts):
+            ids[i, L - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
+            if needs_mask and len(p) < L:
+                cache_valid[i, :L - len(p)] = False  # left-pad columns are invalid keys
+
+        # Prefill. logits[:, -1] is the last (rightmost = always real, left-pad) position.
+        input_pos = torch.arange(L, device=device, dtype=torch.long)
+        logits = self.model.forward(ids, input_pos=input_pos, attention_mask=cache_valid)[:, -1, :]
+
+        out = [[] for _ in range(B)]
+        done = [False] * B
+        cur = L
+        num_generated = 0
+        while num_generated < max_tokens and not all(done):
+            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+            toks = next_ids[:, 0].tolist()
+            for i in range(B):
+                if done[i]:
+                    continue
+                out[i].append(toks[i])
+                if toks[i] == bos:
+                    out[i] = out[i][:-1]; done[i] = True            # strip bos
+                elif out[i][-ae_len:] == ae_list:
+                    out[i] = out[i][:-ae_len]; done[i] = True        # strip assistant_end
+            num_generated += 1
+            if all(done):
+                break
+            input_pos = torch.tensor([cur], device=device, dtype=torch.long)
+            logits = self.model.forward(next_ids, input_pos=input_pos, attention_mask=cache_valid)[:, -1, :]
+            cur += 1
+        return out
+
 
 if __name__ == "__main__":
     """

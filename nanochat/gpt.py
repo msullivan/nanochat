@@ -170,6 +170,7 @@ class CausalSelfAttention(nn.Module):
                 input_pos=input_pos,
                 causal=True,
                 window_size=window_size,
+                key_padding_mask=key_padding_mask,
             )
 
         # Re-assemble the heads and project back to residual stream
@@ -584,23 +585,29 @@ class GPT(nn.Module):
         # replay. Order matters: compute the smear contribution FIRST using the OLD
         # prev_embedding, THEN write the current pre-smear last position back into the
         # buffer, THEN apply the smear to x.
-        assert attention_mask is None or kv_cache is None, "attention_mask is only supported on the no-cache path"
+        #
+        # attention_mask contract: None for training/single-stream (fast, bit-identical
+        # path). For left-padded batched inference it marks valid (non-pad) keys -- it is
+        # (B, T) on the no-cache path and (B, T_max) over the whole cache on the kv-cache
+        # path. The SMEAR only ever needs validity of the current input positions, i.e.
+        # attention_mask[:, :T], to skip smearing a pad token into the first real token.
+        smear_valid = None if attention_mask is None else attention_mask[:, :T]
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
             smear_add = gate * x[:, :-1]
-            if attention_mask is not None:
-                # Left-pad boundary: zero the smear into a token whose predecessor
-                # is padding (so the first real token isn't smeared with pad). No-op
-                # path when attention_mask is None -> bit-identical to before.
-                smear_add = smear_add * attention_mask[:, :-1, None].to(x.dtype)
+            if smear_valid is not None:
+                smear_add = smear_add * smear_valid[:, :-1, None].to(x.dtype)
             x = torch.cat([x[:, :1], x[:, 1:] + smear_add], dim=1)
         elif T > 1:
-            # Prefill: smear within x like training; save last pre-smear position
-            # for the next decode step's smear.
+            # Prefill (with cache): smear within x like training; save last pre-smear
+            # position for the next decode step's smear. Same left-pad boundary masking.
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
-            new_x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            smear_add = gate * x[:, :-1]
+            if smear_valid is not None:
+                smear_add = smear_add * smear_valid[:, :-1, None].to(x.dtype)
+            new_x = torch.cat([x[:, :1], x[:, 1:] + smear_add], dim=1)
             kv_cache.prev_embedding.copy_(x[:, -1:, :])  # pre-smear last pos
             x = new_x
         else:
