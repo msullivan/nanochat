@@ -417,6 +417,43 @@ class Engine:
                 break
         return results, masks
 
+    def _capture_batched_decode_graph(self, B, T_max, cache_valid, device, dtype):
+        """Capture a single-token batched decode forward into a CUDA graph.
+
+        Static buffers: ids (B,1), input_pos (1,), optional key-padding mask
+        (B,T_max), logits (B,vocab). Snapshot/warmup/restore around capture so the
+        post-prefill cache state is preserved for the real decode. Captured fresh
+        per generate_batched call (cache shape varies with the tight sizing)."""
+        kv = self.model.kv_cache
+        vocab = self.model.config.vocab_size
+        ids_buf = torch.zeros(B, 1, dtype=torch.long, device=device)
+        pos_buf = torch.zeros(1, dtype=torch.long, device=device)
+        mask_buf = None
+        if cache_valid is not None:
+            mask_buf = torch.empty(B, T_max, dtype=torch.bool, device=device)
+            mask_buf.copy_(cache_valid)
+        logits_buf = torch.zeros(B, vocab, dtype=torch.float32, device=device)
+
+        snap_k = kv.k_cache.clone(); snap_v = kv.v_cache.clone()
+        snap_pe = kv.prev_embedding.clone(); snap_pt = kv.prev_token_id.clone()
+        def restore():
+            kv.k_cache.copy_(snap_k); kv.v_cache.copy_(snap_v)
+            kv.prev_embedding.copy_(snap_pe); kv.prev_token_id.copy_(snap_pt)
+
+        side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(3):
+                out = self.model.forward(ids_buf, input_pos=pos_buf, attention_mask=mask_buf)
+                logits_buf.copy_(out[:, -1, :])
+        torch.cuda.current_stream().wait_stream(side)
+        restore()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = self.model.forward(ids_buf, input_pos=pos_buf, attention_mask=mask_buf)
+            logits_buf.copy_(out[:, -1, :])
+        restore()
+        return graph, ids_buf, pos_buf, mask_buf, logits_buf
+
     @torch.inference_mode()
     def generate_batched(self, prompts, max_tokens, temperature=0.0, top_k=None, seed=42):
         """Batched generation over DISTINCT prompts via left-padding + KV cache.
@@ -472,9 +509,16 @@ class Engine:
         input_pos = torch.arange(L, device=device, dtype=torch.long)
         logits = self.model.forward(ids, input_pos=input_pos, attention_mask=cache_valid)[:, -1, :]
 
+        # Optional cudagraph for the decode step (replay instead of eager forward).
+        cur = L
+        use_graph = self.use_cuda_graphs and device.type == "cuda"
+        if use_graph:
+            graph, ids_buf, pos_buf, mask_buf, logits_buf = self._capture_batched_decode_graph(
+                B, max_seq_length, cache_valid, device, dtype)
+            pos_buf.fill_(cur)
+
         out = [[] for _ in range(B)]
         done = [False] * B
-        cur = L
         num_generated = 0
         while num_generated < max_tokens and not all(done):
             next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
@@ -490,9 +534,15 @@ class Engine:
             num_generated += 1
             if all(done):
                 break
-            input_pos = torch.tensor([cur], device=device, dtype=torch.long)
-            logits = self.model.forward(next_ids, input_pos=input_pos, attention_mask=cache_valid)[:, -1, :]
-            cur += 1
+            if use_graph:
+                ids_buf.copy_(next_ids)
+                graph.replay()
+                logits = logits_buf
+                pos_buf += 1
+            else:
+                input_pos = torch.tensor([cur], device=device, dtype=torch.long)
+                logits = self.model.forward(next_ids, input_pos=input_pos, attention_mask=cache_valid)[:, -1, :]
+                cur += 1
         return out
 
 
