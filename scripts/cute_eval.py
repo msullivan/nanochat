@@ -29,7 +29,7 @@ from nanochat.engine import Engine
 from tasks.cute import CUTE, CUTE_SUBTASKS, CUTE_CHAR_LEVEL
 
 
-def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0, batch_size=64, strict=False):
+def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0, batch_size=64):
     from tasks.cute import extract_cute_answer
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = engine.model.get_device() if hasattr(engine, "model") else None
@@ -51,7 +51,9 @@ def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problem
         prompts.append(encoded_prompt)
         convs.append(conversation)
 
-    num_passed, total = 0, 0
+    # Score BOTH lenient and strict on the SAME completions so the gap (correct but
+    # rambling / non-terminating) is exact, not cross-run noise.
+    num_lenient, num_strict, total = 0, 0, 0
     for s in range(0, len(prompts), batch_size):
         chunk = prompts[s:s + batch_size]
         chunk_convs = convs[s:s + batch_size]
@@ -61,27 +63,26 @@ def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problem
         gens, finished = engine.generate_batched(chunk, max_tokens=max_new_tokens, temperature=0.0, top_k=50, return_finished=True)
         for j in range(n_real):
             completion = tokenizer.decode(gens[j])
-            outcome = task_object.evaluate(chunk_convs[j], completion, finished=finished[j], strict=strict)
+            len_ok = task_object.evaluate(chunk_convs[j], completion)                                    # lenient
+            str_ok = task_object.evaluate(chunk_convs[j], completion, finished=finished[j], strict=True)  # strict
             total += 1
-            num_passed += int(outcome)
+            num_lenient += int(len_ok)
+            num_strict += int(str_ok)
             if debug_n > 0 and (s + j) < debug_n and ddp_rank == 0:
                 pred = extract_cute_answer(completion, prefilled=task_object.prefill)
-                print(f"\n[debug {task_object.subtask} #{s+j}] gold={chunk_convs[j]['answer']!r} pred={pred!r} ok={outcome}")
+                print(f"\n[debug {task_object.subtask} #{s+j}] gold={chunk_convs[j]['answer']!r} pred={pred!r} lenient={len_ok} strict={str_ok}")
                 print(f"  raw completion (first 120 chars): {completion[:120]!r}")
-        print(f"\r\033[KRank {ddp_rank} | {task_object.subtask} | {num_passed}/{total} ({100*num_passed/max(total,1):.2f}%)", end="", flush=True)
+        print(f"\r\033[KRank {ddp_rank} | {task_object.subtask} | lenient {num_lenient}/{total} | strict {num_strict}/{total}", end="", flush=True)
 
     print()
 
     if ddp:
         device = device or torch.device(f"cuda:{ddp_local_rank}")
-        num_passed_t = torch.tensor([num_passed], dtype=torch.long, device=device)
-        total_t = torch.tensor([total], dtype=torch.long, device=device)
-        dist.all_reduce(num_passed_t, op=dist.ReduceOp.SUM)
-        dist.all_reduce(total_t, op=dist.ReduceOp.SUM)
-        num_passed = num_passed_t.item()
-        total = total_t.item()
+        t = torch.tensor([num_lenient, num_strict, total], dtype=torch.long, device=device)
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        num_lenient, num_strict, total = t.tolist()
 
-    return num_passed, total
+    return num_lenient, num_strict, total
 
 
 def main():
@@ -104,10 +105,6 @@ def main():
     parser.add_argument("-b", "--batch-size", type=int, default=64,
                         help="Problems generated together per batch (left-padded). Fixed size keeps the "
                         "compiled decode shape stable.")
-    parser.add_argument("--strict", action="store_true",
-                        help="Strict scoring: answer must be correct AND the model must end its turn "
-                        "(stop on assistant_end, not max_tokens) AND say nothing after the answer. "
-                        "Catches correct-but-rambling / non-terminating completions.")
     args = parser.parse_args()
 
     if args.source in ("base", "cute", "scratch", "mix") and args.mode == "chat":
@@ -146,42 +143,46 @@ def main():
         csv_path = os.path.join(csv_dir, f"{args.source}_{args.mode}_{args.prompt_style}_{step}.csv")
         print0(f"Writing CSV to {csv_path}")
 
-    def write_csv(results, mean=None):
+    def write_csv(results, mean_l=None, mean_s=None):
         if csv_path is None:
             return
         with open(csv_path, "w", encoding="utf-8", newline="") as f:
-            f.write(f"{'subtask':<20}, {'accuracy':<10}\n")
-            for st, a in results.items():
-                f.write(f"{st:<20}, {a:<10.6f}\n")
-            if mean is not None:
-                f.write(f"{'mean':<20}, {mean:<10.6f}\n")
+            f.write(f"{'subtask':<20}, {'lenient':<10}, {'strict':<10}\n")
+            for st, (al, as_) in results.items():
+                f.write(f"{st:<20}, {al:<10.6f}, {as_:<10.6f}\n")
+            if mean_l is not None:
+                f.write(f"{'mean':<20}, {mean_l:<10.6f}, {mean_s:<10.6f}\n")
 
-    results = {}
+    results = {}  # subtask -> (lenient_acc, strict_acc)
     for subtask in subtasks:
         task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill, prompt_style=args.prompt_style)
-        num_passed, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens,
-                                             max_problems=args.max_problems, debug_n=args.debug_n,
-                                             batch_size=args.batch_size, strict=args.strict)
-        acc = num_passed / total if total > 0 else 0.0
-        results[subtask] = acc
-        print0(f"{subtask}: {num_passed}/{total} ({100*acc:.2f}%)")
+        nl, ns, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens,
+                                         max_problems=args.max_problems, debug_n=args.debug_n,
+                                         batch_size=args.batch_size)
+        al = nl / total if total > 0 else 0.0
+        as_ = ns / total if total > 0 else 0.0
+        results[subtask] = (al, as_)
+        print0(f"{subtask}: lenient {nl}/{total} ({100*al:.2f}%) | strict {ns}/{total} ({100*as_:.2f}%)")
         write_csv(results)  # incremental: update after each subtask
 
     print0("=" * 60)
-    print0(f"{'subtask':<20} {'accuracy':>10}")
+    print0(f"{'subtask':<20} {'lenient':>10} {'strict':>10}")
     print0("-" * 60)
     for subtask in subtasks:
-        print0(f"{subtask:<20} {100*results[subtask]:>9.2f}%")
-    avg = sum(results.values()) / len(results)
+        al, as_ = results[subtask]
+        print0(f"{subtask:<20} {100*al:>9.2f}% {100*as_:>9.2f}%")
+    mean_l = sum(v[0] for v in results.values()) / len(results)
+    mean_s = sum(v[1] for v in results.values()) / len(results)
     print0("-" * 60)
-    print0(f"{'mean':<20} {100*avg:>9.2f}%")
-    write_csv(results, mean=avg)  # final: include the mean row
+    print0(f"{'mean':<20} {100*mean_l:>9.2f}% {100*mean_s:>9.2f}%")
+    write_csv(results, mean_l, mean_s)  # final: include the mean row
 
     from nanochat.report import get_report
     get_report().log(section=f"CUTE eval {args.source} {args.mode}", data=[
         vars(args),
-        {f"cute/{k}": v for k, v in results.items()},
-        {"cute/mean": avg},
+        {f"cute/{k}": v[0] for k, v in results.items()},
+        {f"cute_strict/{k}": v[1] for k, v in results.items()},
+        {"cute/mean": mean_l, "cute_strict/mean": mean_s},
     ])
 
     compute_cleanup()
