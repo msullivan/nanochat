@@ -785,7 +785,7 @@ while True:
         accs = []
         for subtask in subtasks:
             task = CUTE(subtask=subtask, mode="completion", prefill=True, prompt_style="zero")
-            num_passed, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64, max_problems=args.cute_max_problems)
+            num_passed, _num_strict, total = run_cute_subtask(task, tokenizer, engine, max_new_tokens=64, max_problems=args.cute_max_problems)
             acc = num_passed / total if total > 0 else 0.0
             print0(f"Step {step:05d} | cute/{subtask}: {num_passed}/{total} ({100*acc:.1f}%)")
             cute_log[f"cute/{subtask}"] = acc
