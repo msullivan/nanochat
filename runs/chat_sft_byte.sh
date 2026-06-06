@@ -28,9 +28,10 @@ set -ex
 #   OUTPUT_TAG        SFT output tag (default ${BASE_TAG}-chat)
 #   WANDB_RUN         wandb run name; "dummy" disables logging (default dummy)
 #   NPROC_PER_NODE    GPUs (default 1)
-#   DEVICE_BATCH_SIZE per-device MICRO-batch (default 8, matching the pretrain that
-#                     already fit on this card; grad-accum keeps the effective batch
-#                     fixed, so this only trades VRAM vs speed. Lower if it OOMs.)
+#   DEVICE_BATCH_SIZE per-device MICRO-batch (default 4 -- what the SFT actually fit
+#                     at on the 95GB card. NOTE: pretrain ran 8 but with fp8; SFT/
+#                     anneal are bf16 so 8 OOMs. grad-accum keeps the effective batch
+#                     fixed, so this only trades VRAM vs speed.)
 #   MAX_SEQ_LEN       cap context (default: inherit pretrain 8192; try 2048-4096 if OOM)
 #   NUM_ITERATIONS    steps (default -1 = one full epoch over the mixture)
 #   LOAD_OPTIMIZER    warm-start optim from the converted base (default 1; set 0 for multi-GPU)
@@ -54,7 +55,7 @@ CHAT_BASE_TAG="${CHAT_BASE_TAG:-${BASE_TAG}-chatbase}"
 OUTPUT_TAG="${OUTPUT_TAG:-${BASE_TAG}-chat}"
 WANDB_RUN="${WANDB_RUN:-dummy}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-4}"
 NUM_ITERATIONS="${NUM_ITERATIONS:--1}"
 LOAD_OPTIMIZER="${LOAD_OPTIMIZER:-1}"
 # Save a checkpoint at every eval step (cadence matches eval-every/cute-every=100)

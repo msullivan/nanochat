@@ -31,7 +31,7 @@ set -ex
 #   WARMDOWN_RATIO fraction of steps to anneal down (default 0.95 -> ends at 0)
 #   SAVE_EVERY     checkpoint cadence (default 100 = eval cadence)
 #   WANDB_RUN      wandb run name ("dummy" disables; default dummy)
-#   NPROC_PER_NODE / DEVICE_BATCH_SIZE  (default 1 / 8)
+#   NPROC_PER_NODE / DEVICE_BATCH_SIZE  (default 1 / 4; bf16 SFT/anneal OOMs at 8)
 #   IDENTITY_FILE  identity .jsonl to stage (default committed byte identity)
 
 cd "$(dirname "$0")/.."
@@ -50,7 +50,7 @@ WARMDOWN_RATIO="${WARMDOWN_RATIO:-0.95}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 WANDB_RUN="${WANDB_RUN:-dummy}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-8}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-4}"
 export NANOCHAT_REPORT_TAG="$OUTPUT_TAG"
 
 source .venv/bin/activate
