@@ -344,11 +344,14 @@ class Engine:
         return results, masks
 
     @torch.inference_mode()
-    def generate_batched(self, prompts, max_tokens, temperature=0.0, top_k=None, seed=42):
+    def generate_batched(self, prompts, max_tokens, temperature=0.0, top_k=None, seed=42, return_finished=False):
         """Batched generation over DISTINCT prompts via left-padding + KV cache.
 
         prompts: list[list[int]]. Returns list[list[int]] of generated tokens per
-        prompt (prompt and the terminal eos token excluded).
+        prompt (prompt and the terminal eos token excluded). If return_finished,
+        returns (tokens, finished) where finished[i] is True iff row i stopped on a
+        terminal token (assistant_end/bos) rather than hitting max_tokens -- used
+        by strict eval to check the model actually ended its turn.
 
         Prompts are left-padded to a common length so every row's next-token
         position lines up; a per-row key-padding mask (passed to the model as
@@ -432,7 +435,8 @@ class Engine:
             # (compiled) batched decode step; cache_valid (or None) is the key-padding mask.
             logits = self._decode(next_ids, torch.tensor([cur], device=device, dtype=torch.long), cache_valid)
             cur += 1
-        return out
+        # done[i] is True iff the row hit a terminal token (vs running out at max_tokens).
+        return (out, list(done)) if return_finished else out
 
 
 if __name__ == "__main__":

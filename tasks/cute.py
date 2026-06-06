@@ -70,6 +70,32 @@ def extract_cute_answer(completion, prefilled=True):
         return completion[start + 1:end].strip()
 
 
+def _answer_trailing_clean(completion, prefilled):
+    """True iff the model said just the answer, no trailing nonsense -- everything
+    after the answer region is whitespace. Handles both the quoted canonical form
+    (`"ans"`) and a bare single-line answer. Used by strict eval together with the
+    engine's turn-ended (assistant_end) signal."""
+    if completion is None:
+        return False
+    # Locate the end of the answer region, then require the remainder be whitespace.
+    if prefilled:
+        # completion starts INSIDE the answer; it ends at the first closing quote,
+        # or (no quote) at the end of the first line.
+        end = completion.find('"')
+        tail = completion[end + 1:] if end >= 0 else completion.split("\n", 1)[1] if "\n" in completion else ""
+    else:
+        start = completion.find('"')
+        if start >= 0:
+            end = completion.find('"', start + 1)
+            if end < 0:
+                return False  # opened a quote but never closed it -> messy
+            tail = completion[end + 1:]
+        else:
+            # bare single-line answer (no quotes): clean iff there's no second line
+            tail = completion.split("\n", 1)[1] if "\n" in completion else ""
+    return tail.strip() == ""
+
+
 class CUTE(Task):
 
     def __init__(self, subtask, mode="completion", prefill=True, prompt_style="fewshot", **kwargs):
@@ -118,10 +144,18 @@ class CUTE(Task):
         else:
             return {"prompt_text": prompt, "answer": answer}
 
-    def evaluate(self, conversation, assistant_response):
+    def evaluate(self, conversation, assistant_response, finished=None, strict=False):
         gold = conversation["answer"]
         pred = extract_cute_answer(assistant_response, prefilled=self.prefill)
-        return int(pred == gold)
+        correct = (pred == gold)
+        if not strict:
+            return int(correct)
+        # Strict: the answer must be right AND the model must have (a) ENDED its turn
+        # (stopped on assistant_end, not run out at max_tokens) and (b) said nothing
+        # after the answer (no trailing nonsense). finished comes from the engine.
+        ended = True if finished is None else bool(finished)
+        clean = _answer_trailing_clean(assistant_response, self.prefill)
+        return int(correct and ended and clean)
 
 
 if __name__ == "__main__":

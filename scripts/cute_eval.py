@@ -29,7 +29,7 @@ from nanochat.engine import Engine
 from tasks.cute import CUTE, CUTE_SUBTASKS, CUTE_CHAR_LEVEL
 
 
-def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0, batch_size=64):
+def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problems=None, debug_n=0, batch_size=64, strict=False):
     from tasks.cute import extract_cute_answer
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = engine.model.get_device() if hasattr(engine, "model") else None
@@ -58,10 +58,10 @@ def run_cute_subtask(task_object, tokenizer, engine, max_new_tokens, max_problem
         n_real = len(chunk)
         if n_real < batch_size:
             chunk = chunk + [chunk[-1]] * (batch_size - n_real)  # pad to fixed B; extras ignored
-        gens = engine.generate_batched(chunk, max_tokens=max_new_tokens, temperature=0.0, top_k=50)
+        gens, finished = engine.generate_batched(chunk, max_tokens=max_new_tokens, temperature=0.0, top_k=50, return_finished=True)
         for j in range(n_real):
             completion = tokenizer.decode(gens[j])
-            outcome = task_object.evaluate(chunk_convs[j], completion)
+            outcome = task_object.evaluate(chunk_convs[j], completion, finished=finished[j], strict=strict)
             total += 1
             num_passed += int(outcome)
             if debug_n > 0 and (s + j) < debug_n and ddp_rank == 0:
@@ -104,6 +104,10 @@ def main():
     parser.add_argument("-b", "--batch-size", type=int, default=64,
                         help="Problems generated together per batch (left-padded). Fixed size keeps the "
                         "compiled decode shape stable.")
+    parser.add_argument("--strict", action="store_true",
+                        help="Strict scoring: answer must be correct AND the model must end its turn "
+                        "(stop on assistant_end, not max_tokens) AND say nothing after the answer. "
+                        "Catches correct-but-rambling / non-terminating completions.")
     args = parser.parse_args()
 
     if args.source in ("base", "cute", "scratch", "mix") and args.mode == "chat":
@@ -157,7 +161,7 @@ def main():
         task = CUTE(subtask=subtask, mode=args.mode, prefill=not args.no_prefill, prompt_style=args.prompt_style)
         num_passed, total = run_cute_subtask(task, tokenizer, engine, args.max_new_tokens,
                                              max_problems=args.max_problems, debug_n=args.debug_n,
-                                             batch_size=args.batch_size)
+                                             batch_size=args.batch_size, strict=args.strict)
         acc = num_passed / total if total > 0 else 0.0
         results[subtask] = acc
         print0(f"{subtask}: {num_passed}/{total} ({100*acc:.2f}%)")
