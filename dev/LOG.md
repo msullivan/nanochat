@@ -4,6 +4,80 @@ A running summary documenting some experiments and findings. Started ~Jan 7 2026
 
 ---
 
+## 2026-06-06: torch.compile DOES beat manual CUDA graphs — the 05-25 result was a stacked-cache bug; + batched eval
+
+**Supersedes the 2026-05-25 conclusion** ("manual cudagraph beats reduce-overhead
+by ~2x"). That was real on the code at the time, but the cause was NOT
+reduce-overhead's wrapper overhead — it was our KV-cache *layout*. Fixed, compiled
+`reduce-overhead` is the faster and simpler path. torch was 2.9.1+cu128 on BOTH
+dates (per uv.lock) — not a version effect.
+
+### The bug: a stacked KV-cache makes torch.compile copy the whole cache every step
+`KVCache` was one stacked tensor `(n_layer, B, T_max, H, D)`; each layer's in-place
+`index_copy_` into a slice gets **functionalized** by Inductor into a *full-cache
+copy* (it can't prove a slice-write to a shared tensor is safe). So every decode
+step copied the entire multi-layer cache → cost O(cache_size) per step:
+
+| single-stream decode (tok/s) | cache=512 | cache=2048 | cache=8192 |
+|---|---:|---:|---:|
+| compiled reduce-overhead, **stacked** cache | 246 | 150 | 30 |
+| manual cudagraph (raw replay) | 214 | — | 183 |
+
+Profiler at 8192: six cache-sized triton copy/pointwise kernels = **84%** of
+runtime. Manual cudagraph captures the raw in-place op (no copy), so it's flat with
+cache size — which is why it "won" at the real 8192 cache. My earlier
+reduce-overhead benchmarks all used a 512 cache, hiding the blowup entirely.
+
+### The fix: per-layer cache buffers (gpt-fast's structure)
+Split the cache into per-layer standalone buffers (`k_cache_{i}`/`v_cache_{i}`) +
+`mark_static_address`. Inductor's reinplace pass then keeps each write in place (no
+copy), so compiled decode is flat with cache size and **beats** manual:
+eager 56 → manual cudagraph 183 → **compiled+per-layer 232 tok/s** (decode @8192).
+This is exactly why gpt-fast works at big context — its cache is per-layer; our
+05-25 stacked cache was the anomaly. `Engine` is now compile-only (manual cudagraph
+machinery deleted).
+
+### Batched generation for fast eval (~40x)
+Generative evals ran one prompt at a time. Added `Engine.generate_batched`: distinct
+prompts left-padded into one batch, one forward/step over all rows, per-row EOS.
+~40x over per-prompt on short-answer CUTE (21x even vs cudagraphed per-prompt at
+B=64). Wired into `cute_eval` and tool-free `chat_eval` tasks.
+
+Gotchas (each cost real time):
+- **Smear breaks left-pad.** The smear mixes adjacent tokens, so left-padding makes
+  the first real token smear in the pad. Must mask the smear at pad→real boundaries,
+  not just attention — nanochat-specific; generic left-pad batching misses it.
+- **Compile/cudagraph need fixed shapes.** Bucket the cache length (round to 256) and
+  fix the batch size (pad partial batches), else recompile (~20s) every batch. Within
+  a bucket, varying prompt lengths are free (one compile).
+- **Mask must match the ACTUAL cache width** (`kv_cache.max_seq_len`), not the
+  per-call bucket — `setup_caches` reuses a larger existing cache (idempotent `>=`),
+  so a mixed-length task crashed until the mask was sized to the real cache.
+- bf16 batching is non-deterministic at argmax ties (~0–2/64 differ vs per-prompt);
+  fp32 is exact. Cross-run comparisons are noise-limited to ~1 point.
+
+### Confirmed with data
+- **Only GSM8K** (of the chat-eval tasks) uses the calculator tool (emits `python`
+  blocks) → can't batch (needs the per-problem tool-use state machine).
+  Addition/Multiplication/SpellingBee/HumanEval are raw (74/71/96/12% are genuine;
+  SpellingBee's `.count()` tool path is commented out). Batched tool-free results
+  match per-problem exactly (SpellingBee 96.09=96.09, Addition 74.22=74.22).
+- **HF route:** compiling `transformers.generate` would hit the same two recompile
+  knobs (batch size; prompt length if prefill is compiled) but NOT the cache-copy
+  bug — HF `StaticCache` is per-layer by design. Default HF generate is eager.
+
+### Anneal / minimal-finetuning (separate thread)
+CUTE mini-eval curve of the 50%-CUTE anneal (wandb `byte-anneal-lr0.3`) is
+**saturating-exponential to a ~96% ceiling** (gap-to-ceiling halves ~every 80–90
+steps), not linear/log: 30→86.75, 60→90.75, 120→93.5, 300→95.75. **Dedicated short
+anneals** (decay-to-0 in 30/60 steps) ≈ truncating the 300-run at the same step
+(uncapped: 30→82.2 vs 81.9; 60→87.7 vs 86.8) → the low-LR "consolidation tail" buys
+~nothing; CUTE tracks the *volume* of CUTE-mix steps, not the schedule shape. Strict
+CUTE (must end the turn + nothing after the answer) == lenient on every subtask →
+the model's outputs are already clean.
+
+---
+
 ## 2026-06-03: Matched byte-vs-BPE CUTE learning curves + WSD/LR ablation + dip
 
 Follow-on to the 2026-05-28 mix work. All runs are 50% mix of ClimbMix +
