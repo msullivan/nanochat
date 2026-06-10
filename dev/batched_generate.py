@@ -27,10 +27,12 @@ def batched_generate(model, prompts, max_new_tokens, eos_ids=(), pad_id=0,
     B = len(prompts)
     L = max(len(p) for p in prompts)
     ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
-    mask = torch.zeros(B, L, dtype=torch.float32, device=device)
+    # Per-row left-pad count, constant as we append real tokens on the right.
+    pad_counts = [L - len(p) for p in prompts]
+    left_pad = (torch.tensor(pad_counts, dtype=torch.long, device=device)
+                if any(c > 0 for c in pad_counts) else None)
     for i, p in enumerate(prompts):
         ids[i, L - len(p):] = torch.tensor(p, device=device)
-        mask[i, L - len(p):] = 1.0
 
     eos = set(eos_ids)
     done = torch.zeros(B, dtype=torch.bool, device=device)
@@ -40,7 +42,7 @@ def batched_generate(model, prompts, max_new_tokens, eos_ids=(), pad_id=0,
         rng = torch.Generator(device=device); rng.manual_seed(seed)
 
     for _ in range(max_new_tokens):
-        logits = model(ids, attention_mask=mask)[:, -1, :]  # (B, vocab)
+        logits = model(ids, left_pad=left_pad)[:, -1, :]  # (B, vocab)
         if temperature == 0.0:
             nxt = logits.argmax(-1)
         else:
@@ -60,7 +62,8 @@ def batched_generate(model, prompts, max_new_tokens, eos_ids=(), pad_id=0,
             break
         nxt_col = torch.where(done, torch.full_like(nxt, pad_id), nxt)
         ids = torch.cat([ids, nxt_col.unsqueeze(1)], dim=1)
-        mask = torch.cat([mask, (~done).float().unsqueeze(1)], dim=1)
+        # left_pad is unchanged: appended tokens are on the right (real for active
+        # rows; done rows produce ignored logits).
     return out
 
 

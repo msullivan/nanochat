@@ -129,7 +129,7 @@ class CausalSelfAttention(nn.Module):
         ve_layer = has_ve(layer_idx, config.n_layer) and not config.disable_value_embeds
         self.ve_gate = Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if ve_layer else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos, key_padding_mask=None):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos, left_pad=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -155,14 +155,14 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window.
-            # key_padding_mask (B, T) marks valid (non-pad) key positions; only
-            # passed for left-padded batched inference, None for training.
+            # left_pad (B,) gives per-row left-pad column counts; only passed for
+            # left-padded batched inference, None for training.
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size,
-                                           key_padding_mask=key_padding_mask)
+                                           left_pad=left_pad)
         else:
             # Inference: use flash_attn_with_kvcache. input_pos tells the cache
             # where to insert these k,v and is consumed by the mask construction
-            # in the SDPA fallback path / cache_seqlens in the FA3 path.
+            # (causal/window/left-pad via Flex score_mod, or cache_seqlens for FA3).
             k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
             y = flash_attn.flash_attn_with_kvcache(
                 q, k_cache, v_cache,
@@ -170,7 +170,7 @@ class CausalSelfAttention(nn.Module):
                 input_pos=input_pos,
                 causal=True,
                 window_size=window_size,
-                key_padding_mask=key_padding_mask,
+                left_pad=left_pad,
             )
 
         # Re-assemble the heads and project back to residual stream
@@ -198,8 +198,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos, key_padding_mask=None):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, input_pos, key_padding_mask)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, input_pos, left_pad=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, input_pos, left_pad)
         x = x + self.mlp(norm(x))
         return x
 
@@ -534,7 +534,7 @@ class GPT(nn.Module):
             device=device,
         )
 
-    def forward(self, idx, targets=None, input_pos=None, loss_reduction='mean', attention_mask=None):
+    def forward(self, idx, targets=None, input_pos=None, loss_reduction='mean', left_pad=None):
         """
         Args:
             idx: (B, T) token ids
@@ -542,9 +542,9 @@ class GPT(nn.Module):
             input_pos: (T,) absolute positions of the tokens in `idx`. Required
                        for inference (kv-cache present); ignored for training.
             loss_reduction: 'mean' or 'sum'
-            attention_mask: optional (B, T) mask, 1 for real tokens and 0 for
-                       padding. Only used on the no-cache path for LEFT-PADDED
-                       batched inference: it masks pad keys in attention AND
+            left_pad: optional (B,) int tensor giving the number of LEFT-PAD
+                       columns per row, for LEFT-PADDED batched inference. It masks
+                       pad keys in attention (causal/window/left-pad via Flex) AND
                        suppresses the smear contribution at pad->real boundaries
                        (so the first real token isn't smeared with pad). None for
                        training / single-stream -> fully bit-identical fast path.
@@ -589,12 +589,15 @@ class GPT(nn.Module):
         # prev_embedding, THEN write the current pre-smear last position back into the
         # buffer, THEN apply the smear to x.
         #
-        # attention_mask contract: None for training/single-stream (fast, bit-identical
-        # path). For left-padded batched inference it marks valid (non-pad) keys -- it is
-        # (B, T) on the no-cache path and (B, T_max) over the whole cache on the kv-cache
-        # path. The SMEAR only ever needs validity of the current input positions, i.e.
-        # attention_mask[:, :T], to skip smearing a pad token into the first real token.
-        smear_valid = None if attention_mask is None else attention_mask[:, :T]
+        # left_pad contract: None for training/single-stream (fast, bit-identical
+        # path). For left-padded batched inference it is a (B,) int count of pad
+        # columns per row. The SMEAR only needs per-position validity of the current
+        # input (position t is real iff t >= left_pad[b]), to skip smearing a pad
+        # token into the first real token. Only relevant when T > 1 (prefill / no
+        # cache); a single decode token (T == 1) is always real.
+        smear_valid = None
+        if left_pad is not None and T > 1:
+            smear_valid = (torch.arange(T, device=x.device).unsqueeze(0) >= left_pad.unsqueeze(1))
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
             assert T > 1, "Training forward pass should have T > 1"
@@ -643,7 +646,7 @@ class GPT(nn.Module):
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](ve_idx).to(x.dtype) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, input_pos, attention_mask)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, input_pos, left_pad)
             if i == backout_layer:
                 x_backout = x
         # Subtract mid-layer residual to remove low-level features before logit projection

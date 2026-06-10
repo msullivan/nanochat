@@ -1,9 +1,13 @@
-"""Correctness test for left-padded batched forward (attention_mask support).
+"""Correctness test for left-padded batched forward (left_pad support).
 
-Checks that GPT.forward(ids, attention_mask=mask) on a LEFT-PADDED batch produces,
+Checks that GPT.forward(ids, left_pad=counts) on a LEFT-PADDED batch produces,
 at each prompt's real positions, the same logits as forwarding that prompt alone
 unpadded. The first real token is the strict case: it exercises the smear-boundary
 masking (without it, the first real token would be smeared with the pad token).
+
+NOTE: the left-padded path now routes attention through FlexAttention, which is
+CUDA-only -- this test requires a Flex-capable GPU (run it on genai). float32 keeps
+the comparison tight.
 
 Usage: python dev/test_batched_padding.py --src ~/.cache/nanochat/base_checkpoints/d8-byte
 """
@@ -24,7 +28,8 @@ def main():
     step = args.step
     if step is None:
         step = max(int(f[6:-3]) for f in os.listdir(args.src) if f.startswith("model_") and f.endswith(".pt"))
-    model, _tok, meta = build_model(checkpoint_dir=args.src, step=step, device=torch.device("cpu"), phase="eval")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, _tok, meta = build_model(checkpoint_dir=args.src, step=step, device=device, phase="eval")
     model = model.to(torch.float32)
     vocab = meta["model_config"]["vocab_size"]
 
@@ -34,18 +39,17 @@ def main():
 
     # per-prompt unpadded reference
     with torch.no_grad():
-        per = [model(torch.tensor([p]))[0] for p in prompts]  # each (len, vocab)
+        per = [model(torch.tensor([p], device=device))[0] for p in prompts]  # each (len, vocab)
 
     # left-padded batch
     L = max(lengths)
     B = len(prompts)
-    ids = torch.zeros(B, L, dtype=torch.long)
-    mask = torch.zeros(B, L)
+    ids = torch.zeros(B, L, dtype=torch.long, device=device)
+    left_pad = torch.tensor([L - len(p) for p in prompts], dtype=torch.long, device=device)
     for i, p in enumerate(prompts):
-        ids[i, L - len(p):] = torch.tensor(p)
-        mask[i, L - len(p):] = 1.0
+        ids[i, L - len(p):] = torch.tensor(p, device=device)
     with torch.no_grad():
-        batched = model(ids, attention_mask=mask)  # (B, L, vocab)
+        batched = model(ids, left_pad=left_pad)  # (B, L, vocab)
 
     ok = True
     worst = 0.0

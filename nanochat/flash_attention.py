@@ -205,27 +205,118 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
 
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
+
+# =============================================================================
+# FlexAttention: left-padded batched paths (prefill + decode)
+# =============================================================================
+def _flex_prefill_leftpad(q, k, v, window_size, enable_gqa, left_pad):
+    """No-cache prefill over a LEFT-PADDED batch. q,k,v: (B, H, T, D), Tq == Tk.
+
+    Block mask = causal [& sliding window] AND key not in the left-pad region
+    (kv_idx >= left_pad[b]). left_pad is a (B,) int tensor: number of left-pad
+    columns per row. Replaces the old explicit-bool-mask SDPA padding path.
+    """
+    from torch.nn.attention.flex_attention import create_block_mask
+    B, _, Tq, _ = q.shape
+    Tk = k.size(2)
+    offset = Tk - Tq  # 0 for prefill; kept for generality
+    window = int(window_size[0])
+    use_window = 0 <= window < Tk
+
+    def mask_mod(b, h, q_idx, kv_idx):
+        m = (q_idx + offset) >= kv_idx          # causal
+        m = m & (kv_idx >= left_pad[b])         # not a left-pad column
+        if use_window:
+            m = m & ((q_idx + offset - kv_idx) <= window)
+        return m
+
+    block_mask = create_block_mask(mask_mod, B=B, H=None, Q_LEN=Tq, KV_LEN=Tk,
+                                   device=q.device)
+    flex = _get_compiled_flex_attention()
+    return flex(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
+
+
+def _flex_attend_cache(flex_fn, q, k_cache, v_cache, input_pos, window_size, enable_gqa, left_pad):
+    """KV-cache attention via FlexAttention over the FULL preallocated cache.
+
+    q: (B, H, T_new, D); caches: (B, H, T_max, D). Masking uses a score_mod (dense,
+    no precomputed block mask) so the SAME callable serves prefill (T_new>1) and
+    every decode step (T_new==1): the captured tensors (input_pos, left_pad) are
+    just inputs, so for decode this composes inside torch.compile(mode=
+    "reduce-overhead") -- cudagraph_trees copies them in each step, exactly how the
+    previous SDPA-mask path worked. T_max is the (bucketed, small) cache width and
+    shapes stay constant across decode steps, so dense is cheap.
+
+    Mask per (b, q, kv): kv_idx <= input_pos[q] (causal up to the cache write
+    position) [& sliding window] & kv_idx >= left_pad[b] (skip left-pad columns;
+    left_pad=None for single-stream / unpadded). Causal masking is required even
+    unpadded because the cache holds zeros past input_pos.
+
+    flex_fn lets the caller pick the flex callable: raw `flex_attention` for the
+    compiled decode (the outer reduce-overhead compile owns it -- no nested
+    torch.compile), and the pre-compiled flex for eager prefill.
+    """
+    window = int(window_size[0])
+    use_window = window >= 0  # window<0 => full context; large window is a no-op below
+    neg_inf = float("-inf")
+
+    def score_mod(score, b, h, q_idx, kv_idx):
+        abs_q = input_pos[q_idx]
+        keep = kv_idx <= abs_q                   # causal up to the cache write position
+        if left_pad is not None:
+            keep = keep & (kv_idx >= left_pad[b])  # skip left-pad columns
+        if use_window:
+            keep = keep & ((abs_q - kv_idx) <= window)
+        return torch.where(keep, score, neg_inf)
+
+    return flex_fn(q, k_cache, v_cache, score_mod=score_mod, enable_gqa=enable_gqa)
+
+
+def _sdpa_decode(q, k_cache, v_cache, input_pos, window_size):
+    """Minimal SDPA KV-cache decode for the no-Flex fallback (CPU / older torch).
+
+    Unpadded only -- left-pad batched decode requires FlexAttention. Kept so the
+    single-stream decode path still runs where FlexAttention is unavailable (e.g.
+    CPU parity tests). No cuDNN-backend forcing: that was a Blackwell-SDPA-mask
+    workaround and the masked path now goes through Flex.
+    """
+    B, T_new, H, D = q.shape
+    T_max = k_cache.size(1)
+    device = q.device
+    key_pos = torch.arange(T_max, device=device)
+    attn_mask = key_pos.unsqueeze(0) <= input_pos.unsqueeze(1)  # (T_new, T_max) causal
+    window = int(window_size[0])
+    if 0 <= window < T_max:
+        attn_mask = attn_mask & (key_pos.unsqueeze(0) >= (input_pos.unsqueeze(1) - window))
+    q_s = q.transpose(1, 2)
+    k_s = k_cache.transpose(1, 2)
+    v_s = v_cache.transpose(1, 2)
+    enable_gqa = q_s.size(1) != k_s.size(1)
+    y = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask, enable_gqa=enable_gqa)
+    return y.transpose(1, 2)  # back to (B, T, H, D)
+
+
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
-def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), key_padding_mask=None):
+def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), left_pad=None):
     """
-    Flash Attention for training (no KV cache).
+    Flash Attention for training / no-cache prefill.
 
     Args:
         q, k, v: Tensors of shape (B, T, H, D)
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
-        key_padding_mask: optional (B, T) mask, True/1 for real key positions and
-            False/0 for padding. Used for LEFT-PADDED batched inference. When set,
-            we route through SDPA with an explicit (causal [& window] & key-valid)
-            mask -- the fast fa3/flex paths don't take a per-row padding mask. None
-            (training) keeps the original backend dispatch unchanged.
+        left_pad: optional (B,) int tensor giving the number of LEFT-PAD columns
+            per row, for left-padded batched inference. When set, routes through
+            FlexAttention with a (causal [& window] & kv_idx >= left_pad[b]) block
+            mask. None (training / single stream) keeps the normal backend
+            dispatch (fa3 / flex / sdpa) unchanged.
 
     Returns:
         Output tensor of shape (B, T, H, D)
     """
-    if key_padding_mask is None and BACKEND == 'fa3':
+    if left_pad is None and BACKEND == 'fa3':
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
     # Both flex and SDPA paths use (B, H, T, D)
@@ -234,19 +325,9 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), key_padding_mas
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
 
-    if key_padding_mask is not None:
-        # Build (B, 1, Tq, Tk) boolean mask: causal (+ window) AND key not padding.
-        B, _, Tq, _ = q.shape
-        Tk = k.size(2)
-        device = q.device
-        row = torch.arange(Tq, device=device).unsqueeze(1)
-        col = torch.arange(Tk, device=device).unsqueeze(0)
-        m = col <= row  # causal (Tq == Tk for prefill)
-        window = window_size[0]
-        if 0 <= window < Tk:
-            m = m & ((row - col) <= window)
-        mask = m.unsqueeze(0).unsqueeze(0) & key_padding_mask.bool().view(B, 1, 1, Tk)
-        y = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
+    if left_pad is not None:
+        assert HAS_FLEX, "left-padded batched prefill requires FlexAttention"
+        y = _flex_prefill_leftpad(q, k, v, window_size, enable_gqa, left_pad)
     elif BACKEND == 'flex':
         y = _flex_attention(q, k, v, window_size, enable_gqa)
     else:
@@ -256,7 +337,7 @@ def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), key_padding_mas
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
-                            causal=False, window_size=(-1, -1), key_padding_mask=None):
+                            causal=False, window_size=(-1, -1), left_pad=None):
     """
     Flash Attention with KV cache for inference.
 
@@ -268,29 +349,25 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
                    the cache, and which the resulting queries attend to causally.
         causal: Whether to use causal masking
         window_size: (left, right) sliding window. -1 means unlimited.
-        key_padding_mask: optional (B, T_max) mask, True/1 for valid cache columns
-                   and False/0 for padding. Used for LEFT-PADDED batched decode so
-                   queries don't attend to the per-row prompt padding. None ->
-                   shared causal mask, behavior unchanged.
+        left_pad: optional (B,) int tensor giving the number of LEFT-PAD columns
+                   per row, for left-padded batched decode so queries skip the
+                   per-row prompt padding. None -> single-stream / unpadded.
 
     Returns:
         Output tensor of shape (B, T_new, H, D)
 
-    For FA3 (Hopper): forwards to flash_attn_with_kvcache, deriving
-    cache_seqlens from input_pos[:1]. FA3 advances the cache position via
-    cache_seqlens and writes new k,v at that offset internally.
+    FA3 (Hopper, unpadded): forwards to flash_attn_with_kvcache, deriving
+    cache_seqlens from input_pos[:1]; FA3 writes new k,v internally. (FA3 has a
+    leftpad_k arg that would cover the padded case, but it's not wired/tested yet.)
 
-    For the SDPA fallback (everything else): writes new k,v at input_pos via
-    index_copy_, then computes SDPA over the FULL preallocated cache with a
-    bool mask built from input_pos. Shapes are constant across decode steps
-    (no variable `[:, :end_pos]` slice), which is what torch.compile mode=
-    "reduce-overhead" needs to capture the decode forward into a cuda graph.
-    Costs a few extra microseconds per layer per step over zero-padded cache
-    positions (which get masked-to-zero contribution anyway), but the
-    cudagraph wins back far more.
+    Everything else: write new k,v at input_pos via index_copy_, then attend over
+    the FULL preallocated cache via FlexAttention (causal + optional window +
+    left-pad, all via a score_mod). Shapes are constant across decode steps -- no
+    variable `[:, :end_pos]` slice -- which is what torch.compile mode=
+    "reduce-overhead" needs to capture the decode forward into a cuda graph. A
+    minimal SDPA path remains only as the no-Flex (CPU) fallback, unpadded.
     """
-    if BACKEND == 'fa3':
-        assert key_padding_mask is None, "FA3 kv-cache path does not support a key_padding_mask (left-pad batched decode); use the SDPA backend"
+    if BACKEND == 'fa3' and left_pad is None:
         # FA3 wants cache_seqlens (per-batch position). Derive from input_pos[0]
         # broadcast across the batch dim -- our input_pos is shared across batch.
         B = q.shape[0]
@@ -299,62 +376,33 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
             causal=causal, window_size=window_size
         )
+    if BACKEND == 'fa3' and left_pad is not None:
+        raise NotImplementedError(
+            "FA3 left-pad batched decode (leftpad_k) is not wired up yet; "
+            "run the batched eval with the flex backend for now"
+        )
 
-    # SDPA fallback: full-cache + mask, no `.item()`, no variable-shape slicing.
-    B, T_new, H, D = q.shape
-    _, T_max, H_kv, _ = k_cache.shape
-    device = q.device
-
-    # In-place insert into cache at positions input_pos.
+    # Flex / SDPA fallback: write the new k,v into the cache ourselves, then
+    # attend over the full preallocated cache (no `.item()`, no variable slice).
     if k is not None and v is not None:
         k_cache.index_copy_(1, input_pos, k)
         v_cache.index_copy_(1, input_pos, v)
 
-    # Build attention mask: query at absolute position input_pos[i] attends to
-    # keys at positions [max(0, input_pos[i] - window), input_pos[i]].
-    # Shape is (T_new, T_max).
-    key_positions = torch.arange(T_max, device=device)
-    q_positions = input_pos  # (T_new,)
-    attn_mask = key_positions.unsqueeze(0) <= q_positions.unsqueeze(1)  # causal (T_new, T_max)
-    window = window_size[0]
-    if 0 <= window < T_max:
-        attn_mask = attn_mask & (key_positions.unsqueeze(0) >= (q_positions.unsqueeze(1) - window))
+    if HAS_FLEX:
+        from torch.nn.attention.flex_attention import flex_attention
+        q_t = q.transpose(1, 2)          # (B, H, T_new, D)
+        k_t = k_cache.transpose(1, 2)    # (B, H_kv, T_max, D)
+        v_t = v_cache.transpose(1, 2)
+        enable_gqa = q_t.size(1) != k_t.size(1)
+        # Decode (T_new==1) runs inside the outer reduce-overhead compile -> use raw
+        # flex_attention so that compile owns it (no nested torch.compile under
+        # cudagraphs). Eager prefill (T_new>1) uses the pre-compiled flex kernel.
+        flex_fn = flex_attention if q_t.size(2) == 1 else _get_compiled_flex_attention()
+        y = _flex_attend_cache(flex_fn, q_t, k_t, v_t, input_pos, window_size, enable_gqa, left_pad)
+        return y.transpose(1, 2)         # back to (B, T_new, H, D)
 
-    # Left-pad batched decode: also forbid attending to per-row pad columns.
-    # Broadcast (T_new, T_max) up to (B, 1, T_new, T_max) and AND with key validity.
-    if key_padding_mask is not None:
-        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0) & key_padding_mask.bool().view(B, 1, 1, T_max)
-
-    # SDPA expects (B, H, T, D). attn_mask broadcasts (T_new, T_max) over (B, H).
-    q_sdpa = q.transpose(1, 2)
-    k_sdpa = k_cache.transpose(1, 2)
-    v_sdpa = v_cache.transpose(1, 2)
-    enable_gqa = q_sdpa.size(1) != k_sdpa.size(1)
-
-    # Force cuDNN backend: SDPA's default selection on Blackwell sm120 picks
-    # the MATH backend (slow) for our (full-cache + bool mask + GQA) combo
-    # because Flash refuses non-null masks and Efficient/cuDNN are runtime-
-    # disabled in the default scoring. cuDNN explicitly supports masks and
-    # is ~2.4x faster than MATH on this hardware for our shapes (microbench
-    # in dev/sdpa_bench.py). The context-manager has per-call Python overhead
-    # (~140us); inside a captured cudagraph it's traced once and replayed
-    # without that overhead, so the forcing is a net win for the graph path.
-    # cuDNN is CUDA-only; on CPU (e.g. local testing) it has no backend, so fall
-    # back to default SDPA selection there.
-    if q_sdpa.is_cuda:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-        with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
-            y_sdpa = F.scaled_dot_product_attention(
-                q_sdpa, k_sdpa, v_sdpa,
-                attn_mask=attn_mask, enable_gqa=enable_gqa,
-            )
-    else:
-        y_sdpa = F.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa,
-            attn_mask=attn_mask, enable_gqa=enable_gqa,
-        )
-
-    return y_sdpa.transpose(1, 2)  # back to (B, T, H, D)
+    assert left_pad is None, "left-pad batched decode requires FlexAttention (no SDPA fallback)"
+    return _sdpa_decode(q, k_cache, v_cache, input_pos, window_size)
 
 
 # =============================================================================

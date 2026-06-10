@@ -194,10 +194,10 @@ class Engine:
         self.tokenizer = tokenizer # needed for tool use
         self.use_cuda_graphs = use_cuda_graphs and torch.cuda.is_available()
 
-        def _decode_step(ids, input_pos, attention_mask=None):
+        def _decode_step(ids, input_pos, left_pad=None):
             # Single decode step -> last-position logits (B, vocab). Compiled with
             # reduce-overhead on CUDA; plain eager otherwise (CPU / disabled).
-            return self.model.forward(ids, input_pos=input_pos, attention_mask=attention_mask)[:, -1, :]
+            return self.model.forward(ids, input_pos=input_pos, left_pad=left_pad)[:, -1, :]
 
         if self.use_cuda_graphs:
             self._decode = torch.compile(_decode_step, mode="reduce-overhead", dynamic=False)
@@ -216,9 +216,10 @@ class Engine:
         """
         assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
         device = self.model.get_device()
-        # NOTE: cuda -> bfloat16 and everything else -> float32 is a repo-wide
-        # assumption; encoded here to allocate the kv cache at the right dtype.
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        # Allocate the kv cache at the activation dtype. COMPUTE_DTYPE honors
+        # NANOCHAT_DTYPE (cuda -> bfloat16 by default, else float32) and must match
+        # the new k,v written into the cache -- same as generate_batched.
+        dtype = COMPUTE_DTYPE
         rng = torch.Generator(device=device)
         rng.manual_seed(seed)
 
@@ -354,12 +355,12 @@ class Engine:
         by strict eval to check the model actually ended its turn.
 
         Prompts are left-padded to a common length so every row's next-token
-        position lines up; a per-row key-padding mask (passed to the model as
-        attention_mask) stops queries from attending to the pad columns, and the
-        smear boundary is handled inside GPT.forward. Decoding is batched: one
-        (compiled) forward per step over all rows, with per-row EOS stopping. The
-        same self._decode serves single-stream and batched -- the mask is just an
-        input the compiled cudagraph copies in.
+        position lines up; a per-row left_pad count (passed to the model) makes the
+        attention skip the pad columns (Flex score_mod), and the smear boundary is
+        handled inside GPT.forward. Decoding is batched: one (compiled) forward per
+        step over all rows, with per-row EOS stopping. The same self._decode serves
+        single-stream and batched -- left_pad is just an input the compiled cudagraph
+        copies in.
 
         Eval-oriented: no tool-use / forced-token state machine (use generate()
         for that).
@@ -392,27 +393,23 @@ class Engine:
                              self.model.config.sequence_len)
         self.model.setup_caches(batch_size=B, max_seq_length=max_seq_length, dtype=dtype)
         self.model.kv_cache.reset()
-        # setup_caches reuses an existing LARGER cache (idempotent >=), so the actual
-        # cache width can exceed max_seq_length. The key-padding mask must match the
-        # ACTUAL cache width (it's applied over all cache columns), not our requested
-        # bucket -- else flash_attn_with_kvcache's view(B,1,1,T_max) mismatches.
-        cache_T = self.model.kv_cache.max_seq_len
 
-        # Left-pad prompts; build the full-cache validity mask (B, cache_T).
+        # Left-pad prompts; build a per-row left_pad count (B,). Flex masks any
+        # cache width from input_pos + left_pad, so we no longer need a full-width
+        # validity mask (the old bool mask had to track the actual cache width).
         # Pad with BOS (id is harmless: those columns are masked out everywhere).
         pad_id = bos if isinstance(bos, int) else 0
         ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
-        needs_mask = any(len(p) < L for p in prompts)
-        cache_valid = torch.ones(B, cache_T, dtype=torch.bool, device=device) if needs_mask else None
+        pad_counts = [L - len(p) for p in prompts]
+        needs_mask = any(c > 0 for c in pad_counts)
+        left_pad = torch.tensor(pad_counts, dtype=torch.long, device=device) if needs_mask else None
         for i, p in enumerate(prompts):
             ids[i, L - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
-            if needs_mask and len(p) < L:
-                cache_valid[i, :L - len(p)] = False  # left-pad columns are invalid keys
 
         # Prefill (eager). logits[:, -1] is the last (rightmost = always real,
         # left-pad) position.
         input_pos = torch.arange(L, device=device, dtype=torch.long)
-        logits = self.model.forward(ids, input_pos=input_pos, attention_mask=cache_valid)[:, -1, :]
+        logits = self.model.forward(ids, input_pos=input_pos, left_pad=left_pad)[:, -1, :]
 
         cur = L
         out = [[] for _ in range(B)]
@@ -432,8 +429,8 @@ class Engine:
             num_generated += 1
             if all(done):
                 break
-            # (compiled) batched decode step; cache_valid (or None) is the key-padding mask.
-            logits = self._decode(next_ids, torch.tensor([cur], device=device, dtype=torch.long), cache_valid)
+            # (compiled) batched decode step; left_pad (or None) skips pad columns.
+            logits = self._decode(next_ids, torch.tensor([cur], device=device, dtype=torch.long), left_pad)
             cur += 1
         # done[i] is True iff the row hit a terminal token (vs running out at max_tokens).
         return (out, list(done)) if return_finished else out
