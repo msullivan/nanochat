@@ -95,6 +95,13 @@ USE_FA3 = BACKEND == 'fa3'  # kept for backward compat with anything that import
 _block_mask_cache = {}
 _compiled_flex_attention = None
 
+# Flex tile config for masked PREFILL (Tq>1, headdim=128). The autotuned default
+# (BLOCK_M=128, num_stages=3) needs ~145KB shared memory > sm120's ~100KB and fails
+# to compile ("no valid triton configs"). BLOCK_M=64 divides the 128 sparse block
+# (so SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0 holds) and fits. Prefill is one-shot so the
+# smaller tile costs ~nothing. Decode (q_len=1) and no-cache/training use the default.
+_FLEX_PREFILL_KERNEL_OPTIONS = {"BLOCK_M": 64, "BLOCK_N": 32, "num_stages": 2}
+
 
 def _get_compiled_flex_attention():
     global _compiled_flex_attention
@@ -117,8 +124,8 @@ def _get_compiled_flex_attention():
 def _get_block_mask(window, q_len, k_len, device):
     """
     Causal block mask with optional left sliding window. window<0 means full
-    causal context. Cached per (window, q_len, k_len, device) -- training has
-    a tiny number of distinct shapes so this stays small.
+    causal context. Cached per (window, q_len, k_len, device) -- a tiny number of
+    distinct shapes so this stays small.
     """
     cache_key = (int(window), int(q_len), int(k_len), str(device))
     if cache_key in _block_mask_cache:
@@ -126,8 +133,7 @@ def _get_block_mask(window, q_len, k_len, device):
 
     from torch.nn.attention.flex_attention import create_block_mask
 
-    # Chunked inference (q_len < k_len) needs offset between query and key positions.
-    offset = k_len - q_len
+    offset = k_len - q_len  # chunked use (q_len < k_len) offsets query vs key positions
     use_window = 0 <= window < k_len
 
     if use_window:
@@ -138,243 +144,142 @@ def _get_block_mask(window, q_len, k_len, device):
         def mask_fn(b, h, q_idx, kv_idx):
             return (q_idx + offset) >= kv_idx
 
-    block_mask = create_block_mask(
-        mask_fn, B=None, H=None, Q_LEN=q_len, KV_LEN=k_len, device=device,
-    )
+    block_mask = create_block_mask(mask_fn, B=None, H=None, Q_LEN=q_len, KV_LEN=k_len, device=device)
     _block_mask_cache[cache_key] = block_mask
     return block_mask
 
 
-def _flex_attention(q, k, v, window_size, enable_gqa):
-    """
-    q, k, v in (B, H, T, D) layout. Returns same layout.
-
-    Hybrid dispatch on the flex backend: full-causal layers (L in window_pattern)
-    go through SDPA's is_causal=True fast path -- on Blackwell that's cuDNN's
-    hand-tuned dense flash kernel, faster than flex's dense-causal kernel.
-    Only true sliding-window layers (S) get the flex/Triton sparse kernel.
-    """
-    Tq = q.size(2)
-    Tk = k.size(2)
-    window = window_size[0]
-
-    # Full causal context with aligned shapes -> SDPA fast path
-    if (window < 0 or window >= Tk) and Tq == Tk:
-        return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-
-    block_mask = _get_block_mask(window, Tq, Tk, q.device)
-    flex = _get_compiled_flex_attention()
-    return flex(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
-
-
 # =============================================================================
-# SDPA helpers
+# Attention cores. Two of them: _attend_full for full attention (training, no-cache
+# generation, AND cache prefill -- prefill is just attention over the written cache
+# slice), and _attend_decode for the incremental q_len=1 step. Each uses the backend
+# hybrid: FULL-causal via SDPA (flex's full-causal kernel overflows sm120 shared
+# memory at headdim=128), SLIDING-WINDOW via the flex/Triton sparse kernel; SDPA
+# throughout on CPU/no-flex.
 # =============================================================================
-def _sdpa_attention(q, k, v, window_size, enable_gqa):
-    """
-    SDPA attention with sliding window support.
-    q, k, v are (B, H, T, D) format.
-    """
-    Tq = q.size(2)
-    Tk = k.size(2)
-    window = window_size[0]
+def _sdpa_causal_mask(T, window, left_pad, device, batch):
+    """(batch, 1, T, T) bool attn_mask for full attention: causal [& sliding window]
+    [& key column >= left_pad[b]]. Returns None when no mask is needed (full-causal,
+    no window, no left-pad) so the caller can use SDPA is_causal."""
+    use_window = 0 <= window < T
+    if left_pad is None and not use_window:
+        return None
+    row = torch.arange(T, device=device).unsqueeze(1)
+    col = torch.arange(T, device=device).unsqueeze(0)
+    m = col <= row
+    if use_window:
+        m = m & ((row - col) <= window)
+    m = m.view(1, 1, T, T)
+    if left_pad is not None:
+        m = m & (torch.arange(T, device=device).view(1, 1, 1, T) >= left_pad.view(batch, 1, 1, 1))
+    return m
 
-    # Full context, same length
-    if (window < 0 or window >= Tq) and Tq == Tk:
+
+def _attend_full(q, k, v, window, left_pad, enable_gqa, kernel_options=None):
+    """Full causal self-attention over aligned q,k,v (Tq == Tk), with optional sliding
+    window and per-row left-pad. (B, H, T, D) layout.
+
+    Dispatch is by masked-vs-unmasked, because SDPA's win is its mask-free is_causal
+    flash kernel -- handing SDPA an attn_mask drops it off that path:
+      - no mask (plain causal): SDPA is_causal.
+      - any mask (sliding window and/or left-pad): flex, which masks via block_mask +
+        score_mod without losing its fast path. No SDPA attn_mask on the flex backend.
+      - CPU / no-flex: SDPA with an explicit mask (only place we build one).
+
+    kernel_options forces the flex tile config (e.g. the prefill passes a smaller
+    BLOCK_M so the headdim=128 kernel fits sm120 shared memory -- the autotuned
+    default BLOCK_M=128/num_stages=3 needs ~145KB vs the ~100KB limit; BLOCK_M=64
+    divides the 128 sparse block so the kernel's divisibility assert holds). None lets
+    the autotuner choose (training / no-cache).
+    """
+    T = q.size(2)
+    window = int(window)
+    masked = (0 <= window < T) or (left_pad is not None)
+    if not masked:
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-
-    # Single token generation
-    if Tq == 1:
-        if window >= 0 and window < Tk:
-            # window is "left" tokens we need to include (window + 1) keys total
-            start = max(0, Tk - (window + 1))
-            k = k[:, :, start:, :]
-            v = v[:, :, start:, :]
-        return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
-
-    # Need explicit mask for sliding window/chunk inference
-    device = q.device
-    # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
-    row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)
-    col_idx = torch.arange(Tk, device=device).unsqueeze(0)
-    mask = col_idx <= row_idx
-
-    # sliding window (left)
-    if window >= 0 and window < Tk:
-        mask = mask & ((row_idx - col_idx) <= window)
-
+    if BACKEND == 'flex':
+        block_mask = _get_block_mask(window, T, T, q.device)
+        score_mod = None
+        if left_pad is not None:
+            neg_inf = float("-inf")
+            def score_mod(s, b, h, q_idx, kv_idx):
+                return torch.where(kv_idx >= left_pad[b], s, neg_inf)
+        return _get_compiled_flex_attention()(
+            q, k, v, block_mask=block_mask, score_mod=score_mod,
+            enable_gqa=enable_gqa, kernel_options=kernel_options)
+    mask = _sdpa_causal_mask(T, window, left_pad, q.device, q.size(0))
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 
-# =============================================================================
-# FlexAttention: left-padded batched paths (prefill + decode)
-# =============================================================================
-def _flex_prefill_leftpad(q, k, v, window_size, enable_gqa, left_pad):
-    """No-cache prefill over a LEFT-PADDED batch. q,k,v: (B, H, T, D), Tq == Tk.
+def _attend_decode(q, k_cache, v_cache, input_pos, window, left_pad, enable_gqa):
+    """One incremental decode step: q is (B, H, 1, D), attending over the FULL cache
+    (B, H, T_max, D). Constant cache shape across steps so it composes with the
+    reduce-overhead cudagraph. Mask per (b, q, kv): kv <= input_pos[q] (causal up to
+    the write position) [& sliding window] [& kv >= left_pad[b]]; causal is needed
+    even unpadded since the cache holds zeros past input_pos.
 
-    Block mask = causal [& sliding window] AND key not in the left-pad region
-    (kv_idx >= left_pad[b]). left_pad is a (B,) int tensor: number of left-pad
-    columns per row. Replaces the old explicit-bool-mask SDPA padding path.
+    Flex backend -> raw flex_attention + score_mod so the OUTER compile owns it (no
+    nested torch.compile under cudagraphs). CPU/no-flex -> SDPA (unpadded only).
     """
-    from torch.nn.attention.flex_attention import create_block_mask
-    B, _, Tq, _ = q.shape
-    Tk = k.size(2)
-    offset = Tk - Tq  # 0 for prefill; kept for generality
-    window = int(window_size[0])
-    use_window = 0 <= window < Tk
-
-    def mask_mod(b, h, q_idx, kv_idx):
-        m = (q_idx + offset) >= kv_idx          # causal
-        m = m & (kv_idx >= left_pad[b])         # not a left-pad column
-        if use_window:
-            m = m & ((q_idx + offset - kv_idx) <= window)
-        return m
-
-    block_mask = create_block_mask(mask_mod, B=B, H=None, Q_LEN=Tq, KV_LEN=Tk,
-                                   device=q.device)
-    flex = _get_compiled_flex_attention()
-    return flex(q, k, v, block_mask=block_mask, enable_gqa=enable_gqa)
-
-
-def _flex_attend_cache(flex_fn, q, k_cache, v_cache, input_pos, window_size, enable_gqa, left_pad):
-    """KV-cache attention via FlexAttention over the FULL preallocated cache.
-
-    q: (B, H, T_new, D); caches: (B, H, T_max, D). Masking uses a score_mod (dense,
-    no precomputed block mask) so the SAME callable serves prefill (T_new>1) and
-    every decode step (T_new==1): the captured tensors (input_pos, left_pad) are
-    just inputs, so for decode this composes inside torch.compile(mode=
-    "reduce-overhead") -- cudagraph_trees copies them in each step, exactly how the
-    previous SDPA-mask path worked. T_max is the (bucketed, small) cache width and
-    shapes stay constant across decode steps, so dense is cheap.
-
-    Mask per (b, q, kv): kv_idx <= input_pos[q] (causal up to the cache write
-    position) [& sliding window] & kv_idx >= left_pad[b] (skip left-pad columns;
-    left_pad=None for single-stream / unpadded). Causal masking is required even
-    unpadded because the cache holds zeros past input_pos.
-
-    flex_fn lets the caller pick the flex callable: raw `flex_attention` for the
-    compiled decode (the outer reduce-overhead compile owns it -- no nested
-    torch.compile), and the pre-compiled flex for eager prefill.
-    """
-    window = int(window_size[0])
-    use_window = window >= 0  # window<0 => full context; large window is a no-op below
+    window = int(window)
+    use_window = window >= 0
     neg_inf = float("-inf")
+    if BACKEND == 'flex':
+        from torch.nn.attention.flex_attention import flex_attention
+        def score_mod(score, b, h, q_idx, kv_idx):
+            abs_q = input_pos[q_idx]
+            keep = kv_idx <= abs_q
+            if left_pad is not None:
+                keep = keep & (kv_idx >= left_pad[b])
+            if use_window:
+                keep = keep & ((abs_q - kv_idx) <= window)
+            return torch.where(keep, score, neg_inf)
+        return flex_attention(q, k_cache, v_cache, score_mod=score_mod, enable_gqa=enable_gqa)
 
-    def score_mod(score, b, h, q_idx, kv_idx):
-        abs_q = input_pos[q_idx]
-        keep = kv_idx <= abs_q                   # causal up to the cache write position
-        if left_pad is not None:
-            keep = keep & (kv_idx >= left_pad[b])  # skip left-pad columns
-        if use_window:
-            keep = keep & ((abs_q - kv_idx) <= window)
-        return torch.where(keep, score, neg_inf)
-
-    return flex_fn(q, k_cache, v_cache, score_mod=score_mod, enable_gqa=enable_gqa)
-
-
-def _sdpa_decode(q, k_cache, v_cache, input_pos, window_size):
-    """Minimal SDPA KV-cache decode for the no-Flex fallback (CPU / older torch).
-
-    Unpadded only -- left-pad batched decode requires FlexAttention. Kept so the
-    single-stream decode path still runs where FlexAttention is unavailable (e.g.
-    CPU parity tests). No cuDNN-backend forcing: that was a Blackwell-SDPA-mask
-    workaround and the masked path now goes through Flex.
-    """
-    B, T_new, H, D = q.shape
-    T_max = k_cache.size(1)
-    device = q.device
-    key_pos = torch.arange(T_max, device=device)
-    attn_mask = key_pos.unsqueeze(0) <= input_pos.unsqueeze(1)  # (T_new, T_max) causal
-    window = int(window_size[0])
-    if 0 <= window < T_max:
-        attn_mask = attn_mask & (key_pos.unsqueeze(0) >= (input_pos.unsqueeze(1) - window))
-    q_s = q.transpose(1, 2)
-    k_s = k_cache.transpose(1, 2)
-    v_s = v_cache.transpose(1, 2)
-    enable_gqa = q_s.size(1) != k_s.size(1)
-    y = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask, enable_gqa=enable_gqa)
-    return y.transpose(1, 2)  # back to (B, T, H, D)
+    # CPU / no-flex SDPA fallback (unpadded; left-pad batched decode requires flex).
+    assert left_pad is None, "left-pad batched decode requires FlexAttention"
+    T_max = k_cache.size(2)
+    key_pos = torch.arange(T_max, device=q.device)
+    mask = key_pos.unsqueeze(0) <= input_pos.unsqueeze(1)  # (T_new, T_max) causal
+    if use_window:
+        mask = mask & (key_pos.unsqueeze(0) >= (input_pos.unsqueeze(1) - window))
+    return F.scaled_dot_product_attention(q, k_cache, v_cache, attn_mask=mask, enable_gqa=enable_gqa)
 
 
 # =============================================================================
 # Public API: Same interface as FA3
 # =============================================================================
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1), left_pad=None):
-    """
-    Flash Attention for training / no-cache prefill.
-
-    Args:
-        q, k, v: Tensors of shape (B, T, H, D)
-        causal: Whether to use causal masking
-        window_size: (left, right) sliding window. -1 means unlimited.
-        left_pad: optional (B,) int tensor giving the number of LEFT-PAD columns
-            per row, for left-padded batched inference. When set, routes through
-            FlexAttention with a (causal [& window] & kv_idx >= left_pad[b]) block
-            mask. None (training / single stream) keeps the normal backend
-            dispatch (fa3 / flex / sdpa) unchanged.
-
-    Returns:
-        Output tensor of shape (B, T, H, D)
+    """No-cache attention (training / generation prefill of a fresh sequence).
+    q, k, v: (B, T, H, D). left_pad: optional (B,) int count of left-pad columns
+    per row (left-padded batches). Returns (B, T, H, D).
     """
     if left_pad is None and BACKEND == 'fa3':
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
-
-    # Both flex and SDPA paths use (B, H, T, D)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-    enable_gqa = q.size(1) != k.size(1)
-
-    if left_pad is not None:
-        assert HAS_FLEX, "left-padded batched prefill requires FlexAttention"
-        y = _flex_prefill_leftpad(q, k, v, window_size, enable_gqa, left_pad)
-    elif BACKEND == 'flex':
-        y = _flex_attention(q, k, v, window_size, enable_gqa)
-    else:
-        y = _sdpa_attention(q, k, v, window_size, enable_gqa)
-
-    return y.transpose(1, 2)  # back to (B, T, H, D)
+    q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)  # -> (B, H, T, D)
+    y = _attend_full(q, k, v, window_size[0], left_pad, enable_gqa=q.size(1) != k.size(1))
+    return y.transpose(1, 2)
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
                             causal=False, window_size=(-1, -1), left_pad=None):
-    """
-    Flash Attention with KV cache for inference.
+    """Attention with a KV cache. q: (B, T_new, H, D); cache: (B, T_max, H_kv, D);
+    k, v: new keys/values written at input_pos. left_pad: optional (B,) left-pad
+    column counts. Returns (B, T_new, H, D).
 
-    Args:
-        q: Queries, shape (B, T_new, H, D)
-        k_cache, v_cache: Pre-allocated cache tensors, shape (B, T_max, H_kv, D)
-        k, v: New keys/values to insert at positions input_pos, shape (B, T_new, H_kv, D)
-        input_pos: (T_new,) absolute positions where the new k,v are written into
-                   the cache, and which the resulting queries attend to causally.
-        causal: Whether to use causal masking
-        window_size: (left, right) sliding window. -1 means unlimited.
-        left_pad: optional (B,) int tensor giving the number of LEFT-PAD columns
-                   per row, for left-padded batched decode so queries skip the
-                   per-row prompt padding. None -> single-stream / unpadded.
-
-    Returns:
-        Output tensor of shape (B, T_new, H, D)
-
-    FA3 (Hopper, unpadded): forwards to flash_attn_with_kvcache, deriving
-    cache_seqlens from input_pos[:1]; FA3 writes new k,v internally. (FA3 has a
-    leftpad_k arg that would cover the padded case, but it's not wired/tested yet.)
-
-    Everything else: write new k,v at input_pos via index_copy_, then attend over
-    the FULL preallocated cache via FlexAttention (causal + optional window +
-    left-pad, all via a score_mod). Shapes are constant across decode steps -- no
-    variable `[:, :end_pos]` slice -- which is what torch.compile mode=
-    "reduce-overhead" needs to capture the decode forward into a cuda graph. A
-    minimal SDPA path remains only as the no-Flex (CPU) fallback, unpadded.
+    Writes the new k,v into the cache, then:
+      - PREFILL (T_new>1): full attention over the just-written [0:T_new) slice --
+        i.e. exactly _attend_full, the same core training/no-cache use.
+      - DECODE (T_new==1): incremental _attend_decode over the full cache.
+    FA3 (Hopper, unpadded) keeps its native fused kvcache path.
     """
     if BACKEND == 'fa3' and left_pad is None:
-        # FA3 wants cache_seqlens (per-batch position). Derive from input_pos[0]
-        # broadcast across the batch dim -- our input_pos is shared across batch.
+        # FA3 advances the cache via cache_seqlens (shared across batch) and writes internally.
         B = q.shape[0]
         cache_seqlens = input_pos[:1].to(torch.int32).expand(B)
         return _fa3.flash_attn_with_kvcache(
             q, k_cache, v_cache, k=k, v=v, cache_seqlens=cache_seqlens,
-            causal=causal, window_size=window_size
+            causal=causal, window_size=window_size,
         )
     if BACKEND == 'fa3' and left_pad is not None:
         raise NotImplementedError(
@@ -382,27 +287,22 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
             "run the batched eval with the flex backend for now"
         )
 
-    # Flex / SDPA fallback: write the new k,v into the cache ourselves, then
-    # attend over the full preallocated cache (no `.item()`, no variable slice).
     if k is not None and v is not None:
         k_cache.index_copy_(1, input_pos, k)
         v_cache.index_copy_(1, input_pos, v)
 
-    if HAS_FLEX:
-        from torch.nn.attention.flex_attention import flex_attention
-        q_t = q.transpose(1, 2)          # (B, H, T_new, D)
-        k_t = k_cache.transpose(1, 2)    # (B, H_kv, T_max, D)
-        v_t = v_cache.transpose(1, 2)
-        enable_gqa = q_t.size(1) != k_t.size(1)
-        # Decode (T_new==1) runs inside the outer reduce-overhead compile -> use raw
-        # flex_attention so that compile owns it (no nested torch.compile under
-        # cudagraphs). Eager prefill (T_new>1) uses the pre-compiled flex kernel.
-        flex_fn = flex_attention if q_t.size(2) == 1 else _get_compiled_flex_attention()
-        y = _flex_attend_cache(flex_fn, q_t, k_t, v_t, input_pos, window_size, enable_gqa, left_pad)
-        return y.transpose(1, 2)         # back to (B, T_new, H, D)
-
-    assert left_pad is None, "left-pad batched decode requires FlexAttention (no SDPA fallback)"
-    return _sdpa_decode(q, k_cache, v_cache, input_pos, window_size)
+    T_new = q.size(1)
+    enable_gqa = q.size(2) != k_cache.size(2)
+    if T_new > 1:
+        # Prefill == full attention over the written slice [0:T_new); force the small
+        # tile config so the headdim=128 flex kernel fits sm120 shared memory.
+        y = _attend_full(q.transpose(1, 2), k_cache[:, :T_new].transpose(1, 2),
+                         v_cache[:, :T_new].transpose(1, 2), window_size[0], left_pad, enable_gqa,
+                         kernel_options=_FLEX_PREFILL_KERNEL_OPTIONS)
+    else:
+        y = _attend_decode(q.transpose(1, 2), k_cache.transpose(1, 2), v_cache.transpose(1, 2),
+                           input_pos, window_size[0], left_pad, enable_gqa)
+    return y.transpose(1, 2)
 
 
 # =============================================================================
