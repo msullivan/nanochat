@@ -27,11 +27,6 @@ from tasks.arithmetic import Addition, Multiplication
 # -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
-# Tasks whose assistant turns emit calculator tool calls (<|python_start|>...),
-# which require the per-problem tool-use state machine in Engine.generate. Only
-# these can't use the batched path (generate_batched has no tool machinery).
-TOOL_TASKS = {"GSM8K"}
-
 
 def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, print_completions=False, batched=False, batch_size=64):
 
@@ -41,8 +36,9 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
     num_passed, total = 0, 0
 
-    # Batched path: tool-free tasks at num_samples==1. Encode this rank's prompts and
-    # run them in fixed-size batches (left-padded) through engine.generate_batched.
+    # Batched path (num_samples==1): encode this rank's prompts and run them in
+    # fixed-size left-padded batches through engine.generate_batched. Calculator
+    # tool use is handled there too (same multi-row state machine as generate).
     if batched and num_samples == 1:
         idxs = list(range(ddp_rank, num_problems, ddp_world_size))
         convs = [task_object[i] for i in idxs]
@@ -205,10 +201,10 @@ def run_chat_eval(task_name, model, tokenizer, engine,
     task_object = task_module()
     # Run the evaluation
     if task_object.eval_type == 'generative':
-        # Tool-free tasks batch through generate_batched; GSM8K (calculator tool)
-        # needs the per-problem tool-use state machine.
-        batched = task_name not in TOOL_TASKS
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, print_completions=print_completions, batched=batched, batch_size=batch_size)
+        # All generative tasks batch through generate_batched (num_samples==1). It runs
+        # the same multi-row state machine as generate, so GSM8K's calculator tool use
+        # works batched too; num_samples>1 falls back to the per-problem path inside.
+        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, print_completions=print_completions, batched=True, batch_size=batch_size)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
     else:
