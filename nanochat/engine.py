@@ -204,70 +204,90 @@ class Engine:
         else:
             self._decode = _decode_step
 
-    @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
-        """Single prefill + decode loop with kv cache attached to the model.
+    def _terminal_token_ids(self):
+        """End-of-turn tokens: (assistant_end as a list, its length, bos id).
+        assistant_end may be a single id (unescaped tokenizer) or a multi-token
+        escape sequence (legacy), hence the list + tail-match length."""
+        ae = self.tokenizer.encode_special("<|assistant_end|>")
+        ae_list = [ae] if isinstance(ae, int) else list(ae)
+        return ae_list, len(ae_list), self.tokenizer.get_bos_token_id()
 
-        The model's kv_cache is set up once via model.setup_caches() (idempotent
-        across calls; resets transient state). input_pos is maintained
-        externally and incremented per decode step -- no host syncs inside
-        forward, which means torch.compile mode="reduce-overhead" can capture
-        the decode forward into a cudagraph automatically.
+    def _run_decode(self, ids, input_pos, left_pad, batch_size, max_seq_length, reset):
+        """Shared core for generate() and generate_batched(): set up the KV cache,
+        run the prefill, then drive the (compiled) single-step decode.
+
+        Coroutine: yields the current last-position logits (B, vocab); the caller
+        sends() the actual next-token ids (B, 1) to advance one step. The caller
+        owns sampling and all stop/terminal/tool logic; this owns cache setup +
+        prefill + the cudagraph decode-step advance (input_pos bookkeeping and
+        left_pad pass-through). `reset` zeroes transient cache state before prefill.
         """
-        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
-        device = self.model.get_device()
-        # Allocate the kv cache at the activation dtype. COMPUTE_DTYPE honors
-        # NANOCHAT_DTYPE (cuda -> bfloat16 by default, else float32) and must match
-        # the new k,v written into the cache -- same as generate_batched.
-        dtype = COMPUTE_DTYPE
-        rng = torch.Generator(device=device)
-        rng.manual_seed(seed)
+        self.model.setup_caches(batch_size=batch_size, max_seq_length=max_seq_length, dtype=COMPUTE_DTYPE)
+        if reset:
+            self.model.kv_cache.reset()
+        logits = self.model.forward(ids, input_pos=input_pos, left_pad=left_pad)[:, -1, :]
+        cur = ids.size(1)
+        while True:
+            next_ids = yield logits
+            logits = self._decode(next_ids, torch.tensor([cur], device=ids.device, dtype=torch.long), left_pad)
+            cur += 1
 
-        # Special tokens for tool-use state machine
+    def _generate_rows(self, prompts, *, max_seq_length, max_tokens, temperature, top_k, seed):
+        """Multi-row decode engine shared by generate() and generate_batched().
+
+        prompts: list[list[int]] of (possibly distinct) prompts, one per row. Rows
+        are left-padded to a common length; the per-row state machine handles
+        special-token detection, end-of-turn completion, and the calculator tool
+        (forced-token injection) uniformly for every row. Yields (token_column,
+        token_masks) per step -- mask 0 for forced (tool) tokens, 1 for sampled --
+        until all rows complete or max_tokens is reached.
+
+        max_seq_length picks the cache size: generate() passes the full sequence_len
+        (constant address -> cudagraph reuse across calls); generate_batched()
+        passes a small bucketed size (distinct prompts -> few compiled shapes).
+        """
+        device = self.model.get_device()
+        rng = torch.Generator(device=device); rng.manual_seed(seed)
+
+        # Special tokens for the per-row state machine (end-of-turn + calculator tool)
         get_special = lambda s: self.tokenizer.encode_special(s)
         python_start = get_special("<|python_start|>")
         python_end = get_special("<|python_end|>")
         output_start = get_special("<|output_start|>")
         output_end = get_special("<|output_end|>")
-        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
-        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+        assistant_end = get_special("<|assistant_end|>")
+        bos = self.tokenizer.get_bos_token_id()
 
-        # Helpers for special tokens. Both tokenizers now return single ints,
-        # but tail-match logic is kept to remain compatible with any list form.
+        # Both tokenizers return single ints today, but tail-match keeps working for
+        # any multi-token (legacy escape) form.
         def _as_list(tok):
             return [tok] if isinstance(tok, int) else list(tok)
-        def _tail_matches(tokens, special):
+        def _tail_matches(toks, special):
             s = _as_list(special)
-            return len(tokens) >= len(s) and tokens[-len(s):] == s
+            return len(toks) >= len(s) and toks[-len(s):] == s
         def _force_special(state, special):
             state.forced_tokens.extend(_as_list(special))
 
-        # 1) Set up the KV cache as model state. Standardize on the model's
-        # full sequence_len so the cache is allocated once on the first call
-        # and reused across all subsequent generate()s -- the captured
-        # cudagraph references this cache's tensor addresses, so any
-        # reallocation between calls invalidates it and forces recapture.
-        # The trade is a bigger cache for short-prompt evals (~24MB at d24)
-        # but constant addresses across prompts.
-        max_seq_length = self.model.config.sequence_len
-        self.model.setup_caches(batch_size=num_samples, max_seq_length=max_seq_length, dtype=dtype)
+        # Left-pad the (possibly distinct) prompts to a common length so every row's
+        # next-token position lines up; left_pad tells attention to skip each row's
+        # pad columns (None when all prompts are the same length, e.g. generate()).
+        B = len(prompts)
+        L = max(len(p) for p in prompts)
+        pad_id = bos if isinstance(bos, int) else 0
+        ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
+        pad_counts = [L - len(p) for p in prompts]
+        left_pad = (torch.tensor(pad_counts, dtype=torch.long, device=device)
+                    if any(c > 0 for c in pad_counts) else None)
+        for i, p in enumerate(prompts):
+            ids[i, L - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
+        input_pos = torch.arange(L, device=device, dtype=torch.long)
 
-        # 2) Prefill at batch=num_samples (prompt duplicated across batch dim).
-        # For num_samples=1 (cute_eval) no waste; for num_samples>1 we trade a
-        # bit of redundant prefill compute for a simpler graph-capturable
-        # decode path (single cache, no batch-1 -> batch-N copy).
-        prompt_len = len(tokens)
-        ids = torch.tensor([tokens], dtype=torch.long, device=device).expand(num_samples, -1).contiguous()
-        input_pos = torch.arange(prompt_len, device=device, dtype=torch.long)
-        logits = self.model.forward(ids, input_pos=input_pos)[:, -1, :]  # (num_samples, vocab_size)
+        # Shared mechanical core: cache setup + prefill + cudagraph decode advance.
+        core = self._run_decode(ids, input_pos, left_pad=left_pad, batch_size=B,
+                                max_seq_length=max_seq_length, reset=True)
+        logits = next(core)  # prefill logits (B, vocab); the row's last pos is always real
 
-        # 3) Initialize states for each sample
-        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
-
-        # 4) Decode loop. self._decode is the (compiled) single-step forward;
-        # cudagraph_trees manages the static graph buffers internally, so we just
-        # hand it fresh tensors each step.
-        cur_pos = prompt_len
+        row_states = [RowState(list(p)) for p in prompts]
         num_generated = 0
         while True:
             if max_tokens is not None and num_generated >= max_tokens:
@@ -275,11 +295,10 @@ class Engine:
             if all(state.completed for state in row_states):
                 break
 
-            # Sample from the current logits
             next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
             sampled_tokens = next_ids[:, 0].tolist()
 
-            # State machine for forced tokens, special-token detection, tool use
+            # Per-row state machine: forced tokens, end-of-turn, calculator tool use.
             token_column = []
             token_masks = []
             for i, state in enumerate(row_states):
@@ -310,130 +329,91 @@ class Engine:
             yield token_column, token_masks
             num_generated += 1
 
-            # Feed the next tokens to the (compiled) decode step.
+            # Feed token_column (forced/tool tokens included) into the decode step.
             ids_step = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
-            logits = self._decode(ids_step, torch.tensor([cur_pos], device=device, dtype=torch.long))
-            cur_pos += 1
+            logits = core.send(ids_step)
+        core.close()
 
-    def generate_batch(self, tokens, num_samples=1, **kwargs):
+    def _collect(self, row_iter, prompts):
+        """Drive a (token_column, token_masks) row iterator to completion.
+
+        Returns (results, masks, finished): results[i]/masks[i] are the FULL per-row
+        sequence (prompt included) with the terminal token stripped; finished[i] is
+        True iff the row ended on a terminal token (vs running out of max_tokens).
         """
-        Non-streaming batch generation that just returns the final token sequences.
-        Returns a list of token sequences (list of lists of ints).
-        Terminal tokens (assistant_end, bos) are not included in the results.
-        """
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        bos = self.tokenizer.get_bos_token_id()
-        assistant_end_list = [assistant_end] if isinstance(assistant_end, int) else list(assistant_end)
-        ae_len = len(assistant_end_list)
-        results = [tokens.copy() for _ in range(num_samples)]
-        masks = [[0] * len(tokens) for _ in range(num_samples)]
-        completed = [False] * num_samples
-        for token_column, token_masks in self.generate(tokens, num_samples, **kwargs):
+        ae_list, ae_len, bos = self._terminal_token_ids()
+        results = [list(p) for p in prompts]
+        masks = [[0] * len(p) for p in prompts]
+        completed = [False] * len(prompts)
+        finished = [False] * len(prompts)
+        for token_column, token_masks in row_iter:
             for i, (token, mask) in enumerate(zip(token_column, token_masks)):
-                if not completed[i]:
-                    results[i].append(token)
-                    masks[i].append(mask)
-                    # Check for end conditions
-                    if token == bos or results[i][-ae_len:] == assistant_end_list:
-                        # Strip the terminal tokens
-                        results[i] = results[i][:-ae_len] if results[i][-ae_len:] == assistant_end_list else results[i][:-1]
-                        masks[i] = masks[i][:-ae_len] if len(masks[i]) >= ae_len else masks[i][:-1]
-                        completed[i] = True
-            # Stop if all rows are completed
+                if completed[i]:
+                    continue
+                results[i].append(token)
+                masks[i].append(mask)
+                if token == bos or results[i][-ae_len:] == ae_list:
+                    if results[i][-ae_len:] == ae_list:
+                        results[i] = results[i][:-ae_len]; masks[i] = masks[i][:-ae_len]
+                    else:
+                        results[i] = results[i][:-1]; masks[i] = masks[i][:-1]
+                    completed[i] = finished[i] = True
             if all(completed):
                 break
+        return results, masks, finished
+
+    @torch.inference_mode()
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+        """Streaming generation from a single prompt (optionally num_samples rows).
+
+        Yields (token_column, token_masks) per step. Thin wrapper over the multi-row
+        engine: the prompt is duplicated across num_samples rows and the FULL
+        sequence_len cache is used so its tensor addresses stay constant across
+        generate() calls (the captured cudagraph references them; reallocation would
+        force recapture).
+        """
+        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        prompts = [list(tokens) for _ in range(num_samples)]
+        yield from self._generate_rows(
+            prompts, max_seq_length=self.model.config.sequence_len,
+            max_tokens=max_tokens, temperature=temperature, top_k=top_k, seed=seed,
+        )
+
+    def generate_batch(self, tokens, num_samples=1, **kwargs):
+        """Non-streaming single-prompt generation: returns (results, masks), each a
+        list of num_samples sequences (prompt included, terminal token stripped)."""
+        results, masks, _ = self._collect(self.generate(tokens, num_samples, **kwargs),
+                                          [list(tokens) for _ in range(num_samples)])
         return results, masks
 
     @torch.inference_mode()
     def generate_batched(self, prompts, max_tokens, temperature=0.0, top_k=None, seed=42, return_finished=False):
         """Batched generation over DISTINCT prompts via left-padding + KV cache.
 
-        prompts: list[list[int]]. Returns list[list[int]] of generated tokens per
-        prompt (prompt and the terminal eos token excluded). If return_finished,
-        returns (tokens, finished) where finished[i] is True iff row i stopped on a
-        terminal token (assistant_end/bos) rather than hitting max_tokens -- used
-        by strict eval to check the model actually ended its turn.
+        prompts: list[list[int]]. Returns list[list[int]] of GENERATED tokens per
+        prompt (prompt and terminal token excluded). If return_finished, returns
+        (tokens, finished) where finished[i] is True iff row i stopped on a terminal
+        token rather than hitting max_tokens (used by strict eval to check the model
+        actually ended its turn).
 
-        Prompts are left-padded to a common length so every row's next-token
-        position lines up; a per-row left_pad count (passed to the model) makes the
-        attention skip the pad columns (Flex score_mod), and the smear boundary is
-        handled inside GPT.forward. Decoding is batched: one (compiled) forward per
-        step over all rows, with per-row EOS stopping. The same self._decode serves
-        single-stream and batched -- left_pad is just an input the compiled cudagraph
-        copies in.
-
-        Eval-oriented: no tool-use / forced-token state machine (use generate()
-        for that).
+        Runs the SAME multi-row state machine as generate() (_generate_rows), so the
+        calculator tool / special-token handling apply here too -- the only
+        differences are distinct left-padded prompts and a bucketed cache size.
         """
         assert isinstance(prompts, list) and all(isinstance(p, list) for p in prompts)
-        device = self.model.get_device()
-        dtype = COMPUTE_DTYPE  # honor NANOCHAT_DTYPE (cache must match activation dtype)
-        rng = None
-        if temperature > 0:
-            rng = torch.Generator(device=device); rng.manual_seed(seed)
-
-        # assistant_end may be a single id (unescaped tokenizer) or a multi-token
-        # escape sequence (legacy tokenizer) -> tail-match like generate_batch.
-        assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
-        ae_list = [assistant_end] if isinstance(assistant_end, int) else list(assistant_end)
-        ae_len = len(ae_list)
-        bos = self.tokenizer.get_bos_token_id()
-
-        B = len(prompts)
-        L = max(len(p) for p in prompts)
-        # Cache length: prompt + generation, but rounded UP to a coarse bucket so
-        # the compiled decode sees a STABLE kv-cache shape across batches. Without
-        # this, every batch with a different max prompt length is a new cache shape
-        # -> torch.compile recompiles (~20s each) every batch. Bucketing keeps most
-        # eval batches (e.g. all short CUTE prompts) on a single compiled graph.
-        # Still far smaller than sequence_len, so per-step attention stays cheap.
+        # Cache length: prompt + generation, rounded UP to a coarse bucket so the
+        # compiled decode sees a STABLE shape across batches (else a ~20s recompile
+        # per distinct max-prompt-length). Keeps most eval batches on one graph.
         CACHE_BUCKET = 256
+        L = max(len(p) for p in prompts)
         need = L + max_tokens
         max_seq_length = min(((need + CACHE_BUCKET - 1) // CACHE_BUCKET) * CACHE_BUCKET,
                              self.model.config.sequence_len)
-        self.model.setup_caches(batch_size=B, max_seq_length=max_seq_length, dtype=dtype)
-        self.model.kv_cache.reset()
-
-        # Left-pad prompts; build a per-row left_pad count (B,). Flex masks any
-        # cache width from input_pos + left_pad, so we no longer need a full-width
-        # validity mask (the old bool mask had to track the actual cache width).
-        # Pad with BOS (id is harmless: those columns are masked out everywhere).
-        pad_id = bos if isinstance(bos, int) else 0
-        ids = torch.full((B, L), pad_id, dtype=torch.long, device=device)
-        pad_counts = [L - len(p) for p in prompts]
-        needs_mask = any(c > 0 for c in pad_counts)
-        left_pad = torch.tensor(pad_counts, dtype=torch.long, device=device) if needs_mask else None
-        for i, p in enumerate(prompts):
-            ids[i, L - len(p):] = torch.tensor(p, dtype=torch.long, device=device)
-
-        # Prefill (eager). logits[:, -1] is the last (rightmost = always real,
-        # left-pad) position.
-        input_pos = torch.arange(L, device=device, dtype=torch.long)
-        logits = self.model.forward(ids, input_pos=input_pos, left_pad=left_pad)[:, -1, :]
-
-        cur = L
-        out = [[] for _ in range(B)]
-        done = [False] * B
-        num_generated = 0
-        while num_generated < max_tokens and not all(done):
-            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
-            toks = next_ids[:, 0].tolist()
-            for i in range(B):
-                if done[i]:
-                    continue
-                out[i].append(toks[i])
-                if toks[i] == bos:
-                    out[i] = out[i][:-1]; done[i] = True            # strip bos
-                elif out[i][-ae_len:] == ae_list:
-                    out[i] = out[i][:-ae_len]; done[i] = True        # strip assistant_end
-            num_generated += 1
-            if all(done):
-                break
-            # (compiled) batched decode step; left_pad (or None) skips pad columns.
-            logits = self._decode(next_ids, torch.tensor([cur], device=device, dtype=torch.long), left_pad)
-            cur += 1
-        # done[i] is True iff the row hit a terminal token (vs running out at max_tokens).
-        return (out, list(done)) if return_finished else out
+        rows = self._generate_rows(prompts, max_seq_length=max_seq_length, max_tokens=max_tokens,
+                                   temperature=temperature, top_k=top_k, seed=seed)
+        results, _masks, finished = self._collect(rows, prompts)
+        out = [results[i][len(prompts[i]):] for i in range(len(prompts))]  # strip the prompt
+        return (out, finished) if return_finished else out
 
 
 if __name__ == "__main__":
