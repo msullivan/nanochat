@@ -1,0 +1,22 @@
+{%- if messages[0]['role'] == 'system' -%}
+    {%- set system_message = messages[0]['content'] -%}
+    {%- set loop_messages = messages[1:] -%}
+{%- else -%}
+    {%- set system_message = '' -%}
+    {%- set loop_messages = messages -%}
+{%- endif -%}
+{{- '<|bos|>' -}}
+{%- for message in loop_messages -%}
+    {%- if message['role'] == 'user' -%}
+        {%- if loop.first and system_message != '' -%}
+            {{- '<|user_start|>' + system_message + '\n\n' + message['content'] + '<|user_end|>' -}}
+        {%- else -%}
+            {{- '<|user_start|>' + message['content'] + '<|user_end|>' -}}
+        {%- endif -%}
+    {%- elif message['role'] == 'assistant' -%}
+        {{- '<|assistant_start|>' + message['content'] + '<|assistant_end|>' -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- '<|assistant_start|>' -}}
+{%- endif -%}
