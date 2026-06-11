@@ -1,11 +1,11 @@
 """
 Unified Flash Attention interface with automatic backend dispatch.
 
-Exports `flash_attn` module that matches the FA3 API exactly. Backends, in
-preference order:
-    fa3   - Flash Attention 3, Hopper (sm_90) only, fastest path
-    flex  - PyTorch FlexAttention (Triton-generated), works on Ada/Blackwell etc.
-    sdpa  - PyTorch SDPA, universal fallback (CPU/MPS/older GPUs)
+Exports `flash_attn` module that matches the FA3 API exactly. Primary backend:
+    fa3   - Flash Attention 3, Hopper (sm_90) only, fastest path (bf16/fp8)
+    flex  - PyTorch FlexAttention everywhere else (the default; runs eager on CPU)
+Within these, plain causal attention uses SDPA is_causal (its mask-free flash kernel
+benchmarks fastest); any masked attention (sliding window, left-pad, decode) uses flex.
 
 Usage (drop-in replacement for FA3):
     from nanochat.flash_attention import flash_attn
@@ -16,6 +16,7 @@ Usage (drop-in replacement for FA3):
     # Inference (with KV cache)
     y = flash_attn.flash_attn_with_kvcache(q, k_cache, v_cache, k=k, v=v, ...)
 """
+import os
 import torch
 import torch.nn.functional as F
 
@@ -46,20 +47,10 @@ def _load_flash_attention_3():
         return None
 
 
-def _flex_attention_available():
-    """FlexAttention requires PyTorch 2.5+ and CUDA with Triton."""
-    if not torch.cuda.is_available():
-        return False
-    try:
-        from torch.nn.attention.flex_attention import flex_attention, create_block_mask  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 _fa3 = _load_flash_attention_3()
 HAS_FA3 = _fa3 is not None
-HAS_FLEX = _flex_attention_available()
+# FlexAttention is assumed always available (PyTorch >= 2.5; runs eager on CPU, fused
+# on GPU). It's the default backend whenever FA3 isn't used.
 
 # Override for testing: 'fa3', 'flex', or None (auto)
 _override_impl = None
@@ -71,7 +62,6 @@ def _resolve_backend():
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
         return 'fa3'
     if _override_impl == 'flex':
-        assert HAS_FLEX, "Cannot override to FlexAttention: not available"
         return 'flex'
     if HAS_FA3:
         # FA3 Hopper kernels only support bf16/fp8; other dtypes fall through to flex.
@@ -91,13 +81,15 @@ USE_FA3 = BACKEND == 'fa3'  # kept for backward compat with anything that import
 _block_mask_cache = {}
 _compiled_flex_attention = None
 
-# Flex tile config for masked PREFILL (Tq>1, headdim=128). Flex's autotuned default
-# tile (BLOCK_M=128, num_stages=3) wants ~145KB of shared memory -- above sm120's
-# ~99KB per-block opt-in cap (128KB/SM total), so it won't compile there. We pin
-# BLOCK_M=64 (which divides the 128 sparse block, so SPARSE_Q_BLOCK_SIZE % BLOCK_M
-# == 0 holds) and it fits. Prefill is one-shot, so the smaller tile costs ~nothing.
-# Decode (q_len=1) and no-cache/training keep the autotuned default. (Datacenter GPUs
-# with 164-228KB/SM fit the default, which is why gpt-fast doesn't pin a tile.)
+# OPT-IN small tile for masked PREFILL (Tq>1, headdim=128), enabled by
+# NANOCHAT_FLEX_PREFILL_PIN. OFF by default because it's ~1.6-2x slower than the
+# autotuned default tile, and the default fits the production path (Blackwell/sm120
+# bf16). Turn it on where the default overflows the ~99KB per-block shared-memory cap
+# on consumer GPUs and fails with "no valid triton configs": fp32 anywhere (incl.
+# Blackwell, ~115KB) and bf16 on the 3090/sm86 (~106KB). BLOCK_M=64 divides the 128
+# sparse block (SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0) so it fits. Training is unaffected
+# either way (no-cache always uses the autotuner). Datacenter GPUs (164-228KB/SM) fit
+# the default, which is why gpt-fast never pins.
 _FLEX_PREFILL_KERNEL_OPTIONS = {"BLOCK_M": 64, "BLOCK_N": 32, "num_stages": 2}
 
 
@@ -161,9 +153,9 @@ def _attend_full(q, k, v, window, left_pad, enable_gqa, kernel_options=None):
     window and per-row left-pad. (B, H, T, D) layout.
 
     No mask (plain causal) -> SDPA is_causal (benchmarks ~2x faster than flex here, and
-    it's the CPU path too). Any mask (sliding window and/or left-pad) -> flex (requires
-    HAS_FLEX). kernel_options pins the flex tile config; the prefill passes
-    _FLEX_PREFILL_KERNEL_OPTIONS so the headdim=128 kernel fits sm120's per-block
+    it's the CPU path too). Any mask (sliding window and/or left-pad) -> flex.
+    kernel_options pins the flex tile config; the prefill passes
+    _FLEX_PREFILL_KERNEL_OPTIONS so the headdim=128 kernel fits the GPU's per-block
     shared-memory cap (see that constant). None lets the autotuner choose (training /
     no-cache).
     """
@@ -171,7 +163,6 @@ def _attend_full(q, k, v, window, left_pad, enable_gqa, kernel_options=None):
     window = int(window)
     if not ((0 <= window < T) or (left_pad is not None)):
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
-    assert HAS_FLEX, "masked attention (sliding window / left-pad) requires FlexAttention"
     block_mask = _get_block_mask(window, T, T, q.device)
     score_mod = None
     if left_pad is not None:
@@ -184,37 +175,26 @@ def _attend_full(q, k, v, window, left_pad, enable_gqa, kernel_options=None):
 
 
 def _attend_decode(q, k_cache, v_cache, input_pos, window, left_pad, enable_gqa):
-    """One incremental decode step: q is (B, H, 1, D) attending over the cache.
-
-    Flex backend: score_mod over the FULL cache (B, H, T_max, D) -- constant shape so
-    it composes with the reduce-overhead cudagraph. Mask per (b, kv): kv <= input_pos
-    (causal up to the write position) [& window] [& kv >= left_pad[b]]; causal is
-    needed even unpadded since the cache holds zeros past input_pos. Raw flex_attention
-    so the outer compile owns it.
-
-    CPU / no-flex: SDPA is_causal over the FILLED slice [0:cur+1] -- a single query at
-    the last position attends all prior keys, so is_causal is exact and no mask is
-    built. Unpadded full-causal only (windowed / left-pad decode requires flex).
+    """One incremental decode step: q is (B, H, 1, D) attending over the FULL cache
+    (B, H, T_max, D) via a flex score_mod. Constant cache shape across steps, so it
+    composes with the reduce-overhead cudagraph; raw flex_attention so the outer
+    compile owns it (eager on CPU). Mask per (b, kv): kv <= input_pos (causal up to
+    the write position) [& window] [& kv >= left_pad[b]] -- causal is needed even
+    unpadded since the cache holds zeros past input_pos.
     """
+    from torch.nn.attention.flex_attention import flex_attention
     window = int(window)
-    if HAS_FLEX:
-        from torch.nn.attention.flex_attention import flex_attention
-        use_window = window >= 0
-        neg_inf = float("-inf")
-        def score_mod(score, b, h, q_idx, kv_idx):
-            abs_q = input_pos[q_idx]
-            keep = kv_idx <= abs_q
-            if left_pad is not None:
-                keep = keep & (kv_idx >= left_pad[b])
-            if use_window:
-                keep = keep & ((abs_q - kv_idx) <= window)
-            return torch.where(keep, score, neg_inf)
-        return flex_attention(q, k_cache, v_cache, score_mod=score_mod, enable_gqa=enable_gqa)
-
-    assert left_pad is None and window < 0, "windowed / left-pad decode requires FlexAttention"
-    end = int(input_pos[-1]) + 1  # filled cache length (host sync ok: CPU, no cudagraph)
-    return F.scaled_dot_product_attention(
-        q, k_cache[:, :, :end], v_cache[:, :, :end], is_causal=True, enable_gqa=enable_gqa)
+    use_window = window >= 0
+    neg_inf = float("-inf")
+    def score_mod(score, b, h, q_idx, kv_idx):
+        abs_q = input_pos[q_idx]
+        keep = kv_idx <= abs_q
+        if left_pad is not None:
+            keep = keep & (kv_idx >= left_pad[b])
+        if use_window:
+            keep = keep & ((abs_q - kv_idx) <= window)
+        return torch.where(keep, score, neg_inf)
+    return flex_attention(q, k_cache, v_cache, score_mod=score_mod, enable_gqa=enable_gqa)
 
 
 # =============================================================================
@@ -265,11 +245,13 @@ def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, input_pos=None,
     T_new = q.size(1)
     enable_gqa = q.size(2) != k_cache.size(2)
     if T_new > 1:
-        # Prefill == full attention over the written slice [0:T_new); pin the small
-        # tile config (see _FLEX_PREFILL_KERNEL_OPTIONS) so the flex kernel fits.
+        # Prefill == full attention over the written slice [0:T_new). Autotuned tile by
+        # default (fastest, fits on Blackwell bf16); pin the small tile only when
+        # NANOCHAT_FLEX_PREFILL_PIN is set (fp32 / smaller cards). See the constant.
+        ko = _FLEX_PREFILL_KERNEL_OPTIONS if os.environ.get("NANOCHAT_FLEX_PREFILL_PIN") else None
         y = _attend_full(q.transpose(1, 2), k_cache[:, :T_new].transpose(1, 2),
                          v_cache[:, :T_new].transpose(1, 2), window_size[0], left_pad, enable_gqa,
-                         kernel_options=_FLEX_PREFILL_KERNEL_OPTIONS)
+                         kernel_options=ko)
     else:
         y = _attend_decode(q.transpose(1, 2), k_cache.transpose(1, 2), v_cache.transpose(1, 2),
                            input_pos, window_size[0], left_pad, enable_gqa)

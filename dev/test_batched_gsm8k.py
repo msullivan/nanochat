@@ -7,6 +7,7 @@ exactly, and the tool path must actually fire (some completions contain a
 """
 import os
 os.environ.setdefault("NANOCHAT_DTYPE", "float32")
+os.environ.setdefault("NANOCHAT_FLEX_PREFILL_PIN", "1")  # fp32 cache-prefill needs the small flex tile
 import argparse
 import torch
 from nanochat.checkpoint_manager import build_model
