@@ -206,20 +206,19 @@ wandb_run.define_metric("step")
 wandb_run.define_metric("*", step_metric="step")
 
 # Flash Attention status
-from nanochat.flash_attention import BACKEND
+from nanochat.flash_attention import BACKEND, HAS_FLEX
 if BACKEND == 'fa3':
     print0("✓ Using Flash Attention 3 (Hopper GPU detected), efficient, new and awesome.")
-elif BACKEND == 'flex':
+elif HAS_FLEX:
     print0("✓ Using PyTorch FlexAttention (Triton-generated, sliding-window aware).")
     if HAS_FA3 and COMPUTE_DTYPE != torch.bfloat16:
         print0(f"  (FA3 was available but only supports bf16; COMPUTE_DTYPE={COMPUTE_DTYPE})")
 else:
     print0("!" * 80)
-    print0("WARNING: Falling back to PyTorch SDPA (no FA3 or FlexAttention available)")
-    print0("WARNING: Training will be less efficient")
+    print0("WARNING: FlexAttention unavailable -- only full-causal attention works here;")
+    print0("WARNING: sliding-window / masked attention is unsupported.")
     if args.window_pattern != "L":
-        print0(f"WARNING: SDPA has no fast path for sliding window (window_pattern='{args.window_pattern}'). GPU utilization will be poor.")
-        print0("WARNING: Recommend using --window-pattern L on this backend.")
+        print0(f"WARNING: window_pattern='{args.window_pattern}' requires FlexAttention. Use --window-pattern L.")
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
