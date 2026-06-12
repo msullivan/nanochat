@@ -1,16 +1,19 @@
 #!/bin/bash -e
 
-# Create a Runpod H100 pod attached to the shared nanochat network volume,
+# Create a Runpod pod attached to the shared nanochat network volume,
 # poll until SSH info is available, and write the full pod descriptor to
 # .pods/$NAME.json. Prints the ssh command on completion.
 #
-# Usage: ./make-runpod.sh <name> <gpu-count>
+# Usage: ./make-runpod.sh <name> <gpu-count|cpu>
+#
+# Pass "cpu" instead of a gpu count for a CPU-only pod (no GPU allocation;
+# useful for shuttling data on/off the network volume).
 
 NAME="$1"
 GPUS="$2"
 
 if [ -z "$NAME" ] || [ -z "$GPUS" ]; then
-    echo "Usage: $0 <name> <gpu-count>" >&2
+    echo "Usage: $0 <name> <gpu-count|cpu>" >&2
     exit 1
 fi
 
@@ -24,14 +27,25 @@ mkdir -p .pods
 CREATE_JSON=".pods/$NAME-create.json"
 POD_JSON=".pods/$NAME.json"
 
-runpodctl pod create \
-    --template-id "$TEMPLATE_ID" \
-    --gpu-id "$GPU_TYPE" \
-    --container-disk-in-gb "$DISK_GB" \
-    --network-volume-id "$VOL_ID" \
-    --gpu-count "$GPUS" \
-    --name "$NAME" \
-    | tee "$CREATE_JSON"
+if [ "$GPUS" = "cpu" ]; then
+    # CPU pods cap container disk at 20GB
+    runpodctl pod create \
+        --compute-type cpu \
+        --image ubuntu:22.04 \
+        --container-disk-in-gb 20 \
+        --network-volume-id "$VOL_ID" \
+        --name "$NAME" \
+        | tee "$CREATE_JSON"
+else
+    runpodctl pod create \
+        --template-id "$TEMPLATE_ID" \
+        --gpu-id "$GPU_TYPE" \
+        --container-disk-in-gb "$DISK_GB" \
+        --network-volume-id "$VOL_ID" \
+        --gpu-count "$GPUS" \
+        --name "$NAME" \
+        | tee "$CREATE_JSON"
+fi
 
 POD_ID=$(jq -r .id "$CREATE_JSON")
 if [ -z "$POD_ID" ] || [ "$POD_ID" = "null" ]; then
