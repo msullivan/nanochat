@@ -11,6 +11,10 @@ Usage:
     python hf_export/generate_hf_model.py \
         --src ~/.cache/nanochat/chatsft_checkpoints/d24-byte-l-ext-chat \
         --step latest --dst ~/hf_models/nanochat-byte --dtype bfloat16 --verify
+
+Base (pretrained-only) checkpoints: add --base (no chat template, EOS=<|bos|>).
+The 265-vocab converted form is expected (e.g. d24-byte-l-ext-u), not the
+legacy 256-wide scheme.
 """
 
 import os
@@ -72,12 +76,15 @@ def _resolve_step(src, step):
     return max(steps)
 
 
-def generate(src, step, dst, dtype=torch.float32):
+def generate(src, step, dst, dtype=torch.float32, base=False):
     step_i = _resolve_step(src, step)
     model_data = torch.load(os.path.join(src, f"model_{step_i:06d}.pt"), map_location="cpu")
     meta = json.load(open(os.path.join(src, f"meta_{step_i:06d}.json")))
     mc = dict(meta["model_config"])
     mc.setdefault("window_pattern", "L")
+    assert mc["vocab_size"] == 265, (
+        f"expected a 265-vocab checkpoint, got {mc['vocab_size']}; legacy 256-wide "
+        f"base checkpoints must be converted first (dev/convert_byte_tokenizer_unescaped.py)")
 
     os.makedirs(dst, exist_ok=True)
 
@@ -86,12 +93,14 @@ def generate(src, step, dst, dtype=torch.float32):
     open(os.path.join(dst, "flash_attention.py"), "w").write(
         _rewrite(os.path.join(ROOT, "nanochat", "flash_attention.py"), FLASH_REWRITES))
 
-    # 2. Copy static templates (runtime shim, wrapper, config/tokenizer code, chat template).
+    # 2. Copy static templates (runtime shim, wrapper, config/tokenizer code,
+    #    and -- for chat models -- the chat template).
     shutil.copy(os.path.join(HERE, "_runtime_template.py"), os.path.join(dst, "_runtime.py"))
     shutil.copy(os.path.join(HERE, "_wrapper_modeling_template.py"), os.path.join(dst, "modeling_nanochat.py"))
     shutil.copy(os.path.join(HERE, "configuration_nanochat.py"), os.path.join(dst, "configuration_nanochat.py"))
     shutil.copy(os.path.join(HERE, "tokenization_nanochat.py"), os.path.join(dst, "tokenization_nanochat.py"))
-    shutil.copy(os.path.join(HERE, "chat_template.jinja"), os.path.join(dst, "chat_template.jinja"))
+    if not base:
+        shutil.copy(os.path.join(HERE, "chat_template.jinja"), os.path.join(dst, "chat_template.jinja"))
 
     # 3. Config with auto_map for trust_remote_code loading.
     import sys
@@ -122,16 +131,22 @@ def generate(src, step, dst, dtype=torch.float32):
     #    AutoTokenizer(trust_remote_code) picks our custom class instead of a fast one).
     from tokenization_nanochat import NanochatByteTokenizer
     NanochatByteTokenizer.register_for_auto_class("AutoTokenizer")
-    tok = NanochatByteTokenizer()
-    tok.chat_template = open(os.path.join(HERE, "chat_template.jinja")).read()
+    tok = NanochatByteTokenizer(base_model=base)
+    if not base:
+        tok.chat_template = open(os.path.join(HERE, "chat_template.jinja")).read()
     tok.save_pretrained(dst)
 
-    print(f"generated standalone HF artifact: {src} (step {step_i}) -> {dst}  [dtype={dtype}, vocab={config.vocab_size}]")
+    kind = "base" if base else "chat"
+    print(f"generated standalone HF artifact: {src} (step {step_i}) -> {dst}  [{kind}, dtype={dtype}, vocab={config.vocab_size}]")
     return dst, step_i, mc
 
 
-def verify(dst, src, step_i, mc, seqlen=64, batch=2):
-    """Bit-exact logits parity vs the reference nanochat GPT + a generate smoke test."""
+def verify(dst, src, step_i, mc, seqlen=64, batch=2, base=False, dtype=torch.float32):
+    """Bit-exact logits parity vs the reference nanochat GPT + a generate smoke test.
+
+    Comparison runs in fp32 on both sides. For a non-fp32 export the reference
+    weights are first round-tripped through the export dtype, so the comparison
+    is still exact (it checks the port, not the quantization)."""
     os.environ.setdefault("NANOCHAT_DTYPE", "float32")
     import sys
     if ROOT not in sys.path:
@@ -142,12 +157,17 @@ def verify(dst, src, step_i, mc, seqlen=64, batch=2):
 
     ref, _tok, _meta = build_model(checkpoint_dir=src, step=step_i, device=_t.device("cpu"), phase="eval")
     ref = ref.to(_t.float32)
+    if dtype != _t.float32:
+        for p in ref.parameters():
+            p.data = p.data.to(dtype).to(_t.float32)
     m = AutoModelForCausalLM.from_pretrained(dst, trust_remote_code=True, dtype=_t.float32).eval()
     # tokenizer must load via AutoTokenizer (custom slow class via auto_map) and round-trip
     tk = AutoTokenizer.from_pretrained(dst, trust_remote_code=True)
     _s = 'Héllo 世界!'
     tok_ok = tk.decode(tk.encode(_s, add_special_tokens=False), skip_special_tokens=True) == _s
-    print(f"  tokenizer: AutoTokenizer load + round-trip: {tok_ok}")
+    expected_eos = "<|bos|>" if base else "<|assistant_end|>"
+    tok_ok = tok_ok and tk.eos_token == expected_eos and (tk.chat_template is None) == base
+    print(f"  tokenizer: AutoTokenizer load + round-trip + roles (eos={tk.eos_token}): {tok_ok}")
 
     _t.manual_seed(0)
     vocab = mc["vocab_size"]
@@ -178,12 +198,14 @@ def main():
     ap.add_argument("--step", default="latest")
     ap.add_argument("--dst", required=True)
     ap.add_argument("--dtype", default="float32", choices=["float32", "bfloat16", "float16"])
+    ap.add_argument("--base", action="store_true",
+                    help="base (pretrained-only) artifact: no chat template, EOS=<|bos|>")
     ap.add_argument("--verify", action="store_true")
     args = ap.parse_args()
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[args.dtype]
-    dst, step_i, mc = generate(args.src, args.step, args.dst, dtype=dtype)
+    dst, step_i, mc = generate(args.src, args.step, args.dst, dtype=dtype, base=args.base)
     if args.verify:
-        ok = verify(dst, args.src, step_i, mc)
+        ok = verify(dst, args.src, step_i, mc, base=args.base, dtype=dtype)
         raise SystemExit(0 if ok else 1)
 
 

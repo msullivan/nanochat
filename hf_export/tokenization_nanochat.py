@@ -48,7 +48,12 @@ class NanochatByteTokenizer(PreTrainedTokenizer):
     model_input_names = ["input_ids", "attention_mask"]
     vocab_files_names = {}
 
-    def __init__(self, **kwargs):
+    def __init__(self, base_model=False, **kwargs):
+        # base_model=True: pretrained-only artifact -- EOS is <|bos|> (the
+        # document separator the base model actually predicts) instead of
+        # <|assistant_end|>. Persisted via tokenizer_config.json so reloads
+        # re-pin the same role.
+        self.base_model = base_model
         # byte <-> unicode-char maps, and char <-> id over the 256 byte range
         self.byte_encoder = bytes_to_unicode()           # byte(int) -> char
         self.byte_decoder = {c: b for b, c in self.byte_encoder.items()}  # char -> byte(int)
@@ -59,7 +64,7 @@ class NanochatByteTokenizer(PreTrainedTokenizer):
         # so they cannot perturb the 256..264 ordering.
         for k in ("bos_token", "eos_token", "pad_token", "unk_token", "additional_special_tokens"):
             kwargs.pop(k, None)
-        super().__init__(**kwargs)
+        super().__init__(base_model=base_model, **kwargs)
 
         # Add the 9 specials IN ORDER first, so ids land at exactly 256..264
         # (baked into the model's embedding rows). Only then assign roles --
@@ -68,8 +73,9 @@ class NanochatByteTokenizer(PreTrainedTokenizer):
             self.add_special_tokens(
                 {"additional_special_tokens": [AddedToken(t, special=True, normalized=False) for t in SPECIAL_TOKENS]}
             )
+        eos = "<|bos|>" if base_model else "<|assistant_end|>"
         self.add_special_tokens(
-            {"bos_token": "<|bos|>", "eos_token": "<|assistant_end|>", "pad_token": "<|bos|>"}
+            {"bos_token": "<|bos|>", "eos_token": eos, "pad_token": "<|bos|>"}
         )
 
     @property
