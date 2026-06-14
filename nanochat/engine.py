@@ -11,6 +11,7 @@ Notes:
 The whole thing is made as efficient as possible.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,6 +45,16 @@ def eval_with_timeout(formula, max_time=3):
         # print(f"Warning: Failed to eval {formula}, exception: {e}") # it's ok ignore wrong calculator usage
         return None
 
+def _maybe_int(result):
+    """When NANOCHAT_CALC_INT_FLOATS=1, render integer-valued floats as ints
+    (7.0 -> 7) so the tool output matches GSM8K's annotation style (exact
+    divisions are written as integers; true fractions like 7.5/0.2 stay decimal).
+    Default off, preserving the Python-eval 7.0 behavior."""
+    if os.environ.get("NANOCHAT_CALC_INT_FLOATS") == "1" and isinstance(result, float) and result.is_integer():
+        return int(result)
+    return result
+
+
 def use_calculator(expr):
     """
     Evaluate a Python expression safely.
@@ -56,7 +67,7 @@ def use_calculator(expr):
     if all([x in "0123456789*+-/.() " for x in expr]):
         if "**" in expr:  # disallow power operator
             return None
-        return eval_with_timeout(expr)
+        return _maybe_int(eval_with_timeout(expr))
 
     # Check if it's a string operation we support
     # Allow: strings (single/double quotes), .count(), letters, numbers, spaces, parens
@@ -77,7 +88,7 @@ def use_calculator(expr):
         return None
 
     # Evaluate with timeout
-    return eval_with_timeout(expr)
+    return _maybe_int(eval_with_timeout(expr))
 
 # -----------------------------------------------------------------------------
 class KVCache(nn.Module):
