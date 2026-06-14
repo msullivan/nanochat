@@ -18,6 +18,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 
 import argparse
 import os
+import signal
 import itertools
 import wandb
 import torch
@@ -222,9 +223,68 @@ assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step 
 examples_per_rank = args.examples_per_step // ddp_world_size # per GPU
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
+# Checkpoint location (output tag = model tag, or depth-derived fallback).
+checkpoint_dir = os.path.join(
+    get_base_dir(), "chatrl_checkpoints",
+    args.model_tag if args.model_tag else f"d{model.config.n_layer}",
+)
+model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig
+
+def save_rl_checkpoint(step):
+    save_checkpoint(
+        checkpoint_dir,
+        step,
+        model.state_dict(),
+        None, # note: we don't bother to save the optimizer state
+        # byte_tokenizer must propagate or eval/reload picks the wrong (BPE) tokenizer
+        {"model_config": model_config_kwargs, "byte_tokenizer": meta.get("byte_tokenizer", False)},
+    )
+    print(f"✅ Saved model checkpoint to {checkpoint_dir} (step {step})")
+
+# Graceful save/exit signaling (mirrors base_train.py). Checked at the top of
+# the main loop, before the (slow) eval block, so a stop/save takes effect now:
+#   - SIGUSR1 (kill -USR1 <pid>) -> save a checkpoint and keep training.
+#   - SIGINT (Ctrl-C, or wandb dashboard "Stop Run") -> save and exit cleanly.
+# Multi-rank: SIGUSR1 must be sent to every rank; SIGINT is usually forwarded by
+# torchrun. A second SIGINT restores default behavior so a hung save can be
+# force-quit.
+signal_save_requested = False
+signal_exit_requested = False
+def _save_handler(signum, frame):
+    global signal_save_requested
+    signal_save_requested = True
+    print(f"[rank {ddp_rank}] received SIGUSR1, will save checkpoint at next loop iteration", flush=True)
+def _save_and_exit_handler(signum, frame):
+    global signal_save_requested, signal_exit_requested
+    if signal_exit_requested:
+        print(f"[rank {ddp_rank}] second SIGINT received, exiting immediately", flush=True)
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        raise KeyboardInterrupt
+    signal_save_requested = True
+    signal_exit_requested = True
+    print(f"[rank {ddp_rank}] received SIGINT (Ctrl-C / wandb Stop), will save and exit at next loop iteration", flush=True)
+signal.signal(signal.SIGUSR1, _save_handler)
+signal.signal(signal.SIGINT, _save_and_exit_handler)
+
 # Kick off the training loop
 batch_iterator = get_batch()
 for step in range(num_steps):
+
+    # Graceful save/exit: handle SIGUSR1 (save+continue) and SIGINT (save+exit)
+    # before the eval/rollout blocks so a stop click isn't stuck behind them.
+    if ddp: # consensus so all ranks save+exit together
+        flag = torch.tensor([1 if signal_exit_requested else 0], device=device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+        if flag.item():
+            signal_save_requested = True
+            signal_exit_requested = True
+    if signal_save_requested:
+        if master_process:
+            save_rl_checkpoint(step)
+        signal_save_requested = False
+    if signal_exit_requested:
+        print0(f"Exiting after save at step {step} (SIGINT / wandb Stop)")
+        break
 
     # Evaluate the model once in a while and log to wandb
     if step % args.eval_every == 0:
@@ -311,21 +371,7 @@ for step in range(num_steps):
 
     # Master process saves the model once in a while. Skip first step. Save last step.
     if master_process and ((step > 0 and step % args.save_every == 0) or step == num_steps - 1):
-        base_dir = get_base_dir()
-        depth = model.config.n_layer
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # base the model tag on the depth of the base model
-        checkpoint_dir = os.path.join(base_dir, "chatrl_checkpoints", output_dirname)
-        model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            model.state_dict(),
-            None, # note: we don't bother to save the optimizer state
-            {
-                "model_config": model_config_kwargs,
-            }
-        )
-        print(f"✅ Saved model checkpoint to {checkpoint_dir}")
+        save_rl_checkpoint(step)
 
 # Log to report
 from nanochat.report import get_report
@@ -335,3 +381,9 @@ get_report().log(section="Chat RL", data=[
 
 wandb_run.finish() # wandb run finish
 compute_cleanup()
+
+# If we exited via SIGINT (Ctrl-C / wandb Stop), re-raise it now that the
+# checkpoint is saved and cleanup is done, so the exit status reflects the signal.
+if signal_exit_requested:
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGINT)
