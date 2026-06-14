@@ -111,8 +111,8 @@ wandb_run.define_metric("step")
 wandb_run.define_metric("*", step_metric="step")
 
 # Flash Attention status
-if not HAS_FA3:
-    print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
+from nanochat.flash_attention import BACKEND
+print0(f"Attention backend: {BACKEND}" + (" (FA3 not available)" if not HAS_FA3 else ""))
 
 # Resume-detection. We always need to load the base first to get the model
 # architecture and tokenizer; if resuming, we then overwrite the model weights
