@@ -20,7 +20,7 @@ from nanochat.engine import Engine
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
 from tasks.arc import ARC
-from tasks.gsm8k import GSM8K
+from tasks.gsm8k import GSM8K, extract_answer as gsm8k_extract_answer
 from tasks.spellingbee import SpellingBee, SimpleSpelling
 from tasks.arithmetic import Addition, Multiplication
 
@@ -28,13 +28,37 @@ from tasks.arithmetic import Addition, Multiplication
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
 
-def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, print_completions=False, batched=False, batch_size=64):
+def _make_record(task_object, conversation, completion, passed, index):
+    """Per-problem record for --save-records analysis (aligned by index across runs)."""
+    rec = {"index": index, "correct": bool(passed), "completion": completion}
+    msgs = conversation.get("messages", [])
+    if msgs and isinstance(msgs[0].get("content"), str):
+        rec["question"] = msgs[0]["content"]
+    if isinstance(task_object, GSM8K):
+        rec["gold"] = gsm8k_extract_answer(msgs[-1]["content"][-1]["text"])
+        rec["pred"] = gsm8k_extract_answer(completion)
+    return rec
+
+
+def _write_records(records, record_path, ddp, ddp_rank):
+    import json, os
+    path = record_path
+    if ddp:  # each rank writes its own shard; merge offline
+        root, ext = os.path.splitext(record_path)
+        path = f"{root}.rank{ddp_rank}{ext}"
+    with open(path, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+
+def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None, print_completions=False, batched=False, batch_size=64, record_path=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
     num_passed, total = 0, 0
+    records = []  # per-problem records when record_path is set
 
     # Batched path (num_samples==1): encode this rank's prompts and run them in
     # fixed-size left-padded batches through engine.generate_batched. Calculator
@@ -55,6 +79,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
                 passed = bool(task_object.evaluate(chunk_convs[j], completion))
                 total += 1
                 num_passed += int(passed)
+                if record_path is not None:
+                    records.append(_make_record(task_object, chunk_convs[j], completion, passed, idxs[s + j]))
                 if print_completions:
                     print(f"\n--- [{'PASS' if passed else 'FAIL'}] rank={ddp_rank} i={idxs[s+j]} ({num_passed}/{total}) ---")
                     print(f"--- completion (score={passed}) ---\n{completion}\n---")
@@ -80,6 +106,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
             passed = any(outcomes)
             total += 1
             num_passed += int(passed)
+            if record_path is not None:
+                records.append(_make_record(task_object, conversation, completions[0], passed, i))
             if print_completions:
                 prompt_text = tokenizer.decode(encoded_prompt)
                 verdict = "PASS" if passed else "FAIL"
@@ -102,6 +130,10 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         dist.all_reduce(total_tensor, op=dist.ReduceOp.SUM)
         num_passed = num_passed_tensor.item()
         total = total_tensor.item()
+
+    if record_path is not None:
+        _write_records(records, record_path, ddp, ddp_rank)
+        print0(f"wrote {len(records)} records (this rank) to {record_path}")
 
     print0("=" * 50)
     print0(f"Final: {num_passed}/{total} ({100*num_passed/total:.2f}%)")
@@ -185,7 +217,7 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
 
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
-                   max_problems=None, print_completions=False):
+                   max_problems=None, print_completions=False, record_path=None):
     # Create the evaluation object
     task_module = {
         'HumanEval': HumanEval,
@@ -204,7 +236,7 @@ def run_chat_eval(task_name, model, tokenizer, engine,
         # All generative tasks batch through generate_batched (num_samples==1). It runs
         # the same multi-row state machine as generate, so GSM8K's calculator tool use
         # works batched too; num_samples>1 falls back to the per-problem path inside.
-        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, print_completions=print_completions, batched=True, batch_size=batch_size)
+        acc = run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=max_problems, print_completions=print_completions, batched=True, batch_size=batch_size, record_path=record_path)
     elif task_object.eval_type == 'categorical':
         acc = run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems=max_problems)
     else:
@@ -228,6 +260,7 @@ if __name__ == "__main__":
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('-v', '--print-completions', action='store_true', help='Print prompt + completion + score for each problem (generative tasks only)')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    parser.add_argument('--save-records', type=str, default=None, help='Write per-problem JSONL (index, question, gold, completion, pred, correct) to this path. {task} is substituted with the task name. Records align by index across runs (same shuffle seed).')
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -264,6 +297,7 @@ if __name__ == "__main__":
             top_k=args.top_k,
             max_problems=args.max_problems,
             print_completions=args.print_completions,
+            record_path=(args.save_records.format(task=task_name) if args.save_records else None),
         )
         results[task_name] = acc
         print0(f"{task_name} accuracy: {100 * acc:.2f}%")
