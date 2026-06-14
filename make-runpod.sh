@@ -28,10 +28,12 @@ CREATE_JSON=".pods/$NAME-create.json"
 POD_JSON=".pods/$NAME.json"
 
 if [ "$GPUS" = "cpu" ]; then
-    # CPU pods cap container disk at 20GB
+    # Same template as the GPU path (it's CPU-category: runpod/base + sshd;
+    # a raw docker image like ubuntu:22.04 has no sshd, so ssh never comes up).
+    # CPU pods cap container disk at 20GB.
     runpodctl pod create \
         --compute-type cpu \
-        --image ubuntu:22.04 \
+        --template-id "$TEMPLATE_ID" \
         --container-disk-in-gb 20 \
         --network-volume-id "$VOL_ID" \
         --name "$NAME" \
@@ -72,6 +74,9 @@ fi
 
 SSH_CMD=$(jq -r '.ssh.ssh_command' "$POD_JSON")
 SYNC_URL="ssh://root@$IP:$PORT/root/nanochat"
+# Print connection info BEFORE remote setup so a setup failure doesn't eat it.
+echo "  SSH:  $SSH_CMD"
+echo "  sync: $SYNC_URL"
 git remote set-url sync "$SYNC_URL" 2>/dev/null || git remote add sync "$SYNC_URL"
 
 if [ ! -f "$HOME/.wandb-key" ]; then
@@ -88,5 +93,3 @@ echo "Running setup on pod (apt + uv + clone + wandb login)..."
 
 echo
 echo "Pod ready."
-echo "  SSH:  $SSH_CMD"
-echo "  sync: $SYNC_URL"
